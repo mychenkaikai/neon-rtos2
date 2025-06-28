@@ -42,3 +42,7 @@ debug = true
 
 [profile.release]
 opt-level = 3
+
+[profile.test]
+opt-level = 0
+debug = true
