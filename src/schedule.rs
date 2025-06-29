@@ -11,6 +11,14 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
+    pub fn init() {
+        unsafe {
+            SCHEDULER = Scheduler {
+                current_task: None,
+                is_running: false,
+            };
+        }
+    }
     //使用task::for_each_from遍历所有任务,找到当前任务之后的下一个非阻塞任务,如果当前任务是最后一个任务,则找到第一个任务
     //但也要考虑其他任务找不到准备状态，此时currenttask还是原任务
     pub fn schedule() {
@@ -81,6 +89,7 @@ mod tests {
     use crate::event::EventType;
     use crate::task::Task;
     use crate::task::TaskState;
+    use crate::utils::kernel_init;
 
     fn task1(_args: usize) {
         // 简化的任务函数
@@ -104,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_schedule() {
-        Task::reset_tasks();
+        kernel_init();
         Task::new("task1", task1);
         Task::new("task2", task2);
         Task::new("task3", task3);
@@ -156,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_schedule_block() {
-        Task::reset_tasks();
+        kernel_init();
         Task::new("task1", task1);
         Task::new("task2", task2);
         Task::new("task3", task3);
@@ -182,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_schedule_block_and_schedule() {
-        Task::reset_tasks();
+        kernel_init();
         Task::new("task1", task1);
         Task::new("task2", task2);
         Task::new("task3", task3);
@@ -217,7 +226,7 @@ mod tests {
     //测试调度器关闭后，是否还能调度
     #[test]
     fn test_schedule_stop() {
-        Task::reset_tasks();
+        kernel_init();
         Task::new("task1", task1);
         Task::new("task2", task2);
         Scheduler::start();

@@ -120,7 +120,7 @@ impl Task {
         unsafe { TASK_LIST[self.0].stack_top }
     }
 
-    pub(crate) fn reset_tasks() {
+    pub(crate) fn init() {
         unsafe {
             for i in 0..MAX_TASKS {
                 TASK_LIST[i] = TCB {
@@ -185,7 +185,7 @@ impl Task {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::assert_eq;
+    use crate::utils::kernel_init;
 
     fn task1(_args: usize) {
         // 简化的任务函数
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_task() {
-        Task::reset_tasks();
+        kernel_init();
         let task1 = Task::new("task1", task1);
         let task2 = Task::new("task2", task2);
         assert_eq!(task1.get_state(), TaskState::Ready);
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_task_overflow() {
-        Task::reset_tasks();
+        kernel_init();
         for _ in 0..MAX_TASKS + 1 {
             Task::new("task", task1);
         }
@@ -224,7 +224,7 @@ mod tests {
     //检测任务状态
     #[test]
     fn test_task_state() {
-        Task::reset_tasks();
+        kernel_init();
         let mut task = Task::new("task", task1);
         task.run();
         assert_eq!(task.get_state(), TaskState::Running);
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_task_for_each_from() {
-        Task::reset_tasks();
+        kernel_init();
         //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
         let mut cnt = 0;
         Task::new("task1", task1);
@@ -270,7 +270,7 @@ mod tests {
     fn test_task_for_each() {
         //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
         let mut cnt = 0;
-        Task::reset_tasks();
+        kernel_init();
         Task::new("task1", task1);
         Task::new("task2", task2);
         Task::for_each(|task, id| {

@@ -12,7 +12,7 @@ pub(crate) enum EventType {
 
 impl EventType {
     //根据事件唤醒被所有被这个事件阻塞的task
-    fn wake_task(event_type: EventType) {
+    pub(crate) fn wake_task(event_type: EventType) {
         Task::for_each(|mut task, _| {
             if task.get_state() == TaskState::Blocked(event_type) {
                 task.ready();
@@ -35,7 +35,7 @@ mod tests {
     fn task5(_args: usize) {}
     #[test]
     fn test_event() {
-        Task::reset_tasks();
+        Task::init();
         //设置部分任务为阻塞状态，进行判断状态是否正确
         let mut task1 = Task::new("task1", task1);
         let mut task2 = Task::new("task2", task2);

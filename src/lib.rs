@@ -6,12 +6,7 @@ mod task;
 mod schedule;
 mod utils;
 mod event;
+mod signal;
+mod timer;
+mod systick;
 
-use core::panic::PanicInfo;
-
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {
-    }
-}
