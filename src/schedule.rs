@@ -1,43 +1,42 @@
-use crate::{
-    config::MAX_TASKS,
-    task::{TASK_LIST, Task, TaskState},
-};
+use crate::task::{Task, TaskState};
 
-static mut SCHEDULER: Scheduler = Scheduler { current_task: None };
+static mut SCHEDULER: Scheduler = Scheduler {
+    current_task: None,
+    is_running: false,
+};
 
 struct Scheduler {
     current_task: Option<Task>,
+    is_running: bool,
 }
 
 impl Scheduler {
+    //使用task::for_each_from遍历所有任务,找到当前任务之后的下一个非阻塞任务,如果当前任务是最后一个任务,则找到第一个任务
+    //但也要考虑其他任务找不到准备状态，此时currenttask还是原任务
     pub fn schedule() {
-        //找到当前任务之后的下一个非阻塞任务设置为新的当前任务,并且设置当前任务为就绪状态
-        //如果当前任务是最后一个任务,则设置为第一个任务
-        let mut next_task = None;
-        unsafe {
-            let mut current_task = SCHEDULER.current_task.unwrap();
-            for i in current_task.0..MAX_TASKS {
-                if TASK_LIST[i].state == TaskState::Ready {
-                    next_task = Some(Task(i));
-
-                    break;
-                }
-            }
-            if next_task.is_none() {
-                for i in 0..current_task.0 {
-                    if TASK_LIST[i].state == TaskState::Ready {
-                        next_task = Some(Task(i));
-                        break;
-                    }
-                }
-            }
-
-            if let Some(task) = next_task.as_mut() {
-                current_task.ready();
-                task.run();
-                SCHEDULER.current_task = Some(*task);
-            }
+        if !unsafe { SCHEDULER.is_running } {
+            return;
         }
+        let mut next_task: Task = unsafe { SCHEDULER.current_task.unwrap() };
+        let current_task = unsafe { SCHEDULER.current_task.unwrap() };
+        Task::for_each_from(current_task.get_taskid() + 1, |task, _| {
+            if task.get_state() == TaskState::Ready {
+                next_task = task.clone();
+            }
+        });
+        if next_task == current_task {
+            //如果next_task还是原任务，则说明没有找到下一个非阻塞任务，此时currenttask还是原任务
+            return;
+        }
+        if current_task.get_state() == TaskState::Running {
+            Task::operate(current_task.get_taskid(), |task| {
+                task.ready();
+            });
+        }
+        Task::operate(next_task.get_taskid(), |task| {
+            task.run();
+        });
+        unsafe { SCHEDULER.current_task = Some(next_task) };
     }
 
     pub fn start() {
@@ -45,8 +44,16 @@ impl Scheduler {
         unsafe {
             SCHEDULER.current_task = Some(Task(0));
             //设置当前任务为运行状态
-            TASK_LIST[0].state = TaskState::Running;
+            Task::operate(0, |task| {
+                task.run();
+            });
         }
+        unsafe { SCHEDULER.is_running = true };
+    }
+
+    //关闭调度器
+    pub fn stop() {
+        unsafe { SCHEDULER.is_running = false };
     }
 }
 
@@ -65,64 +72,140 @@ mod tests {
         // 简化的任务函数
     }
 
+    fn task3(_args: usize) {
+        // 简化的任务函数
+    }
+
+    fn task4(_args: usize) {
+        // 简化的任务函数
+    }
+
+    fn task5(_args: usize) {
+        // 简化的任务函数
+    }
+
     #[test]
     fn test_schedule() {
         Task::reset_tasks();
-        let task1 = Task::new("task1", task1);
-        let task2 = Task::new("task2", task2);
+        Task::new("task1", task1);
+        Task::new("task2", task2);
+        Task::new("task3", task3);
+        Task::new("task4", task4);
+        Task::new("task5", task5);
 
         Scheduler::start();
         //统计任务状态为Running的次数,只能有一个任务处于Running状态
         let mut running_count = 0;
-        running_count += if task1.get_state() == TaskState::Running {
-            1
-        } else {
-            0
-        };
-        running_count += if task2.get_state() == TaskState::Running {
-            1
-        } else {
-            0
-        };
+        //统计所有的ready任务
+        let mut ready_count = 0;
+        Task::for_each(|task, _| {
+            if task.get_state() == TaskState::Running {
+                running_count += 1;
+            }
+            if task.get_state() == TaskState::Ready {
+                ready_count += 1;
+            }
+        });
         assert_eq!(running_count, 1);
+        assert_eq!(ready_count, 4);
         Scheduler::schedule();
         running_count = 0;
-        running_count += if task1.get_state() == TaskState::Running {
-            1
-        } else {
-            0
-        };
-        running_count += if task2.get_state() == TaskState::Running {
-            1
-        } else {
-            0
-        };
+        ready_count = 0;
+        Task::for_each(|task, _| {
+            if task.get_state() == TaskState::Running {
+                running_count += 1;
+            }
+            if task.get_state() == TaskState::Ready {
+                ready_count += 1;
+            }
+        });
         assert_eq!(running_count, 1);
+        assert_eq!(ready_count, 4);
         Scheduler::schedule();
         running_count = 0;
-        running_count += if task1.get_state() == TaskState::Running {
-            1
-        } else {
-            0
-        };
-        running_count += if task2.get_state() == TaskState::Running {
-            1
-        } else {
-            0
-        };
+        ready_count = 0;
+        Task::for_each(|task, _| {
+            if task.get_state() == TaskState::Running {
+                running_count += 1;
+            }
+            if task.get_state() == TaskState::Ready {
+                ready_count += 1;
+            }
+        });
         assert_eq!(running_count, 1);
+        assert_eq!(ready_count, 4);
     }
 
     #[test]
     fn test_schedule_block() {
         Task::reset_tasks();
-        let mut task1 = Task::new("task1", task1);
-        let task2 = Task::new("task2", task2);
-
+        Task::new("task1", task1);
+        Task::new("task2", task2);
+        Task::new("task3", task3);
+        Task::new("task4", task4);
+        Task::new("task5", task5);
         Scheduler::start();
-        task1.block(BlockReason::Signal);
+        unsafe { SCHEDULER.current_task.unwrap() }.block(BlockReason::Signal);
+        assert_eq!(
+            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            TaskState::Blocked(BlockReason::Signal)
+        );
         Scheduler::schedule();
-        assert_eq!(task1.get_state(), TaskState::Blocked(BlockReason::Signal));
-        assert_eq!(task2.get_state(), TaskState::Running);
+        assert_eq!(
+            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            TaskState::Running
+        );
+        Scheduler::schedule();
+        assert_eq!(
+            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            TaskState::Running
+        );
+    }
+
+    #[test]
+    fn test_schedule_block_and_schedule() {
+        Task::reset_tasks();
+        Task::new("task1", task1);
+        Task::new("task2", task2);
+        Task::new("task3", task3);
+        Task::new("task4", task4);
+        Task::new("task5", task5);
+        Scheduler::start();
+        unsafe { SCHEDULER.current_task.unwrap() }.block(BlockReason::Signal);
+        //保存此时的current_task为block_task
+        let block_task = unsafe { SCHEDULER.current_task.unwrap() };
+        Scheduler::schedule();
+        assert_eq!(
+            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            TaskState::Running
+        );
+        //测试block_task是否还是原任务
+        assert_eq!(
+            block_task.get_state(),
+            TaskState::Blocked(BlockReason::Signal)
+        );
+        Scheduler::schedule();
+        assert_eq!(
+            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            TaskState::Running
+        );
+        //测试block_task是否还是原任务
+        assert_eq!(
+            block_task.get_state(),
+            TaskState::Blocked(BlockReason::Signal)
+        );
+    }
+
+    //测试调度器关闭后，是否还能调度
+    #[test]
+    fn test_schedule_stop() {
+        Task::reset_tasks();
+        Task::new("task1", task1);
+        Task::new("task2", task2);
+        Scheduler::start();
+        let current_task = unsafe { SCHEDULER.current_task.unwrap() };
+        Scheduler::stop();
+        Scheduler::schedule();
+        assert_eq!(current_task.get_state(), TaskState::Running);
     }
 }

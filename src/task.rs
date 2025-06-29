@@ -10,10 +10,10 @@ use core::ptr::addr_of;
 
 // 在lib.rs或main.rs中
 #[unsafe(no_mangle)]
-pub(crate) static mut TASK_LIST: [TCB; MAX_TASKS] = [TCB {
+static mut TASK_LIST: [TCB; MAX_TASKS] = [TCB {
     stack_top: 0,
     name: "noinit",
-    stackid: 0,
+    taskid: 0,
     state: TaskState::Uninit,
 }; MAX_TASKS];
 
@@ -50,7 +50,7 @@ pub struct TCB {
     // 任务控制块的字段
     pub(crate) stack_top: usize,
     pub(crate) name: &'static str,
-    pub(crate) stackid: usize,
+    pub(crate) taskid: usize,
     pub(crate) state: TaskState,
 }
 
@@ -58,14 +58,14 @@ pub struct TCB {
 pub struct Task(pub usize);
 
 impl TCB {
-    pub fn init(&mut self, name: &'static str, func: fn(usize), stackid: usize, stack_top: usize) {
+    pub fn init(&mut self, name: &'static str, func: fn(usize), taskid: usize, stack_top: usize) {
         self.stack_top = stack_top;
-        self.stackid = stackid;
+        self.taskid = taskid;
 
         self.name = name;
         self.state = TaskState::Ready;
 
-        init_task_stack(&mut self.stack_top, func, stackid);
+        init_task_stack(&mut self.stack_top, func, taskid);
     }
 }
 
@@ -112,8 +112,8 @@ impl Task {
         unsafe { TASK_LIST[self.0].name }
     }
 
-    pub fn get_stackid(&self) -> usize {
-        unsafe { TASK_LIST[self.0].stackid }
+    pub fn get_taskid(&self) -> usize {
+        unsafe { TASK_LIST[self.0].taskid }
     }
 
     pub fn get_stack_top(&self) -> usize {
@@ -126,7 +126,7 @@ impl Task {
                 TASK_LIST[i] = TCB {
                     stack_top: 0,
                     name: "noinit",
-                    stackid: 0,
+                    taskid: 0,
                     state: TaskState::Uninit,
                 };
                 TASK_STACKS[i] = Stack {
@@ -134,6 +134,52 @@ impl Task {
                 };
             }
         }
+    }
+
+    /// 遍历所有初始化的任务，对每个任务执行函数f,遍历的时候显示当前id
+    pub fn for_each<F>(mut f: F)
+    where
+        F: FnMut(&Task, usize) -> (),
+    {
+        unsafe {
+            for i in 0..MAX_TASKS {
+                if TASK_LIST[i].state != TaskState::Uninit {
+                    f(&Task(i), i);
+                }
+            }
+        }
+    }
+
+    //从给定id开始循环遍历所有任务到id本身,如果id是最后一个任务,则从0开始
+    pub fn for_each_from<F>(start: usize, mut f: F)
+    where
+        F: FnMut(&Task, usize) -> (),
+    {
+        unsafe {
+            if start == MAX_TASKS - 1 {
+                for i in 0..start {
+                    if TASK_LIST[i].state != TaskState::Uninit {
+                        f(&Task(i), i);
+                    }
+                }
+            } else {
+                for i in start..MAX_TASKS {
+                    if TASK_LIST[i].state != TaskState::Uninit {
+                        f(&Task(i), i);
+                    }
+                }
+                for i in 0..start {
+                    if TASK_LIST[i].state != TaskState::Uninit {
+                        f(&Task(i), i);
+                    }
+                }
+            }
+        }
+    }
+
+    //操作某个任务
+    pub fn operate(task: usize, f: fn(&mut Task)) {
+        f(&mut Task(task));
     }
 }
 
@@ -159,8 +205,8 @@ mod tests {
         assert_eq!(task2.get_state(), TaskState::Ready);
         assert_eq!(task1.get_name(), "task1");
         assert_eq!(task2.get_name(), "task2");
-        assert_eq!(task1.get_stackid(), 0);
-        assert_eq!(task2.get_stackid(), 1);
+        assert_eq!(task1.get_taskid(), 0);
+        assert_eq!(task2.get_taskid(), 1);
         //检测栈顶是否8字节对齐
         assert_eq!(task1.get_stack_top() & !(0x0007), task1.get_stack_top());
         assert_eq!(task2.get_stack_top() & !(0x0007), task2.get_stack_top());
@@ -187,5 +233,57 @@ mod tests {
         assert_eq!(task.get_state(), TaskState::Blocked(BlockReason::Signal));
         task.ready();
         assert_eq!(task.get_state(), TaskState::Ready);
+    }
+
+    #[test]
+    fn test_task_for_each_from() {
+        Task::reset_tasks();
+        //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
+        let mut cnt = 0;
+        Task::new("task1", task1);
+        Task::new("task2", task2);
+        Task::for_each_from(0, |task, id| {
+            if cnt == 0 {
+                assert_eq!(task.get_name(), "task1");
+                assert_eq!(id, 0);
+                cnt += 1;
+            } else if cnt == 1 {
+                assert_eq!(task.get_name(), "task2");
+                assert_eq!(id, 1);
+                cnt += 1;
+            }
+        });
+        cnt = 0;
+        Task::for_each_from(1, |task, id| {
+            if cnt == 0 {
+                assert_eq!(task.get_name(), "task2");
+                assert_eq!(id, 1);
+                cnt += 1;
+            } else if cnt == 1 {
+                assert_eq!(task.get_name(), "task1");
+                assert_eq!(id, 0);
+                cnt += 1;
+            }
+        });
+    }
+
+    #[test]
+    fn test_task_for_each() {
+        //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
+        let mut cnt = 0;
+        Task::reset_tasks();
+        Task::new("task1", task1);
+        Task::new("task2", task2);
+        Task::for_each(|task, id| {
+            if cnt == 0 {
+                assert_eq!(task.get_name(), "task1");
+                assert_eq!(id, 0);
+                cnt += 1;
+            } else if cnt == 1 {
+                assert_eq!(task.get_name(), "task2");
+                assert_eq!(id, 1);
+                cnt += 1;
+            }
+        });
     }
 }
