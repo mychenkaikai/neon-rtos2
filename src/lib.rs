@@ -5,7 +5,7 @@ mod config;
 mod task;
 mod schedule;
 mod utils;
-mod signal;
+mod event;
 
 use core::panic::PanicInfo;
 

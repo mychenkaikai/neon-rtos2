@@ -1,7 +1,7 @@
 use crate::arch::init_task_stack;
 use crate::config::MAX_TASKS;
 use crate::config::STACK_SIZE;
-
+use crate::event::EventType;
 use core::cmp::PartialEq;
 use core::fmt::Debug;
 use core::panic;
@@ -24,18 +24,18 @@ static mut TASK_STACKS: [Stack; MAX_TASKS] = [const {
     }
 }; MAX_TASKS];
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) enum BlockReason {
-    Signal,
-    Wait,
-}
+// #[derive(Debug, PartialEq, Clone, Copy)]
+// pub(crate) enum BlockReason {
+//     Signal,
+//     Wait,
+// }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TaskState {
     Uninit,
     Ready,
     Running,
-    Blocked(BlockReason),
+    Blocked(EventType),
 }
 
 #[repr(C)]
@@ -98,7 +98,7 @@ impl Task {
         }
     }
 
-    pub fn block(&mut self, reason: BlockReason) {
+    pub fn block(&mut self, reason: EventType) {
         unsafe {
             TASK_LIST[self.0].state = TaskState::Blocked(reason);
         }
@@ -139,12 +139,12 @@ impl Task {
     /// 遍历所有初始化的任务，对每个任务执行函数f,遍历的时候显示当前id
     pub fn for_each<F>(mut f: F)
     where
-        F: FnMut(&Task, usize) -> (),
+        F: FnMut(&mut Task, usize) -> (),
     {
         unsafe {
             for i in 0..MAX_TASKS {
                 if TASK_LIST[i].state != TaskState::Uninit {
-                    f(&Task(i), i);
+                    f(&mut Task(i), i);
                 }
             }
         }
@@ -153,34 +153,33 @@ impl Task {
     //从给定id开始循环遍历所有任务到id本身,如果id是最后一个任务,则从0开始
     pub fn for_each_from<F>(start: usize, mut f: F)
     where
-        F: FnMut(&Task, usize) -> (),
+        F: FnMut(&mut Task, usize) -> (),
     {
         unsafe {
             if start == MAX_TASKS - 1 {
                 for i in 0..start {
                     if TASK_LIST[i].state != TaskState::Uninit {
-                        f(&Task(i), i);
+                        f(&mut Task(i), i);
                     }
                 }
             } else {
                 for i in start..MAX_TASKS {
                     if TASK_LIST[i].state != TaskState::Uninit {
-                        f(&Task(i), i);
+                        f(&mut Task(i), i);
                     }
                 }
                 for i in 0..start {
                     if TASK_LIST[i].state != TaskState::Uninit {
-                        f(&Task(i), i);
+                        f(&mut Task(i), i);
                     }
                 }
             }
         }
     }
 
-    //操作某个任务
-    pub fn operate(task: usize, f: fn(&mut Task)) {
-        f(&mut Task(task));
-    }
+
+
+
 }
 
 #[cfg(test)]
@@ -229,8 +228,8 @@ mod tests {
         let mut task = Task::new("task", task1);
         task.run();
         assert_eq!(task.get_state(), TaskState::Running);
-        task.block(BlockReason::Signal);
-        assert_eq!(task.get_state(), TaskState::Blocked(BlockReason::Signal));
+        task.block(EventType::Signal(1));
+        assert_eq!(task.get_state(), TaskState::Blocked(EventType::Signal(1)));
         task.ready();
         assert_eq!(task.get_state(), TaskState::Ready);
     }
