@@ -1,7 +1,7 @@
 use crate::arch::init_task_stack;
 use crate::config::MAX_TASKS;
 use crate::config::STACK_SIZE;
-use crate::event::EventType;
+use crate::event::Event;
 use core::cmp::PartialEq;
 use core::fmt::Debug;
 use core::panic;
@@ -35,7 +35,7 @@ pub(crate) enum TaskState {
     Uninit,
     Ready,
     Running,
-    Blocked(EventType),
+    Blocked(Event),
 }
 
 #[repr(C)]
@@ -98,7 +98,7 @@ impl Task {
         }
     }
 
-    pub fn block(&mut self, reason: EventType) {
+    pub fn block(&mut self, reason: Event) {
         unsafe {
             TASK_LIST[self.0].state = TaskState::Blocked(reason);
         }
@@ -228,8 +228,8 @@ mod tests {
         let mut task = Task::new("task", task1);
         task.run();
         assert_eq!(task.get_state(), TaskState::Running);
-        task.block(EventType::Signal(1));
-        assert_eq!(task.get_state(), TaskState::Blocked(EventType::Signal(1)));
+        task.block(Event::Signal(1));
+        assert_eq!(task.get_state(), TaskState::Blocked(Event::Signal(1)));
         task.ready();
         assert_eq!(task.get_state(), TaskState::Ready);
     }

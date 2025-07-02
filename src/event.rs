@@ -2,17 +2,18 @@ use crate::task::Task;
 use crate::task::TaskState;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) enum EventType {
+pub(crate) enum Event {
     Signal(usize),
     Timer(usize),
     Ipc(usize),
     Memory(usize),
     Network(usize),
+    Mutex(usize),
 }
 
-impl EventType {
+impl Event {
     //根据事件唤醒被所有被这个事件阻塞的task
-    pub(crate) fn wake_task(event_type: EventType) {
+    pub(crate) fn wake_task(event_type: Event) {
         Task::for_each(|mut task, _| {
             if task.get_state() == TaskState::Blocked(event_type) {
                 task.ready();
@@ -43,30 +44,30 @@ mod tests {
         let mut task4 = Task::new("task4", task4);
         let mut task5 = Task::new("task5", task5);
         Scheduler::start();
-        task1.block(EventType::Signal(1));
-        task2.block(EventType::Signal(2));
-        task3.block(EventType::Signal(3));
-        task4.block(EventType::Signal(4));
-        task5.block(EventType::Signal(5));
-        assert_eq!(task1.get_state(), TaskState::Blocked(EventType::Signal(1)));
-        assert_eq!(task2.get_state(), TaskState::Blocked(EventType::Signal(2)));
-        assert_eq!(task3.get_state(), TaskState::Blocked(EventType::Signal(3)));
-        assert_eq!(task4.get_state(), TaskState::Blocked(EventType::Signal(4)));
-        assert_eq!(task5.get_state(), TaskState::Blocked(EventType::Signal(5)));
+        task1.block(Event::Signal(1));
+        task2.block(Event::Signal(2));
+        task3.block(Event::Signal(3));
+        task4.block(Event::Signal(4));
+        task5.block(Event::Signal(5));
+        assert_eq!(task1.get_state(), TaskState::Blocked(Event::Signal(1)));
+        assert_eq!(task2.get_state(), TaskState::Blocked(Event::Signal(2)));
+        assert_eq!(task3.get_state(), TaskState::Blocked(Event::Signal(3)));
+        assert_eq!(task4.get_state(), TaskState::Blocked(Event::Signal(4)));
+        assert_eq!(task5.get_state(), TaskState::Blocked(Event::Signal(5)));
         Scheduler::schedule();
         //调度之后任务依然为阻塞状态
-        assert_eq!(task1.get_state(), TaskState::Blocked(EventType::Signal(1)));
-        assert_eq!(task2.get_state(), TaskState::Blocked(EventType::Signal(2)));
-        assert_eq!(task3.get_state(), TaskState::Blocked(EventType::Signal(3)));
-        assert_eq!(task4.get_state(), TaskState::Blocked(EventType::Signal(4)));
-        assert_eq!(task5.get_state(), TaskState::Blocked(EventType::Signal(5)));
+        assert_eq!(task1.get_state(), TaskState::Blocked(Event::Signal(1)));
+        assert_eq!(task2.get_state(), TaskState::Blocked(Event::Signal(2)));
+        assert_eq!(task3.get_state(), TaskState::Blocked(Event::Signal(3)));
+        assert_eq!(task4.get_state(), TaskState::Blocked(Event::Signal(4)));
+        assert_eq!(task5.get_state(), TaskState::Blocked(Event::Signal(5)));
         //唤醒任务
-        EventType::wake_task(EventType::Signal(1));
+        Event::wake_task(Event::Signal(1));
         assert_eq!(task1.get_state(), TaskState::Ready);
-        assert_eq!(task2.get_state(), TaskState::Blocked(EventType::Signal(2)));
-        assert_eq!(task3.get_state(), TaskState::Blocked(EventType::Signal(3)));
-        assert_eq!(task4.get_state(), TaskState::Blocked(EventType::Signal(4)));
-        assert_eq!(task5.get_state(), TaskState::Blocked(EventType::Signal(5)));
+        assert_eq!(task2.get_state(), TaskState::Blocked(Event::Signal(2)));
+        assert_eq!(task3.get_state(), TaskState::Blocked(Event::Signal(3)));
+        assert_eq!(task4.get_state(), TaskState::Blocked(Event::Signal(4)));
+        assert_eq!(task5.get_state(), TaskState::Blocked(Event::Signal(5)));
         Scheduler::schedule();
         //调度之后当前任务为运行状态，其他任务为阻塞状态
         //打印所有任务状态
@@ -86,7 +87,7 @@ mod tests {
                 //通过模式匹配只是判断是不是Signal事件不关注Signal的id
                 //首先肯定是阻塞的Signal事件，之后通过通配符捕获id，如果之前的步骤不匹配，则assert失败
                 match task.get_state() {
-                    TaskState::Blocked(EventType::Signal(id)) => {
+                    TaskState::Blocked(Event::Signal(id)) => {
                         assert_eq!(id, task.get_taskid() + 1)
                     }
                     _ => assert!(false),

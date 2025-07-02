@@ -1,5 +1,5 @@
 use crate::config::MAX_TIMERS;
-use crate::event::EventType;
+use crate::event::Event;
 use crate::schedule::Scheduler;
 use crate::systick::Systick;
 
@@ -83,7 +83,7 @@ impl Timer {
     pub fn delay(timeout: usize) {
         let mut timer = Timer::new(timeout);
         timer.start();
-        Scheduler::get_current_task().block(EventType::Timer(timer.0));
+        Scheduler::get_current_task().block(Event::Timer(timer.0));
     }
 
     //遍历检查是否有满足条件的定时器，如果有的话就发送信号，并删除定时器
@@ -91,7 +91,7 @@ impl Timer {
         Timer::for_each(|timer, id| {
             if timer.is_timeout() {
                 timer.delete();
-                EventType::wake_task(EventType::Timer(id));
+                Event::wake_task(Event::Timer(id));
             }
         });
     }
@@ -113,7 +113,7 @@ impl Timer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::EventType;
+    use crate::event::Event;
     use crate::systick::Systick;
     use crate::task::Task;
     use crate::task::TaskState;
@@ -155,7 +155,7 @@ mod tests {
         let task = Task::new("test_timer_wait_and_start", |_| {});
         Scheduler::start();
         Timer::delay(1000);
-        assert_eq!(task.get_state(), TaskState::Blocked(EventType::Timer(0)));
+        assert_eq!(task.get_state(), TaskState::Blocked(Event::Timer(0)));
         Systick::add_current_time(1000);
         Timer::timer_check_and_send_event();
         assert_eq!(task.get_state(), TaskState::Ready);

@@ -4,6 +4,7 @@ use crate::signal::Signal;
 use crate::schedule::Scheduler;
 use crate::timer::Timer;
 use crate::systick::Systick;
+use crate::mutex::Mutex;
 
 pub(crate) fn kernel_init() {
     Task::init();
@@ -11,6 +12,7 @@ pub(crate) fn kernel_init() {
     Scheduler::init();
     Timer::init();
     Systick::init();
+    Mutex::init();
 }
 
 #[cfg(not(test))]

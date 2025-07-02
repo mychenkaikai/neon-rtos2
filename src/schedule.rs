@@ -86,7 +86,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::EventType;
+    use crate::event::Event;
     use crate::task::Task;
     use crate::task::TaskState;
     use crate::utils::kernel_init;
@@ -172,10 +172,10 @@ mod tests {
         Task::new("task4", task4);
         Task::new("task5", task5);
         Scheduler::start();
-        unsafe { SCHEDULER.current_task.unwrap() }.block(EventType::Signal(1));
+        unsafe { SCHEDULER.current_task.unwrap() }.block(Event::Signal(1));
         assert_eq!(
             unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
-            TaskState::Blocked(EventType::Signal(1))
+            TaskState::Blocked(Event::Signal(1))
         );
         Scheduler::schedule();
         assert_eq!(
@@ -198,7 +198,7 @@ mod tests {
         Task::new("task4", task4);
         Task::new("task5", task5);
         Scheduler::start();
-        unsafe { SCHEDULER.current_task.unwrap() }.block(EventType::Signal(1));
+        unsafe { SCHEDULER.current_task.unwrap() }.block(Event::Signal(1));
         //保存此时的current_task为block_task
         let block_task = unsafe { SCHEDULER.current_task.unwrap() };
         Scheduler::schedule();
@@ -209,7 +209,7 @@ mod tests {
         //测试block_task是否还是原任务
         assert_eq!(
             block_task.get_state(),
-            TaskState::Blocked(EventType::Signal(1))
+            TaskState::Blocked(Event::Signal(1))
         );
         Scheduler::schedule();
         assert_eq!(
@@ -219,7 +219,7 @@ mod tests {
         //测试block_task是否还是原任务
         assert_eq!(
             block_task.get_state(),
-            TaskState::Blocked(EventType::Signal(1))
+            TaskState::Blocked(Event::Signal(1))
         );
     }
 

@@ -1,5 +1,5 @@
 use crate::config::MAX_SIGNALS;
-use crate::event::EventType;
+use crate::event::Event;
 use crate::schedule::Scheduler;
 
 
@@ -34,12 +34,12 @@ impl Signal {
     }
     //调用event的wake_task函数
     pub fn send(&self) {
-        EventType::wake_task(EventType::Signal(self.id));
+        Event::wake_task(Event::Signal(self.id));
     }
 
     //等待一个信号 阻塞当前任务
     pub fn wait(&self) {
-        Scheduler::get_current_task().block(EventType::Signal(self.id));
+        Scheduler::get_current_task().block(Event::Signal(self.id));
     }
 }
 
@@ -58,7 +58,7 @@ mod tests {
         let task = Task::new("test_signal", |_| {});
         Scheduler::start();
         signal.wait();
-        assert_eq!(task.get_state(), TaskState::Blocked(EventType::Signal(signal.id)));
+        assert_eq!(task.get_state(), TaskState::Blocked(Event::Signal(signal.id)));
         signal.send();
         assert_eq!(task.get_state(), TaskState::Ready);
         Scheduler::schedule();
