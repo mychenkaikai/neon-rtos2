@@ -10,5 +10,4 @@ mod signal;
 mod timer;
 mod systick;
 mod mutex;
-mod mq;
 
