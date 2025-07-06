@@ -1,0 +1,1 @@
+cargo:warning=非ARM目标，跳过汇编编译: thumbv7em-none-eabihf

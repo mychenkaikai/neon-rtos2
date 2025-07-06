@@ -2,9 +2,9 @@
 #![cfg_attr(not(test), no_main)]
 mod arch;
 mod config;
-mod task;
-mod schedule;
-mod utils;
+pub mod task;
+pub mod schedule;
+pub mod utils;
 mod event;
 mod signal;
 mod timer;

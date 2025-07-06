@@ -1,12 +1,14 @@
 use crate::task::{Task, TaskState};
 
 static mut SCHEDULER: Scheduler = Scheduler {
-    current_task: None,
+    current_task: None, 
+    next_task: None,
     is_running: false,
 };
 
-pub(crate) struct Scheduler {
+pub struct Scheduler {
     current_task: Option<Task>,
+    next_task: Option<Task>,
     is_running: bool,
 }
 
@@ -15,6 +17,7 @@ impl Scheduler {
         unsafe {
             SCHEDULER = Scheduler {
                 current_task: None,
+                next_task: None,
                 is_running: false,
             };
         }
@@ -71,12 +74,15 @@ impl Scheduler {
             Task(0).run();
         }
         unsafe { SCHEDULER.is_running = true };
+        //触发当前架构的任务切换
+        crate::arch::start_first_task();
     }
 
     //关闭调度器
     pub fn stop() {
         unsafe { SCHEDULER.is_running = false };
     }
+
 
     pub fn get_current_task() -> Task {
         unsafe { SCHEDULER.current_task.unwrap() }

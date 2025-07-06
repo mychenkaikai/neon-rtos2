@@ -6,7 +6,7 @@ use crate::timer::Timer;
 use crate::systick::Systick;
 use crate::mutex::Mutex;
 
-pub(crate) fn kernel_init() {
+pub fn kernel_init() {
     Task::init();
     Signal::init();
     Scheduler::init();

@@ -114,6 +114,12 @@ impl Task {
         unsafe { TASK_LIST[self.0].stack_top }
     }
 
+    pub fn set_stack_top(&mut self, stack_top: usize) {
+        unsafe {
+            TASK_LIST[self.0].stack_top = stack_top;
+        }
+    }
+
     pub(crate) fn init() {
         unsafe {
             for i in 0..MAX_TASKS {
