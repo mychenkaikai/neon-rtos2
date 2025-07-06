@@ -9,6 +9,7 @@ pub(crate) enum Event {
     Memory(usize),
     Network(usize),
     Mutex(usize),
+    Mq(usize),
 }
 
 impl Event {

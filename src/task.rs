@@ -24,12 +24,6 @@ static mut TASK_STACKS: [Stack; MAX_TASKS] = [const {
     }
 }; MAX_TASKS];
 
-// #[derive(Debug, PartialEq, Clone, Copy)]
-// pub(crate) enum BlockReason {
-//     Signal,
-//     Wait,
-// }
-
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TaskState {
     Uninit,

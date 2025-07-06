@@ -1,173 +1,185 @@
 use crate::config::MAX_MQS;
-use core::marker::PhantomData;
+use crate::event::Event;
+use crate::task::Task;
 use core::mem::MaybeUninit;
-use core::ptr::NonNull;
 
-static mut MQ_LIST: [_Mq; MAX_MQS] = [_Mq {
-    buffer: None,
-    size: 0,
-    head: 0,
-    tail: 0,
-    count: 0,
-    id: 0,
-    used: false,
-}; MAX_MQS];
-
+//全局变量数组，用于给mq分配id
+static mut MQ_LIST: [_Mq; MAX_MQS] = [_Mq { used: false, id: 0 }; MAX_MQS];
 #[derive(Copy, Clone)]
-pub struct _Mq {
-    buffer: Option<NonNull<u8>>,
-    size: usize,  // 每个元素的大小
+struct _Mq {
+    used: bool,
+    id: usize,
+}
+
+
+//仿照mutex，实现任务间的阻塞机制
+pub struct Mq<T, const N: usize> {
+    buffer: [MaybeUninit<T>; N],
     head: usize,
     tail: usize,
     count: usize,
+    locked: bool,
+    owner: Option<Task>,
     id: usize,
-    used: bool,
 }
 
-pub struct Mq<T, const N: usize>(usize, PhantomData<T>);
-
-impl<T, const N: usize> Mq<T, N> {
-    //遍历mq_list，找到一个未使用的mq
-    //入参是用户准备好的类型MqStorage<T, N>
-    pub fn new(data: &'static MqStorage<T, N>) -> Self {
+impl<T, const N: usize> Mq<T, N>
+where
+    T: Copy + Default + Sized,
+{
+    //创建一个mq,这个结构体必定是static分配的，可以直接初始化
+    pub fn new() -> Self {
+        //
+        let mut id: Option<usize> = None;
         unsafe {
             for i in 0..MAX_MQS {
                 if !MQ_LIST[i].used {
                     MQ_LIST[i].used = true;
-                    // 存储数据的首地址
-                    MQ_LIST[i].buffer = NonNull::new(data.data.as_ptr() as *mut u8);
-                    MQ_LIST[i].size = core::mem::size_of::<T>();
-                    MQ_LIST[i].head = 0;
-                    MQ_LIST[i].tail = 0;
-                    MQ_LIST[i].count = 0;
-                    return Mq(i, PhantomData);
+                    id = Some(MQ_LIST[i].id);
+                    break;
                 }
             }
         }
-        panic!("No free mq");
-    }
-
-    fn get_mq(&self) -> &mut _Mq {
-        unsafe { &mut MQ_LIST[self.0] }
-    }
-
-    pub fn delete(&self) {
-        let mq = self.get_mq();
-        mq.count = 0;
-        mq.head = 0;
-        mq.tail = 0;
-        mq.used = false;
-        mq.buffer = None;
-    }
-
-    pub fn send(&self, data: T) {
-        let mq = self.get_mq();
-        if mq.count == N {
-            panic!("MQ is full");
+        //如果id为None，则panic
+        if id.is_none() {
+            panic!("MQ_LIST is full");
         }
 
-        // 检查buffer是否为None
-        let buffer_ptr = match mq.buffer {
-            Some(ptr) => ptr.as_ptr(),
-            None => panic!("MQ buffer is not initialized"),
-        };
-        
+        Mq {
+            buffer: [MaybeUninit::uninit(); N],
+            head: 0,
+            tail: 0,
+            count: 0,
+            locked: false,
+            owner: None,
+            id: id.unwrap(),
+        }
+    }
+
+    pub fn push(&mut self, data: T) -> bool {
+        if self.locked {
+            self.owner.unwrap().block(Event::Mq(self.id));
+            return false;
+        }
+
+        if self.count == N {
+            return false;
+        }
+
         unsafe {
-            if mq.tail < N {
-                // 计算正确的内存位置
-                let elem_ptr = buffer_ptr.add(mq.tail * mq.size) as *mut MaybeUninit<T>;
-                elem_ptr.write(MaybeUninit::new(data));
-                
-                mq.count += 1;
-                mq.tail += 1;
-                if mq.tail == N {
-                    mq.tail = 0;
-                }
-            } else {
-                panic!("MQ tail index out of bounds");
-            }
+            // 直接写入tail位置
+            *self.buffer.get_unchecked_mut(self.tail) = MaybeUninit::new(data);
+
+            self.count += 1;
+            self.tail = (self.tail + 1) % N;
         }
+        //设置owner为空
+        self.owner = None;
+        self.locked = false;
+        //唤醒被阻塞的task
+        Event::wake_task(Event::Mq(self.id));
+        true
     }
 
-    pub fn recv(&self) -> T {
-        let mq = self.get_mq();
-        if mq.count == 0 {
-            panic!("MQ is empty");
+    pub fn pop(&mut self) -> Option<T> {
+        if self.locked {
+            self.owner.unwrap().block(Event::Mq(self.id));
+            return None;
         }
 
-        let buffer_ptr = match mq.buffer {
-            Some(ptr) => ptr.as_ptr(),
-            None => panic!("MQ buffer is not initialized"),
-        };
-        
+        if self.count == 0 {
+            return None;
+        }
+
+        let mut ret: Option<T> = None;
         unsafe {
-            if mq.head < N {
-                // 计算正确的内存位置
-                let elem_ptr = buffer_ptr.add(mq.head * mq.size) as *mut MaybeUninit<T>;
-                let ret = elem_ptr.read().assume_init();
-                
-                mq.count -= 1;
-                mq.head += 1;
-                if mq.head == N {
-                    mq.head = 0;
-                }
-                ret
-            } else {
-                panic!("MQ head index out of bounds");
-            }
+            // 直接从head位置读取
+            ret = Some(self.buffer.get_unchecked(self.head).assume_init());
+
+            self.count -= 1;
+            self.head = (self.head + 1) % N;
         }
+        self.owner = None;
+        self.locked = false;
+        //唤醒被阻塞的task
+        Event::wake_task(Event::Mq(self.id));
+        ret
     }
 }
-
-//使用maybe_uninit来初始化一个数组
-pub struct MqStorage<T, const N: usize> {
-    // 使用数组而不是整体放在MaybeUninit中
-    data: [MaybeUninit<T>; N],
-}
-
-// 允许从多个线程访问
-unsafe impl<T, const N: usize> Sync for MqStorage<T, N> {}
-
-impl<T, const N: usize> MqStorage<T, N> {
-    // 创建一个未初始化但有效的内存区域
-    const ELEM: MaybeUninit<T> = MaybeUninit::uninit();
-    const INIT: [MaybeUninit<T>; N] = [Self::ELEM; N];
-
-    pub const fn new() -> Self {
-        Self { data: Self::INIT }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
-    use crate::mutex::Mutex;
     use crate::schedule::Scheduler;
     use crate::task::Task;
-    use crate::timer::Timer;
     use crate::utils::kernel_init;
 
     #[test]
     fn test_mq() {
         kernel_init();
 
-        // 使用非可变静态数组，使用maybe_uninit
-        static U32_MQ_DATA: MqStorage<u32, 10> = MqStorage::new();
         // 使用非可变静态数组
-        let mq = Mq::<u32, 10>::new(&U32_MQ_DATA);
-        println!("U32_MQ_DATA address: {:p}", &U32_MQ_DATA as *const _);
-        println!("U32_MQ_DATA data: {:?}", mq.get_mq().buffer);
+        let mut mq: Mq<u32, 10> = Mq::<u32, 10>::new();
 
-        mq.send(1);
-        mq.send(2);
-        mq.send(3);
-        mq.send(4);
-        mq.send(5);
-        assert_eq!(mq.recv(), 1);
-        assert_eq!(mq.recv(), 2);
-        assert_eq!(mq.recv(), 3);
-        assert_eq!(mq.recv(), 4);
-        assert_eq!(mq.recv(), 5);
+        assert_eq!(mq.push(1), true);
+        assert_eq!(mq.push(2), true);
+        assert_eq!(mq.push(3), true);
+        assert_eq!(mq.push(4), true);
+        assert_eq!(mq.push(5), true);
+        assert_eq!(mq.push(6), true);
+        assert_eq!(mq.push(7), true);
+        assert_eq!(mq.push(8), true);
+        assert_eq!(mq.push(9), true);
+        assert_eq!(mq.push(10), true);
+        assert_eq!(mq.push(11), false);
+
+        assert_eq!(mq.pop(), Some(1));
+        assert_eq!(mq.pop(), Some(2));
+        assert_eq!(mq.pop(), Some(3));
+        assert_eq!(mq.pop(), Some(4));
+        assert_eq!(mq.pop(), Some(5));
+        assert_eq!(mq.pop(), Some(6));
+        assert_eq!(mq.pop(), Some(7));
+        assert_eq!(mq.pop(), Some(8));
+        assert_eq!(mq.pop(), Some(9));
+        assert_eq!(mq.pop(), Some(10));
+        assert_eq!(mq.pop(), None);
+    }
+
+    //测试两个任务同时push和pop
+    #[test]
+    fn test_mq_multi_task() {
+        kernel_init();
+
+        let mut mq: Mq<u32, 10> = Mq::<u32, 10>::new();
+
+        //任务要空着，不能有参数
+        Task::new("task1", |_| {});
+        Task::new("task2", |_| {});
+        Scheduler::start();
+
+        mq.push(1);
+        mq.push(2);
+
+        Scheduler::schedule();
+
+        assert_eq!(mq.pop(), Some(1));
+        assert_eq!(mq.pop(), Some(2));
+    }
+
+    //测试两个任务同时push和pop，但是一个任务先push，一个任务后push
+    #[test]
+    fn test_mq_multi_task_push_pop() {
+        kernel_init();
+
+        let mut mq: Mq<u32, 10> = Mq::<u32, 10>::new();
+        Task::new("task1", |_| {});
+        Task::new("task2", |_| {});
+        Scheduler::start();
+        //测试可能冲突的情况，第一个任务先获得锁，然后第二个任务获得锁，然后第一个任务push，然后第二个任务pop
+        mq.push(1);
+        mq.push(2);
+        Scheduler::schedule();
+        assert_eq!(mq.pop(), Some(1));
+        assert_eq!(mq.pop(), Some(2));
     }
 }
