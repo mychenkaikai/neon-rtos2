@@ -1,0 +1,19 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cortex-m3 Build (debug)",
+            "type": "process",
+            "command": "cargo",
+            "args": ["build", "--target", "thumbv7m-none-eabi"],
+            "options": {
+                "cwd": "${workspaceFolder}/examples/cortex-m3"
+            },
+            "problemMatcher": ["$rustc"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}

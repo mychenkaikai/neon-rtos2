@@ -2,13 +2,13 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-
 use cortex_m::Peripherals;
 use cortex_m::peripheral::syst::SystClkSource;
+use cortex_m_rt::entry;
 use cortex_m_semihosting::hprintln;
-use neon_rtos2::utils::kernel_init;
-use neon_rtos2::task::Task;
 use neon_rtos2::schedule::Scheduler;
+use neon_rtos2::task::Task;
+use neon_rtos2::utils::kernel_init;
 
 const SYST_FREQ: u32 = 100;
 const SYS_CLOCK: u32 = 12_000_000;
@@ -23,13 +23,18 @@ const SYST_RELOAD: u32 = SYS_CLOCK / SYST_FREQ;
 
 fn test1(_arg: usize) {
     hprintln!("task1");
-    loop {}
+    loop {
+        // hprintln!("task1");
+    }
 }
 fn test2(_arg: usize) {
     hprintln!("task2");
-    loop {}
+    loop {
+        // hprintln!("task2");
+    }
 }
 
+#[entry]
 fn main() -> ! {
     kernel_init();
     let p = Peripherals::take().unwrap();

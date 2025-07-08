@@ -1,0 +1,24 @@
+{
+    /*
+     * Requires the Rust Language Server (rust-analyzer) and Cortex-Debug extensions
+     * https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer
+     * https://marketplace.visualstudio.com/items?itemName=marus25.cortex-debug
+     */
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "cortex-debug",
+            "request": "launch",
+            "name": "cortex-m3 debug",
+            "servertype": "qemu",
+            "cwd": "${workspaceRoot}/examples/cortex-m3",
+            "preLaunchTask": "cortex-m3 Build (debug)",
+            "runToEntryPoint": "main",
+            "executable": "./target/thumbv7m-none-eabi/debug/neon-rtos2-example-cortex-m3",
+            "cpu": "cortex-m3",
+            "machine": "lm3s6965evb",
+            "debuggerArgs": ["-ex", "addr=0x00000000"],
+            "gdbPath": "/opt/homebrew/bin/arm-none-eabi-gdb"
+        }
+    ]
+}
