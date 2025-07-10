@@ -48,7 +48,7 @@ pub(crate) fn start_first_task() {
 #[exception]
 unsafe fn SysTick() {
     Systick::systick_inc();
-    Scheduler::schedule();
+    SCB::set_pendsv();
 }
 
 #[exception]

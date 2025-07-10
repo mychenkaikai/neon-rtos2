@@ -2,7 +2,6 @@ use crate::config::MAX_SIGNALS;
 use crate::event::Event;
 use crate::schedule::Scheduler;
 
-
 static mut SIGNAL_LIST: [Signal; MAX_SIGNALS] = [Signal { used: false, id: 0 }; MAX_SIGNALS];
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -21,17 +20,22 @@ impl Signal {
         }
     }
     //创建一个信号
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
+        Self { used: false, id: 0 }
+    }
+    pub fn open(&self) {
         unsafe {
             for i in 0..MAX_SIGNALS {
                 if !SIGNAL_LIST[i].used {
                     SIGNAL_LIST[i].used = true;
-                    return Self { used: true, id: i };
+                    SIGNAL_LIST[i].id = i;
+                    return;
                 }
             }
         }
         panic!("Signal list is full");
     }
+
     //调用event的wake_task函数
     pub fn send(&self) {
         Event::wake_task(Event::Signal(self.id));
@@ -58,7 +62,10 @@ mod tests {
         let task = Task::new("test_signal", |_| {});
         Scheduler::start();
         signal.wait();
-        assert_eq!(task.get_state(), TaskState::Blocked(Event::Signal(signal.id)));
+        assert_eq!(
+            task.get_state(),
+            TaskState::Blocked(Event::Signal(signal.id))
+        );
         signal.send();
         assert_eq!(task.get_state(), TaskState::Ready);
         Scheduler::schedule();
