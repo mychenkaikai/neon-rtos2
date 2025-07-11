@@ -3,6 +3,12 @@ name = "neon-rtos2"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [
+    ".",
+    "examples/cortex-m3"
+]
+
 [dependencies]
 
 [features]
