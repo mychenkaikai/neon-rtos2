@@ -14,11 +14,11 @@
             "cwd": "${workspaceRoot}/examples/cortex-m3",
             "preLaunchTask": "cortex-m3 Build (debug)",
             "runToEntryPoint": "main",
-            "executable": "./target/thumbv7m-none-eabi/debug/neon-rtos2-example-cortex-m3",
+            "executable": "${workspaceRoot}/target/thumbv7m-none-eabi/debug/neon-rtos2-example-cortex-m3",
             "cpu": "cortex-m3",
             "machine": "lm3s6965evb",
             "debuggerArgs": ["-ex", "addr=0x00000000"],
-            "gdbPath": "gdb-multiarch"
+            "gdbPath": "arm-none-eabi-gdb"
         }
     ]
 }
