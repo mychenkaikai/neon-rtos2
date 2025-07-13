@@ -18,15 +18,8 @@ elif [ "$1" = "run" ]; then
     -machine lm3s6965evb \
     -nographic \
     -semihosting-config enable=on,target=native \
-    -kernel target/thumbv7m-none-eabi/debug/neon-rtos2-example-cortex-m3 \
-    -s -S
+    -kernel target/thumbv7m-none-eabi/debug/neon-rtos2-example-cortex-m3 
 
-elif [ "$1" = "debug" ]; then
-    cd examples/cortex-m3
-    arm-none-eabi-gdb \
-    target/thumbv7m-none-eabi/debug/neon-rtos2-example-cortex-m3 \
-    -ex "target remote localhost:1234" \
-    -ex "load"
 else
     echo "Usage: ./build.sh [test|build]"
     exit 1

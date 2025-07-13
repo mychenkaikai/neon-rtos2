@@ -10,6 +10,7 @@ members = [
 ]
 
 [dependencies]
+paste = "1.0"
 
 [features]
 default = ["cortex_m3"]

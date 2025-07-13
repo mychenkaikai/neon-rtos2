@@ -9,33 +9,31 @@ use cortex_m_semihosting::hprintln;
 use neon_rtos2::schedule::Scheduler;
 use neon_rtos2::task::Task;
 use neon_rtos2::utils::kernel_init;
-use neon_rtos2::signal::Signal;
+use neon_rtos2::define_signal;
 
 const SYST_FREQ: u32 = 100;
 const SYS_CLOCK: u32 = 12_000_000;
 // 定义 SysTick 的重新加载值
 const SYST_RELOAD: u32 = SYS_CLOCK / SYST_FREQ;
 
-static SIGNAL: Signal = Signal::new();
-
 // #[panic_handler]
 // fn panic_halt(p: &PanicInfo) -> ! {
 //     hprintln!("{}", p);
 //     loop {}
 // }
-
+define_signal!(MY_SIGNAL);
 fn test1(_arg: usize) {
     hprintln!("task1");
     loop {
         hprintln!("task1");
-        SIGNAL.wait();
+        MY_SIGNAL().wait();
     }
 }
 fn test2(_arg: usize) {
     hprintln!("task2");
     loop {
         hprintln!("task2");
-        // SIGNAL.send();
+        // MY_SIGNAL().send();
     }
 }
 
@@ -50,7 +48,6 @@ fn main() -> ! {
     syst.enable_counter();
     syst.enable_interrupt();
 
-    SIGNAL.open();
 
     let task1 = Task::new("task1", test1);
     let task2 = Task::new("task2", test2);
