@@ -4,7 +4,7 @@
 
 if [ "$1" = "test" ]; then
     # RUST_BACKTRACE=full cargo test -- --test-threads=1 --nocapture
-    cargo test -- --test-threads=1
+    RUSTFLAGS='--cfg test' cargo test --lib -- --test-threads=1
 elif [ "$1" = "build" ]; then
     cd examples/cortex-m3
     cargo build --target=thumbv7m-none-eabi

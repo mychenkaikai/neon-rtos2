@@ -33,7 +33,7 @@ fn test2(_arg: usize) {
     hprintln!("task2");
     loop {
         hprintln!("task2");
-        // MY_SIGNAL().send();
+        MY_SIGNAL().send();
     }
 }
 
@@ -48,7 +48,7 @@ fn main() -> ! {
     syst.enable_counter();
     syst.enable_interrupt();
 
-
+    MY_SIGNAL().open();
     let task1 = Task::new("task1", test1);
     let task2 = Task::new("task2", test2);
 
