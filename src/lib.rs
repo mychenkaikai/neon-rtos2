@@ -11,6 +11,6 @@ pub mod timer;
 pub mod systick;
 mod mutex;
 mod mq;
-
+pub mod log;
 
 pub use paste;
