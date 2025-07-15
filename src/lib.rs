@@ -5,10 +5,10 @@ mod config;
 pub mod task;
 pub mod schedule;
 pub mod utils;
-mod event;
+pub mod event;
 pub mod signal;
 pub mod timer;
-mod systick;
+pub mod systick;
 mod mutex;
 mod mq;
 

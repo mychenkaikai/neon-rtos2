@@ -8,7 +8,6 @@ use crate::mutex::Mutex;
 
 pub fn kernel_init() {
     Task::init();
-    //Signal::init();
     Scheduler::init();
     Timer::init();
     Systick::init();

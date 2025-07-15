@@ -2,7 +2,7 @@ use crate::task::Task;
 
 static mut CURRENT_TIME: usize = 0;
 
-pub(crate) struct Systick;
+pub struct Systick;
 
 impl Systick {
     pub(crate) fn init() {
@@ -24,7 +24,7 @@ impl Systick {
     }
 
     #[cfg(test)]
-    pub(crate) fn add_current_time(ms_time: usize) -> usize {
+    pub fn add_current_time(ms_time: usize) -> usize {
         unsafe {
             CURRENT_TIME += ms_time;
             return CURRENT_TIME;

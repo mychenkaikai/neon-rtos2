@@ -2,7 +2,7 @@ use crate::task::Task;
 use crate::task::TaskState;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) enum Event {
+pub enum Event {
     Signal(usize),
     Timer(usize),
     Ipc(usize),

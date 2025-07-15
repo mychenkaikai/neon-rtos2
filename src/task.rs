@@ -25,7 +25,7 @@ static mut TASK_STACKS: [Stack; MAX_TASKS] = [const {
 }; MAX_TASKS];
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) enum TaskState {
+pub enum TaskState {
     Uninit,
     Ready,
     Running,
@@ -156,30 +156,18 @@ impl Task {
         F: FnMut(&mut Task, usize) -> (),
     {
         unsafe {
-            if start == MAX_TASKS - 1 {
-                for i in 0..start {
-                    if TASK_LIST[i].state != TaskState::Uninit {
-                        f(&mut Task(i), i);
-                    }
+            for i in start..MAX_TASKS {
+                if TASK_LIST[i].state != TaskState::Uninit {
+                    f(&mut Task(i), i);
                 }
-            } else {
-                for i in start..MAX_TASKS {
-                    if TASK_LIST[i].state != TaskState::Uninit {
-                        f(&mut Task(i), i);
-                    }
-                }
-                for i in 0..start {
-                    if TASK_LIST[i].state != TaskState::Uninit {
-                        f(&mut Task(i), i);
-                    }
+            }
+            for i in 0..start {
+                if TASK_LIST[i].state != TaskState::Uninit {
+                    f(&mut Task(i), i);
                 }
             }
         }
     }
-
-
-
-
 }
 
 #[cfg(test)]
