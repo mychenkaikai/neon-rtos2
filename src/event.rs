@@ -55,7 +55,7 @@ mod tests {
         assert_eq!(task3.get_state(), TaskState::Blocked(Event::Signal(3)));
         assert_eq!(task4.get_state(), TaskState::Blocked(Event::Signal(4)));
         assert_eq!(task5.get_state(), TaskState::Blocked(Event::Signal(5)));
-        Scheduler::schedule();
+        Scheduler::task_switch();
         //调度之后任务依然为阻塞状态
         assert_eq!(task1.get_state(), TaskState::Blocked(Event::Signal(1)));
         assert_eq!(task2.get_state(), TaskState::Blocked(Event::Signal(2)));
@@ -69,7 +69,7 @@ mod tests {
         assert_eq!(task3.get_state(), TaskState::Blocked(Event::Signal(3)));
         assert_eq!(task4.get_state(), TaskState::Blocked(Event::Signal(4)));
         assert_eq!(task5.get_state(), TaskState::Blocked(Event::Signal(5)));
-        Scheduler::schedule();
+        Scheduler::task_switch();
         //调度之后当前任务为运行状态，其他任务为阻塞状态
         //打印所有任务状态
         Task::for_each(|task, _| {

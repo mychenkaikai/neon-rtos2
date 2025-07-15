@@ -6,6 +6,8 @@ use cortex_m::register::psp;
 use cortex_m_rt::exception;
 use cortex_m_rt::ExceptionFrame;
 use crate::systick::Systick;
+use crate::timer::Timer;
+use crate::task::Task;
 
 pub(crate) fn init_task_stack(top_of_stack: &mut usize, func: fn(usize), p_args: usize) {
     unsafe {
@@ -26,7 +28,7 @@ pub(crate) fn init_task_stack(top_of_stack: &mut usize, func: fn(usize), p_args:
 #[unsafe(no_mangle)]
 fn task_switch_context(psp: *mut u32) -> *mut u32 {
     Scheduler::get_current_task().set_stack_top(psp as usize);
-    Scheduler::schedule();
+    Scheduler::task_switch();
     Scheduler::get_current_task().get_stack_top() as *mut u32
 }
 
@@ -36,11 +38,15 @@ fn set_psp(psp: usize) {
     }
 }
 
-pub(crate) fn start_first_task() {
-    set_psp(Scheduler::get_current_task().get_stack_top() + 8 * size_of::<usize>());
+pub(crate) fn trigger_schedule() {
     cortex_m::asm::dsb();
     cortex_m::asm::isb();
     SCB::set_pendsv();
+}
+
+pub(crate) fn start_first_task() {
+    set_psp(Scheduler::get_current_task().get_stack_top() + 8 * size_of::<usize>());
+    trigger_schedule();
 }
 
 
@@ -48,7 +54,8 @@ pub(crate) fn start_first_task() {
 #[exception]
 unsafe fn SysTick() {
     Systick::systick_inc();
-    SCB::set_pendsv();
+    Timer::timer_check_and_send_event();
+    trigger_schedule();
 }
 
 #[exception]
@@ -58,4 +65,13 @@ unsafe fn HardFault(_ef: &ExceptionFrame) -> ! {
 #[exception]
 unsafe fn DefaultHandler(_val: i16) -> ! {
     loop {}
+}
+
+pub(crate) fn init_idle_task() {
+    fn idle_task(_arg: usize) {
+        loop {
+            cortex_m::asm::wfi();
+        }
+    }
+    let task = Task::new("idle", idle_task);
 }

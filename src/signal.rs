@@ -2,6 +2,7 @@ use crate::config::MAX_SIGNALS;
 use crate::event::Event;
 use crate::schedule::Scheduler;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::arch::trigger_schedule;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct Signal {
@@ -30,6 +31,7 @@ impl Signal {
     //等待一个信号 阻塞当前任务
     pub fn wait(&self) {
         Scheduler::get_current_task().block(Event::Signal(self.id));
+        trigger_schedule();
     }
 }
 
@@ -42,6 +44,7 @@ macro_rules! define_signal {
             #[allow(non_snake_case)]
             fn $name() -> &'static mut $crate::signal::Signal {
                 unsafe {
+                    [<__SIGNAL_ $name>].open();
                     &mut [<__SIGNAL_ $name>]
                 }
             }
@@ -70,7 +73,7 @@ mod tests {
         );
         signal.send();
         assert_eq!(task.get_state(), TaskState::Ready);
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(task.get_state(), TaskState::Running);
     }
 }

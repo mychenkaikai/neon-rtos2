@@ -9,7 +9,7 @@ use core::prelude::rust_2024::*;
 use core::ptr::addr_of;
 
 // 在lib.rs或main.rs中
-#[unsafe(no_mangle)]
+
 static mut TASK_LIST: [TCB; MAX_TASKS] = [TCB {
     stack_top: 0,
     name: "noinit",

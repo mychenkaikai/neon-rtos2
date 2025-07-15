@@ -160,7 +160,7 @@ mod tests {
         mq.push(1);
         mq.push(2);
 
-        Scheduler::schedule();
+        Scheduler::task_switch();
 
         assert_eq!(mq.pop(), Some(1));
         assert_eq!(mq.pop(), Some(2));
@@ -178,7 +178,7 @@ mod tests {
         //测试可能冲突的情况，第一个任务先获得锁，然后第二个任务获得锁，然后第一个任务push，然后第二个任务pop
         mq.push(1);
         mq.push(2);
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(mq.pop(), Some(1));
         assert_eq!(mq.pop(), Some(2));
     }

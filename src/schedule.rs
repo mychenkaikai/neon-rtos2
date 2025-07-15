@@ -1,4 +1,5 @@
 use crate::task::{Task, TaskState};
+use crate::arch::init_idle_task;
 
 static mut SCHEDULER: Scheduler = Scheduler {
     current_task: None, 
@@ -20,11 +21,14 @@ impl Scheduler {
                 next_task: None,
                 is_running: false,
             };
+
+            init_idle_task();
+
         }
     }
     //使用task::for_each_from遍历所有任务,找到当前任务之后的下一个非阻塞任务,如果当前任务是最后一个任务,则找到第一个任务
     //但也要考虑其他任务找不到准备状态，此时currenttask还是原任务
-    pub fn schedule() {
+    pub fn task_switch() {
         // 如果调度器未运行，直接返回
         if !unsafe { SCHEDULER.is_running } {
             return;
@@ -141,7 +145,7 @@ mod tests {
         });
         assert_eq!(running_count, 1);
         assert_eq!(ready_count, 4);
-        Scheduler::schedule();
+        Scheduler::task_switch();
         running_count = 0;
         ready_count = 0;
         Task::for_each(|task, _| {
@@ -154,7 +158,7 @@ mod tests {
         });
         assert_eq!(running_count, 1);
         assert_eq!(ready_count, 4);
-        Scheduler::schedule();
+        Scheduler::task_switch();
         running_count = 0;
         ready_count = 0;
         Task::for_each(|task, _| {
@@ -183,12 +187,12 @@ mod tests {
             unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
             TaskState::Blocked(Event::Signal(1))
         );
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(
             unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
             TaskState::Running
         );
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(
             unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
             TaskState::Running
@@ -207,7 +211,7 @@ mod tests {
         unsafe { SCHEDULER.current_task.unwrap() }.block(Event::Signal(1));
         //保存此时的current_task为block_task
         let block_task = unsafe { SCHEDULER.current_task.unwrap() };
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(
             unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
             TaskState::Running
@@ -217,7 +221,7 @@ mod tests {
             block_task.get_state(),
             TaskState::Blocked(Event::Signal(1))
         );
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(
             unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
             TaskState::Running
@@ -238,7 +242,7 @@ mod tests {
         Scheduler::start();
         let current_task = unsafe { SCHEDULER.current_task.unwrap() };
         Scheduler::stop();
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(current_task.get_state(), TaskState::Running);
     }
 }

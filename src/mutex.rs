@@ -58,7 +58,7 @@ impl Mutex {
     pub fn unlock(&self) {
         unsafe {
             if MUTEX_LIST[self.0].owner != Some(Scheduler::get_current_task()) {
-                panic!("Mutex not owned by current task");
+                panic!("Mutex not owned by current task {:?}", MUTEX_LIST[self.0].owner.unwrap().get_name());
             }
             MUTEX_LIST[self.0].locked = false;
             MUTEX_LIST[self.0].owner = None;
@@ -100,7 +100,7 @@ mod tests {
         );
         let old_task = Scheduler::get_current_task();
         //如果任务被调度走，处于ready状态
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(old_task.get_state(), TaskState::Ready);
 
         //此时模拟运行第二个任务，第二个任务尝试获取锁，会panic
@@ -142,7 +142,7 @@ mod tests {
             Scheduler::get_current_task().get_state(),
             TaskState::Running
         );
-        Scheduler::schedule();
+        Scheduler::task_switch();
 
         mutex.lock();
         assert_eq!(
@@ -174,14 +174,14 @@ mod tests {
             Scheduler::get_current_task().get_state(),
             TaskState::Running
         );
-        Scheduler::schedule();
+        Scheduler::task_switch();
         mutex.lock();
         let old_task = Scheduler::get_current_task();
         assert_eq!(
             old_task.get_state(),
             TaskState::Blocked(Event::Mutex(mutex.0))
         );
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(
             Scheduler::get_current_task().get_state(),
             TaskState::Running
@@ -193,7 +193,7 @@ mod tests {
             TaskState::Running
         );
         assert_eq!(old_task.get_state(), TaskState::Ready);
-        Scheduler::schedule();
+        Scheduler::task_switch();
         assert_eq!(
             Scheduler::get_current_task().get_state(),
             TaskState::Running
