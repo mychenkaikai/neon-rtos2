@@ -134,7 +134,48 @@ macro_rules! trace {
     };
 }
 
-/// 初始化日志系统
-pub fn init() {
-    // 无需初始化静态记录器，直接使用函数调用
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_log_level_setting() {
+        // 测试默认日志级别
+        assert_eq!(get_log_level(), LogLevel::Info);
+        
+        // 测试设置日志级别
+        set_log_level(LogLevel::Debug);
+        assert_eq!(get_log_level(), LogLevel::Debug);
+        
+        set_log_level(LogLevel::Error);
+        assert_eq!(get_log_level(), LogLevel::Error);
+    }
+    
+    #[test]
+    fn test_log_writer() {
+        // 测试LogWriter的write_str功能
+        let mut writer = LogWriter;
+        let result = writer.write_str("测试日志");
+        assert!(result.is_ok());
+    }
+    
+    #[test]
+    fn test_log_level_comparison() {
+        // 测试日志级别的比较
+        assert!(LogLevel::Error < LogLevel::Warn);
+        assert!(LogLevel::Warn < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Debug);
+        assert!(LogLevel::Debug < LogLevel::Trace);
+    }
+    
+    #[test]
+    fn test_log_macros() {
+        // 测试各种日志宏
+        // 由于宏输出内容难以直接验证，这里主要测试不会崩溃
+        error!("这是一个错误");
+        warn!("这是一个警告");
+        info!("这是一条信息");
+        debug!("这是一条调试信息");
+        trace!("这是一条跟踪信息");
+    }
 }

@@ -29,6 +29,7 @@ mod tests {
     use crate::schedule::Scheduler;
     use crate::task::Task;
     use crate::task::TaskState;
+    use crate::utils::kernel_init;
 
     fn task1(_args: usize) {}
     fn task2(_args: usize) {}
@@ -98,5 +99,79 @@ mod tests {
         assert_eq!(cnt, 1); //只有一个任务是运行状态
         //停止调度器
         Scheduler::stop();
+    }
+
+    #[test]
+    fn test_wake_task_with_no_blocked_tasks() {
+        kernel_init();
+        
+        Task::new("wake_test1", |_| {});
+        Task::new("wake_test2", |_| {});
+        
+        // 所有任务都处于就绪状态
+        
+        // 尝试唤醒没有被阻塞的事件
+        Event::wake_task(Event::Signal(99));
+        
+        // 确认任务状态没有变化
+        let mut ready_count = 0;
+        Task::for_each(|task, _| {
+            if task.get_state() == TaskState::Ready {
+                ready_count += 1;
+            }
+        });
+        
+        assert_eq!(ready_count, 2);
+    }
+    
+    #[test]
+    fn test_multiple_blocked_same_event() {
+        kernel_init();
+        
+        let mut task1 = Task::new("same_event1", |_| {});
+        let mut task2 = Task::new("same_event2", |_| {});
+        let mut task3 = Task::new("same_event3", |_| {});
+        
+        Scheduler::start();
+        
+        // 多个任务被相同事件阻塞
+        task1.block(Event::Signal(5));
+        task2.block(Event::Signal(5));
+        task3.block(Event::Signal(5));
+        
+        assert_eq!(task1.get_state(), TaskState::Blocked(Event::Signal(5)));
+        assert_eq!(task2.get_state(), TaskState::Blocked(Event::Signal(5)));
+        assert_eq!(task3.get_state(), TaskState::Blocked(Event::Signal(5)));
+        
+        // 唤醒被同一事件阻塞的所有任务
+        Event::wake_task(Event::Signal(5));
+        
+        assert_eq!(task1.get_state(), TaskState::Ready);
+        assert_eq!(task2.get_state(), TaskState::Ready);
+        assert_eq!(task3.get_state(), TaskState::Ready);
+    }
+    
+    #[test]
+    fn test_different_event_types() {
+        kernel_init();
+        
+        let mut task1 = Task::new("diff_event1", |_| {});
+        let mut task2 = Task::new("diff_event2", |_| {});
+        let mut task3 = Task::new("diff_event3", |_| {});
+        
+        Scheduler::start();
+        
+        // 不同类型的事件阻塞
+        task1.block(Event::Signal(1));
+        task2.block(Event::Timer(1));
+        task3.block(Event::Mutex(1));
+        
+        // 唤醒特定类型事件
+        Event::wake_task(Event::Signal(1));
+        
+        // 只有对应事件类型的任务被唤醒
+        assert_eq!(task1.get_state(), TaskState::Ready);
+        assert_eq!(task2.get_state(), TaskState::Blocked(Event::Timer(1)));
+        assert_eq!(task3.get_state(), TaskState::Blocked(Event::Mutex(1)));
     }
 }

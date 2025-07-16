@@ -1,0 +1,17 @@
+[package]
+name = "neon-rtos2-example-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+neon-rtos2 = { path = "../.." ,features = ["cortex_m3"]}
+cortex-m-semihosting = "0.5.0"
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.3"
+alloc-cortex-m = "0.4.4"
+
+
+[[bin]]
+name = "mutex_test"
+path = "src/bin/main.rs"

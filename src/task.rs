@@ -273,4 +273,73 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn test_task_state_transitions() {
+        kernel_init();
+        let mut task = Task::new("transition_task", |_| {});
+        
+        // 测试所有状态转换
+        assert_eq!(task.get_state(), TaskState::Ready);
+        
+        task.run();
+        assert_eq!(task.get_state(), TaskState::Running);
+        
+        task.block(Event::Signal(1));
+        assert_eq!(task.get_state(), TaskState::Blocked(Event::Signal(1)));
+        
+        task.ready();
+        assert_eq!(task.get_state(), TaskState::Ready);
+    }
+    
+    #[test]
+    fn test_task_stack_manipulation() {
+        kernel_init();
+        let mut task = Task::new("stack_task", |_| {});
+        
+        let original_stack_top = task.get_stack_top();
+        assert_ne!(original_stack_top, 0);
+        
+        // 测试修改栈顶
+        let new_stack_top = original_stack_top + 16;
+        task.set_stack_top(new_stack_top);
+        assert_eq!(task.get_stack_top(), new_stack_top);
+    }
+    
+    #[test]
+    fn test_for_each_with_no_tasks() {
+        // 重新初始化任务列表，不创建任务
+        Task::init();
+        
+        let mut count = 0;
+        Task::for_each(|_, _| {
+            count += 1;
+        });
+        
+        // 应该没有任务被遍历
+        assert_eq!(count, 0);
+    }
+    
+    #[test]
+    fn test_for_each_from_with_gap() {
+        kernel_init();
+        
+        // 创建几个任务，但中间有空隙
+        Task::new("task_1", |_| {});
+        // task_2位置空出来
+        let task3 = Task::new("task_3", |_| {});
+        
+        let mut count = 0;
+        let mut found_task3 = false;
+        
+        Task::for_each_from(0, |task, _| {
+            count += 1;
+            if task.get_taskid() == task3.get_taskid() {
+                found_task3 = true;
+            }
+        });
+        
+        assert_eq!(count, 2); // 只应遍历两个任务
+        assert!(found_task3); // 应该找到task3
+    }
 }

@@ -245,4 +245,68 @@ mod tests {
         Scheduler::task_switch();
         assert_eq!(current_task.get_state(), TaskState::Running);
     }
+
+    #[test]
+    fn test_all_tasks_blocked() {
+        kernel_init();
+        let mut task1 = Task::new("blocked_task1", |_| {});
+        let mut task2 = Task::new("blocked_task2", |_| {});
+        
+        Scheduler::start();
+        
+        // 阻塞所有任务
+        task1.block(Event::Signal(1));
+        task2.block(Event::Signal(2));
+        
+        // 保存当前任务状态
+        let current_state = Scheduler::get_current_task().get_state();
+        
+        // 尝试调度 - 此时应该没有可调度任务
+        Scheduler::task_switch();
+        
+        // 当前任务状态应该保持不变
+        assert_eq!(Scheduler::get_current_task().get_state(), current_state);
+    }
+    
+    #[test]
+    fn test_schedule_after_unblock() {
+        kernel_init();
+        
+        let mut task1 = Task::new("unblock_test1", |_| {});
+        let mut task2 = Task::new("unblock_test2", |_| {});
+        
+        Scheduler::start();
+        
+        // 阻塞当前任务
+        task1.block(Event::Signal(1));
+        
+        // 调度到下一个任务
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task().get_taskid(), task2.get_taskid());
+        
+        // 唤醒被阻塞的任务
+        task1.ready();
+        
+        // 再次调度
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task().get_taskid(), task1.get_taskid());
+    }
+    
+    #[test]
+    fn test_start_stop_restart() {
+        kernel_init();
+        Task::new("restart_test", |_| {});
+        
+        // 启动调度器
+        Scheduler::start();
+        assert!(unsafe { SCHEDULER.is_running });
+        
+        // 停止调度器
+        Scheduler::stop();
+        assert!(!unsafe { SCHEDULER.is_running });
+        
+        // 重新启动调度器
+        Scheduler::start();
+        assert!(unsafe { SCHEDULER.is_running });
+    }
 }

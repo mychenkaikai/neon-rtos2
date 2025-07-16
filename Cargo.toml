@@ -6,7 +6,8 @@ edition = "2024"
 [workspace]
 members = [
     ".",
-    "examples/cortex-m3"
+    "examples/cortex-m3",
+    "examples/tests/"
 ]
 
 [dependencies]

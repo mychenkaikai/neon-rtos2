@@ -9,7 +9,7 @@ pub mod event;
 pub mod signal;
 pub mod timer;
 pub mod systick;
-mod mutex;
+pub mod mutex;
 mod mq;
 pub mod log;
 

@@ -20,6 +20,19 @@ elif [ "$1" = "run" ]; then
     -semihosting-config enable=on,target=native \
     -kernel target/thumbv7m-none-eabi/debug/neon-rtos2-example-cortex-m3 
 
+elif [ "$1" = "qemu-tests" ]; then
+    
+
+    cargo build --example tests --target=thumbv7m-none-eabi
+
+    #运行cortex-m3的测试例子
+    qemu-system-arm \
+    -cpu cortex-m3 \
+    -machine lm3s6965evb \
+    -nographic \
+    -semihosting-config enable=on,target=native \
+    -kernel target/thumbv7m-none-eabi/debug/neon-rtos2-example-tests 
+
 else
     echo "Usage: ./build.sh [test|build]"
     exit 1

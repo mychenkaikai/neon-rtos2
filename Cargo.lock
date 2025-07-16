@@ -199,6 +199,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "neon-rtos2-example-tests"
+version = "0.1.0"
+dependencies = [
+ "alloc-cortex-m",
+ "cortex-m",
+ "cortex-m-rt",
+ "cortex-m-semihosting",
+ "neon-rtos2",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

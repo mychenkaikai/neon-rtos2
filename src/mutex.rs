@@ -201,4 +201,74 @@ mod tests {
         assert_eq!(old_task.get_state(), TaskState::Running);
 
     }
+
+    #[test]
+    #[should_panic(expected = "No free mutex slot")]
+    fn test_mutex_overflow() {
+        kernel_init();
+        
+        // 分配超过最大数量的互斥锁
+        for _ in 0..MAX_MUTEXES + 1 {
+            Mutex::new();
+        }
+    }
+    
+    #[test]
+    fn test_mutex_reuse() {
+        kernel_init();
+        Task::new("reuse_test", |_| {});
+        Scheduler::start();
+        
+        // 创建一个互斥锁
+        let mutex1 = Mutex::new();
+        
+        // 使用后释放它
+        mutex1.lock();
+        mutex1.unlock();
+        
+        // 释放互斥锁本身（通过drop）
+        drop(mutex1);
+        
+        // 创建一个新的互斥锁，应该能重用之前的槽位
+        let mutex2 = Mutex::new();
+        
+        // 确保可以正常使用
+        mutex2.lock();
+        mutex2.unlock();
+    }
+    
+    #[test]
+    fn test_multiple_blocked_tasks() {
+        kernel_init();
+        
+        let mutex = Mutex::new();
+        Task::new("block_test1", |_| {});
+        Task::new("block_test2", |_| {});
+        Task::new("block_test3", |_| {});
+        
+        Scheduler::start();
+        
+        // 第一个任务获取锁
+        mutex.lock();
+        
+        // 切换到第二个任务，尝试获取锁，应该被阻塞
+        Scheduler::task_switch();
+        let task2 = Scheduler::get_current_task();
+        mutex.lock();
+        
+        // 切换到第三个任务，尝试获取锁，也应该被阻塞
+        Scheduler::task_switch();
+        let task3 = Scheduler::get_current_task();
+        mutex.lock();
+        
+        // 切换回第一个任务
+        Scheduler::task_switch();
+        
+        // 第一个任务释放锁
+        mutex.unlock();
+        
+        // 验证被阻塞的任务是否被唤醒
+        assert_eq!(task2.get_state(), TaskState::Ready);
+        assert_eq!(task3.get_state(), TaskState::Ready);
+    }
 }

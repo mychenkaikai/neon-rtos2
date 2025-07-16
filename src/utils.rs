@@ -14,11 +14,6 @@ pub fn kernel_init() {
     Mutex::init();
 }
 
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
 
 pub(crate) fn task_exit_error() -> ! {
     loop {}
