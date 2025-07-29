@@ -1,6 +1,6 @@
 use crate::config::HEAP_SIZE;
 use core::mem::MaybeUninit;
-use embedded_alloc::LlffHeap as Heap;
+use embedded_alloc::Heap as Heap;
 
 // 静态分配堆内存
 static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
