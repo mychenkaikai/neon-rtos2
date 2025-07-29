@@ -5,8 +5,10 @@ use crate::schedule::Scheduler;
 use crate::timer::Timer;
 use crate::systick::Systick;
 use crate::mutex::Mutex;
+use crate::allocator::init_heap;
 
 pub fn kernel_init() {
+    init_heap();
     Task::init();
     Scheduler::init();
     Timer::init();

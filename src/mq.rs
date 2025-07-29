@@ -4,10 +4,9 @@ use crate::task::Task;
 use core::mem::MaybeUninit;
 
 //全局变量数组，用于给mq分配id
-static mut MQ_LIST: [_Mq; MAX_MQS] = [_Mq { used: false, id: 0 }; MAX_MQS];
+static mut MQ_LIST: [Option<_Mq>; MAX_MQS] = [None; MAX_MQS];
 #[derive(Copy, Clone)]
 struct _Mq {
-    used: bool,
     id: usize,
 }
 
@@ -33,9 +32,9 @@ where
         let mut id: Option<usize> = None;
         unsafe {
             for i in 0..MAX_MQS {
-                if !MQ_LIST[i].used {
-                    MQ_LIST[i].used = true;
-                    id = Some(MQ_LIST[i].id);
+                if MQ_LIST[i].is_none() {
+                    MQ_LIST[i] = Some(_Mq { id: i });
+                    id = Some(MQ_LIST[i].unwrap().id);
                     break;
                 }
             }
