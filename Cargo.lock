@@ -185,6 +185,7 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "cortex-m-semihosting",
+ "critical-section",
  "embedded-alloc",
  "paste",
  "rand",

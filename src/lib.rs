@@ -16,7 +16,6 @@ pub mod mutex;
 mod mq;
 pub mod log;
 pub mod ipc;
-pub mod ipc_elegant;
 #[cfg(not(test))]
 mod allocator;
 

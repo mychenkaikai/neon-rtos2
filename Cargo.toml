@@ -15,8 +15,12 @@ paste = "1.0"
 
 [features]
 default = ["cortex_m3"]
-cortex_m3 = ["cortex-m", "cortex-m-rt", "embedded-alloc", "spin","cortex-m-semihosting"]
-riscv = ["riscv-rt", "embedded-alloc"]
+cortex_m3 = ["cortex-m", "cortex-m-rt", "embedded-alloc", "spin","cortex-m-semihosting","critical-section"]
+riscv = ["riscv-rt", "embedded-alloc","critical-section"]
+
+[dependencies.critical-section]
+version = "1.2"
+optional = true
 
 [dependencies.cortex-m]
 version = "0.7.7"

@@ -8,14 +8,16 @@ use core::panic;
 use core::prelude::rust_2024::*;
 use core::ptr::addr_of;
 
+use spin::{RwLock, Once};
+
+#[cfg(feature = "embedded-alloc")]
+use alloc::boxed::Box;
+#[cfg(not(feature = "embedded-alloc"))]
+use std::boxed::Box;
+
 // 在lib.rs或main.rs中
 
-static mut TASK_LIST: [TCB; MAX_TASKS] = [TCB {
-    stack_top: 0,
-    name: "noinit",
-    taskid: 0,
-    state: TaskState::Uninit,
-}; MAX_TASKS];
+static TASK_LIST: Once<RwLock<[TCB; MAX_TASKS]>> = Once::new();
 
 #[unsafe(no_mangle)]
 static mut TASK_STACKS: [Stack; MAX_TASKS] = [const {
@@ -38,37 +40,93 @@ pub struct Stack {
     pub data: [u8; STACK_SIZE],
 }
 
+pub trait TaskFunction: Send + 'static + Sync {
+    fn call(self: Box<Self>, task_id: usize);
+}
+
+// 为闭包实现TaskFunction
+impl<F> TaskFunction for F
+where
+    F: FnOnce(usize) + Send + 'static + Sync,
+{
+    fn call(self: Box<Self>, task_id: usize) {
+        (*self)(task_id);
+    }
+}
+
 #[repr(C)]
-#[derive(Clone, PartialEq, Copy)]
 pub struct TCB {
-    // 任务控制块的字段
     pub(crate) stack_top: usize,
     pub(crate) name: &'static str,
     pub(crate) taskid: usize,
     pub(crate) state: TaskState,
+    pub(crate) task_fn: Option<Box<dyn TaskFunction>>,
 }
 
 #[derive(Clone, PartialEq, Copy)]
 pub struct Task(pub usize);
 
-impl TCB {
-    pub fn init(&mut self, name: &'static str, func: fn(usize), taskid: usize, stack_top: usize) {
-        self.stack_top = stack_top;
-        self.taskid = taskid;
+fn get_task_list() -> &'static RwLock<[TCB; MAX_TASKS]> {
+    TASK_LIST.call_once(|| {
+        RwLock::new([(); MAX_TASKS].map(|_| TCB::new()))
+    })
+}
 
-        self.name = name;
-        self.state = TaskState::Ready;
-
-        init_task_stack(&mut self.stack_top, func, taskid);
+// 关键：统一的包装器函数，有固定的入口地址
+fn task_wrapper_entry(task_id: usize) {
+    unsafe {
+        let mut task_list = get_task_list().write();
+        if let Some(task_fn) = task_list[task_id].task_fn.take() {
+            task_fn.call(task_id);
+        }
     }
 }
 
+impl TCB {
+    fn new() -> Self {
+        Self {
+            stack_top: 0,
+            name: "noinit",
+            taskid: 0,
+            state: TaskState::Uninit,
+            task_fn: None,
+        }
+    }
+    pub fn init_unified<F>(&mut self, name: &'static str, func: F, taskid: usize, stack_top: usize)
+    where
+        F: TaskFunction,
+    {
+        self.stack_top = stack_top;
+        self.taskid = taskid;
+        self.name = name;
+        self.state = TaskState::Ready;
+        self.task_fn = Some(Box::new(func));
+
+        // 关键：汇编层面始终使用统一的包装器函数地址
+        init_task_stack(&mut self.stack_top, task_wrapper_entry, taskid);
+    }
+
+    // pub fn init(&mut self, name: &'static str, func: fn(usize), taskid: usize, stack_top: usize) {
+    //     self.stack_top = stack_top;
+    //     self.taskid = taskid;
+
+    //     self.name = name;
+    //     self.state = TaskState::Ready;
+
+    //     init_task_stack(&mut self.stack_top, func, taskid);
+    // }
+}
+
 impl Task {
-    pub fn new(name: &'static str, func: fn(usize)) -> Self {
+    pub fn new<F>(name: &'static str, func: F) -> Self
+    where
+        F: TaskFunction,
+    {
         unsafe {
+            let mut task_list = get_task_list().write();
             for i in 0..MAX_TASKS {
-                if TASK_LIST[i].state == TaskState::Uninit {
-                    TASK_LIST[i].init(
+                if task_list[i].state == TaskState::Uninit {
+                    task_list[i].init_unified(
                         name,
                         func,
                         i,
@@ -83,51 +141,52 @@ impl Task {
 
     pub fn run(&mut self) {
         unsafe {
-            TASK_LIST[self.0].state = TaskState::Running;
+            get_task_list().write()[self.0].state = TaskState::Running;
         }
     }
     pub fn ready(&mut self) {
         unsafe {
-            TASK_LIST[self.0].state = TaskState::Ready;
+            get_task_list().write()[self.0].state = TaskState::Ready;
         }
     }
 
     pub fn block(&mut self, reason: Event) {
         unsafe {
-            TASK_LIST[self.0].state = TaskState::Blocked(reason);
+            get_task_list().write()[self.0].state = TaskState::Blocked(reason);
         }
     }
 
     pub fn get_state(&self) -> TaskState {
-        unsafe { TASK_LIST[self.0].state }
+        unsafe { get_task_list().write()[self.0].state }
     }
 
     pub fn get_name(&self) -> &'static str {
-        unsafe { TASK_LIST[self.0].name }
+        unsafe { get_task_list().write()[self.0].name }
     }
 
     pub fn get_taskid(&self) -> usize {
-        unsafe { TASK_LIST[self.0].taskid }
+        unsafe { get_task_list().write()[self.0].taskid }
     }
 
     pub fn get_stack_top(&self) -> usize {
-        unsafe { TASK_LIST[self.0].stack_top }
+        unsafe { get_task_list().write()[self.0].stack_top }
     }
 
     pub fn set_stack_top(&mut self, stack_top: usize) {
         unsafe {
-            TASK_LIST[self.0].stack_top = stack_top;
+            get_task_list().write()[self.0].stack_top = stack_top;
         }
     }
 
     pub(crate) fn init() {
         unsafe {
             for i in 0..MAX_TASKS {
-                TASK_LIST[i] = TCB {
+                get_task_list().write()[i] = TCB {
                     stack_top: 0,
                     name: "noinit",
                     taskid: 0,
                     state: TaskState::Uninit,
+                    task_fn: None,
                 };
                 TASK_STACKS[i] = Stack {
                     data: [0; STACK_SIZE],
@@ -143,7 +202,7 @@ impl Task {
     {
         unsafe {
             for i in 0..MAX_TASKS {
-                if TASK_LIST[i].state != TaskState::Uninit {
+                if get_task_list().write()[i].state != TaskState::Uninit {
                     f(&mut Task(i), i);
                 }
             }
@@ -157,12 +216,12 @@ impl Task {
     {
         unsafe {
             for i in start..MAX_TASKS {
-                if TASK_LIST[i].state != TaskState::Uninit {
+                if get_task_list().write()[i].state != TaskState::Uninit {
                     f(&mut Task(i), i);
                 }
             }
             for i in 0..start {
-                if TASK_LIST[i].state != TaskState::Uninit {
+                if get_task_list().write()[i].state != TaskState::Uninit {
                     f(&mut Task(i), i);
                 }
             }
@@ -278,68 +337,89 @@ mod tests {
     fn test_task_state_transitions() {
         kernel_init();
         let mut task = Task::new("transition_task", |_| {});
-        
+
         // 测试所有状态转换
         assert_eq!(task.get_state(), TaskState::Ready);
-        
+
         task.run();
         assert_eq!(task.get_state(), TaskState::Running);
-        
+
         task.block(Event::Signal(1));
         assert_eq!(task.get_state(), TaskState::Blocked(Event::Signal(1)));
-        
+
         task.ready();
         assert_eq!(task.get_state(), TaskState::Ready);
     }
-    
+
     #[test]
     fn test_task_stack_manipulation() {
         kernel_init();
         let mut task = Task::new("stack_task", |_| {});
-        
+
         let original_stack_top = task.get_stack_top();
         assert_ne!(original_stack_top, 0);
-        
+
         // 测试修改栈顶
         let new_stack_top = original_stack_top + 16;
         task.set_stack_top(new_stack_top);
         assert_eq!(task.get_stack_top(), new_stack_top);
     }
-    
+
     #[test]
     fn test_for_each_with_no_tasks() {
         // 重新初始化任务列表，不创建任务
         Task::init();
-        
+
         let mut count = 0;
         Task::for_each(|_, _| {
             count += 1;
         });
-        
+
         // 应该没有任务被遍历
         assert_eq!(count, 0);
     }
-    
+
     #[test]
     fn test_for_each_from_with_gap() {
         kernel_init();
-        
+
         // 创建几个任务，但中间有空隙
         Task::new("task_1", |_| {});
         // task_2位置空出来
         let task3 = Task::new("task_3", |_| {});
-        
+
         let mut count = 0;
         let mut found_task3 = false;
-        
+
         Task::for_each_from(0, |task, _| {
             count += 1;
             if task.get_taskid() == task3.get_taskid() {
                 found_task3 = true;
             }
         });
-        
+
         assert_eq!(count, 2); // 只应遍历两个任务
         assert!(found_task3); // 应该找到task3
+    }
+
+    #[test]
+    fn test_for_each_from_with_wrap_around() {
+        kernel_init();
+
+        // 创建几个任务
+        let task1 = Task::new("task_1", |_| {});
+        let task2 = Task::new("task_2", |_| {});
+        let task3 = Task::new("task_3", |_| {});
+
+        let mut count = 0;
+        let mut found_task1 = false;
+        let mut found_task2 = false;
+        let mut found_task3 = false;
+        Task::for_each_from(2, |task, _| {
+            count += 1;
+            if task.get_taskid() == task1.get_taskid() {
+                found_task1 = true;
+            }
+        });
     }
 }
