@@ -77,6 +77,7 @@ fn task_wrapper_entry(task_id: usize) {
     unsafe {
         let mut task_list = get_task_list().write();
         if let Some(task_fn) = task_list[task_id].task_fn.take() {
+            drop(task_list); // 提前释放写锁
             task_fn.call(task_id);
         }
     }
@@ -157,19 +158,19 @@ impl Task {
     }
 
     pub fn get_state(&self) -> TaskState {
-        unsafe { get_task_list().write()[self.0].state }
+        unsafe { get_task_list().read()[self.0].state }
     }
 
     pub fn get_name(&self) -> &'static str {
-        unsafe { get_task_list().write()[self.0].name }
+        unsafe { get_task_list().read()[self.0].name }
     }
 
     pub fn get_taskid(&self) -> usize {
-        unsafe { get_task_list().write()[self.0].taskid }
+        unsafe { get_task_list().read()[self.0].taskid }
     }
 
     pub fn get_stack_top(&self) -> usize {
-        unsafe { get_task_list().write()[self.0].stack_top }
+        unsafe { get_task_list().read()[self.0].stack_top }
     }
 
     pub fn set_stack_top(&mut self, stack_top: usize) {
