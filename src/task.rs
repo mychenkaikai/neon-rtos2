@@ -8,7 +8,7 @@ use core::panic;
 use core::prelude::rust_2024::*;
 use core::ptr::addr_of;
 
-use spin::{RwLock, Once};
+use spin::{Once, RwLock};
 
 #[cfg(feature = "embedded-alloc")]
 use alloc::boxed::Box;
@@ -67,9 +67,7 @@ pub struct TCB {
 pub struct Task(pub usize);
 
 fn get_task_list() -> &'static RwLock<[TCB; MAX_TASKS]> {
-    TASK_LIST.call_once(|| {
-        RwLock::new([(); MAX_TASKS].map(|_| TCB::new()))
-    })
+    TASK_LIST.call_once(|| RwLock::new([(); MAX_TASKS].map(|_| TCB::default())))
 }
 
 // 关键：统一的包装器函数，有固定的入口地址
@@ -84,7 +82,7 @@ fn task_wrapper_entry(task_id: usize) {
 }
 
 impl TCB {
-    fn new() -> Self {
+    fn default() -> Self {
         Self {
             stack_top: 0,
             name: "noinit",
@@ -182,13 +180,7 @@ impl Task {
     pub(crate) fn init() {
         unsafe {
             for i in 0..MAX_TASKS {
-                get_task_list().write()[i] = TCB {
-                    stack_top: 0,
-                    name: "noinit",
-                    taskid: 0,
-                    state: TaskState::Uninit,
-                    task_fn: None,
-                };
+                get_task_list().write()[i] = TCB::default();
                 TASK_STACKS[i] = Stack {
                     data: [0; STACK_SIZE],
                 };
