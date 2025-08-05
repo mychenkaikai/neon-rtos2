@@ -16,6 +16,7 @@ pub mod mutex;
 mod mq;
 pub mod log;
 pub mod ipc;
+pub mod critical_section;
 #[cfg(not(test))]
 mod allocator;
 
