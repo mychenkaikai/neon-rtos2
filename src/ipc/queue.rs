@@ -1,12 +1,12 @@
 use crate::config::MAX_MQS;
-use crate::event::Event;
-use crate::task::Task;
+use crate::sync::event::Event;
+use crate::kernel::task::Task;
 use core::mem::MaybeUninit;
 
 //全局变量数组，用于给mq分配id
-static mut MQ_LIST: [Option<_Mq>; MAX_MQS] = [None; MAX_MQS];
+static mut MQ_LIST: [Option<QueueInner>; MAX_MQS] = [None; MAX_MQS];
 #[derive(Copy, Clone)]
-struct _Mq {
+struct QueueInner {
     id: usize,
 }
 
@@ -33,7 +33,7 @@ where
         unsafe {
             for i in 0..MAX_MQS {
                 if MQ_LIST[i].is_none() {
-                    MQ_LIST[i] = Some(_Mq { id: i });
+                    MQ_LIST[i] = Some(QueueInner { id: i });
                     id = Some(MQ_LIST[i].unwrap().id);
                     break;
                 }
@@ -108,8 +108,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::Scheduler;
-    use crate::task::Task;
+    use crate::kernel::scheduler::Scheduler;
+    use crate::kernel::task::Task;
     use crate::utils::kernel_init;
 
     #[test]
@@ -171,8 +171,8 @@ mod tests {
         kernel_init();
 
         let mut mq: Mq<u32, 10> = Mq::<u32, 10>::new();
-        Task::new("task1", |_| {});
-        Task::new("task2", |_| {});
+        Task::new("task1", |_| {}).unwrap();
+        Task::new("task2", |_| {}).unwrap();
         Scheduler::start();
         //测试可能冲突的情况，第一个任务先获得锁，然后第二个任务获得锁，然后第一个任务push，然后第二个任务pop
         mq.push(1);

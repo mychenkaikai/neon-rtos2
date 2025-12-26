@@ -1,14 +1,13 @@
 use core::panic::PanicInfo;
-use crate::task::Task;
-use crate::signal::Signal;
-use crate::schedule::Scheduler;
-use crate::timer::Timer;
-use crate::systick::Systick;
-use crate::mutex::Mutex;
+use crate::kernel::task::Task;
+use crate::sync::signal::Signal;
+use crate::kernel::scheduler::Scheduler;
+use crate::kernel::time::timer::Timer;
+use crate::kernel::time::systick::Systick;
+use crate::sync::mutex::Mutex;
 
 pub fn kernel_init() {
-    #[cfg(not(test))]
-    crate::allocator::init_heap();
+    crate::mem::allocator::init_heap();
     Task::init();
     Scheduler::init();
     Timer::init();

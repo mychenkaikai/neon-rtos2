@@ -1,5 +1,5 @@
-use crate::task::Task;
-use crate::task::TaskState;
+use crate::kernel::task::Task;
+use crate::kernel::task::TaskState;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Event {
@@ -26,9 +26,9 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::Scheduler;
-    use crate::task::Task;
-    use crate::task::TaskState;
+    use crate::kernel::scheduler::Scheduler;
+    use crate::kernel::task::Task;
+    use crate::kernel::task::TaskState;
     use crate::utils::kernel_init;
 
     fn task1(_args: usize) {}
@@ -40,11 +40,11 @@ mod tests {
     fn test_event() {
         Task::init();
         //设置部分任务为阻塞状态，进行判断状态是否正确
-        let mut task1 = Task::new("task1", task1);
-        let mut task2 = Task::new("task2", task2);
-        let mut task3 = Task::new("task3", task3);
-        let mut task4 = Task::new("task4", task4);
-        let mut task5 = Task::new("task5", task5);
+        let mut task1 = Task::new("task1", task1).unwrap();
+        let mut task2 = Task::new("task2", task2).unwrap();
+        let mut task3 = Task::new("task3", task3).unwrap();
+        let mut task4 = Task::new("task4", task4).unwrap();
+        let mut task5 = Task::new("task5", task5).unwrap();
         Scheduler::start();
         task1.block(Event::Signal(1));
         task2.block(Event::Signal(2));
@@ -105,8 +105,8 @@ mod tests {
     fn test_wake_task_with_no_blocked_tasks() {
         kernel_init();
         
-        Task::new("wake_test1", |_| {});
-        Task::new("wake_test2", |_| {});
+        Task::new("wake_test1", |_| {}).unwrap();
+        Task::new("wake_test2", |_| {}).unwrap();
         
         // 所有任务都处于就绪状态
         
@@ -128,9 +128,9 @@ mod tests {
     fn test_multiple_blocked_same_event() {
         kernel_init();
         
-        let mut task1 = Task::new("same_event1", |_| {});
-        let mut task2 = Task::new("same_event2", |_| {});
-        let mut task3 = Task::new("same_event3", |_| {});
+        let mut task1 = Task::new("same_event1", |_| {}).unwrap();
+        let mut task2 = Task::new("same_event2", |_| {}).unwrap();
+        let mut task3 = Task::new("same_event3", |_| {}).unwrap();
         
         Scheduler::start();
         
@@ -155,9 +155,9 @@ mod tests {
     fn test_different_event_types() {
         kernel_init();
         
-        let mut task1 = Task::new("diff_event1", |_| {});
-        let mut task2 = Task::new("diff_event2", |_| {});
-        let mut task3 = Task::new("diff_event3", |_| {});
+        let mut task1 = Task::new("diff_event1", |_| {}).unwrap();
+        let mut task2 = Task::new("diff_event2", |_| {}).unwrap();
+        let mut task3 = Task::new("diff_event3", |_| {}).unwrap();
         
         Scheduler::start();
         

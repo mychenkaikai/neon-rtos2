@@ -1,8 +1,8 @@
 use crate::config::MAX_SIGNALS;
-use crate::event::Event;
-use crate::schedule::Scheduler;
+use crate::sync::event::Event;
+use crate::kernel::scheduler::Scheduler;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use crate::arch::trigger_schedule;
+use crate::hal::trigger_schedule;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct Signal {
@@ -39,10 +39,10 @@ impl Signal {
 macro_rules! define_signal {
     ($name:ident) => {
         $crate::paste::paste! {
-            static mut [<__SIGNAL_ $name>]: $crate::signal::Signal = $crate::signal::Signal::new();
+            static mut [<__SIGNAL_ $name>]: $crate::sync::signal::Signal = $crate::sync::signal::Signal::new();
             
             #[allow(non_snake_case)]
-            fn $name() -> &'static mut $crate::signal::Signal {
+            fn $name() -> &'static mut $crate::sync::signal::Signal {
                 unsafe {
                     [<__SIGNAL_ $name>].open();
                     &mut [<__SIGNAL_ $name>]
@@ -55,8 +55,8 @@ macro_rules! define_signal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::Task;
-    use crate::task::TaskState;
+    use crate::kernel::task::Task;
+    use crate::kernel::task::TaskState;
     use crate::utils::kernel_init;
 
     //测试任务调度之后，一个正常执行的task被阻塞，之后被唤醒
@@ -64,7 +64,7 @@ mod tests {
     fn test_signal() {
         kernel_init();
         let signal = Signal::new();
-        let task = Task::new("test_signal", |_| {});
+        let task = Task::new("test_signal", |_| {}).unwrap();
         Scheduler::start();
         signal.wait();
         assert_eq!(

@@ -1,5 +1,5 @@
-use crate::task::{Task, TaskState};
-use crate::arch::init_idle_task;
+use crate::kernel::task::{Task, TaskState};
+use crate::hal::init_idle_task;
 
 static mut SCHEDULER: Scheduler = Scheduler {
     current_task: None, 
@@ -79,7 +79,7 @@ impl Scheduler {
         }
         unsafe { SCHEDULER.is_running = true };
         //触发当前架构的任务切换
-        crate::arch::start_first_task();
+        crate::hal::start_first_task();
     }
 
     //关闭调度器
@@ -96,9 +96,9 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
-    use crate::task::Task;
-    use crate::task::TaskState;
+    use crate::sync::event::Event;
+    use crate::kernel::task::Task;
+    use crate::kernel::task::TaskState;
     use crate::utils::kernel_init;
 
     fn task1(_args: usize) {
@@ -124,11 +124,11 @@ mod tests {
     #[test]
     fn test_schedule() {
         kernel_init();
-        Task::new("task1", task1);
-        Task::new("task2", task2);
-        Task::new("task3", task3);
-        Task::new("task4", task4);
-        Task::new("task5", task5);
+        Task::new("task1", task1).unwrap();
+        Task::new("task2", task2).unwrap();
+        Task::new("task3", task3).unwrap();
+        Task::new("task4", task4).unwrap();
+        Task::new("task5", task5).unwrap();
 
         Scheduler::start();
         //统计任务状态为Running的次数,只能有一个任务处于Running状态
@@ -176,11 +176,11 @@ mod tests {
     #[test]
     fn test_schedule_block() {
         kernel_init();
-        Task::new("task1", task1);
-        Task::new("task2", task2);
-        Task::new("task3", task3);
-        Task::new("task4", task4);
-        Task::new("task5", task5);
+        Task::new("task1", task1).unwrap();
+        Task::new("task2", task2).unwrap();
+        Task::new("task3", task3).unwrap();
+        Task::new("task4", task4).unwrap();
+        Task::new("task5", task5).unwrap();
         Scheduler::start();
         unsafe { SCHEDULER.current_task.unwrap() }.block(Event::Signal(1));
         assert_eq!(
@@ -202,11 +202,11 @@ mod tests {
     #[test]
     fn test_schedule_block_and_schedule() {
         kernel_init();
-        Task::new("task1", task1);
-        Task::new("task2", task2);
-        Task::new("task3", task3);
-        Task::new("task4", task4);
-        Task::new("task5", task5);
+        Task::new("task1", task1).unwrap();
+        Task::new("task2", task2).unwrap();
+        Task::new("task3", task3).unwrap();
+        Task::new("task4", task4).unwrap();
+        Task::new("task5", task5).unwrap();
         Scheduler::start();
         unsafe { SCHEDULER.current_task.unwrap() }.block(Event::Signal(1));
         //保存此时的current_task为block_task
@@ -237,8 +237,8 @@ mod tests {
     #[test]
     fn test_schedule_stop() {
         kernel_init();
-        Task::new("task1", task1);
-        Task::new("task2", task2);
+        Task::new("task1", task1).unwrap();
+        Task::new("task2", task2).unwrap();
         Scheduler::start();
         let current_task = unsafe { SCHEDULER.current_task.unwrap() };
         Scheduler::stop();
@@ -249,8 +249,8 @@ mod tests {
     #[test]
     fn test_all_tasks_blocked() {
         kernel_init();
-        let mut task1 = Task::new("blocked_task1", |_| {});
-        let mut task2 = Task::new("blocked_task2", |_| {});
+        let mut task1 = Task::new("blocked_task1", |_| {}).unwrap();
+        let mut task2 = Task::new("blocked_task2", |_| {}).unwrap();
         
         Scheduler::start();
         
@@ -272,8 +272,8 @@ mod tests {
     fn test_schedule_after_unblock() {
         kernel_init();
         
-        let mut task1 = Task::new("unblock_test1", |_| {});
-        let mut task2 = Task::new("unblock_test2", |_| {});
+        let mut task1 = Task::new("unblock_test1", |_| {}).unwrap();
+        let mut task2 = Task::new("unblock_test2", |_| {}).unwrap();
         
         Scheduler::start();
         
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn test_start_stop_restart() {
         kernel_init();
-        Task::new("restart_test", |_| {});
+        Task::new("restart_test", |_| {}).unwrap();
         
         // 启动调度器
         Scheduler::start();

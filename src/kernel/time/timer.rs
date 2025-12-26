@@ -1,13 +1,13 @@
-use crate::arch::trigger_schedule;
+use crate::hal::trigger_schedule;
 use crate::config::MAX_TIMERS;
-use crate::event::Event;
-use crate::schedule::Scheduler;
-use crate::systick::Systick;
+use crate::sync::event::Event;
+use crate::kernel::scheduler::Scheduler;
+use crate::kernel::time::systick::Systick;
 
-static mut TIMER_LIST: [Option<_Timer>; MAX_TIMERS] = [None; MAX_TIMERS];
+static mut TIMER_LIST: [Option<TimerInner>; MAX_TIMERS] = [None; MAX_TIMERS];
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub struct _Timer {
+pub struct TimerInner {
     running: bool,
     id: usize,
     timeout: usize,
@@ -22,7 +22,7 @@ impl Timer {
         let mut id = 0;
         Timer::for_each(|timer, _| {
             if timer.is_none() {
-                *timer = Some(_Timer {
+                *timer = Some(TimerInner {
                     running: false,
                     id: id,
                     timeout: timeout + Systick::get_current_time(),
@@ -52,7 +52,7 @@ impl Timer {
     //通过id来获取定时器结构体,入参是函数
     fn get_timer_by_id<F>(id: usize, mut f: F)
     where
-        F: FnMut(&mut _Timer),
+        F: FnMut(&mut TimerInner),
     {
         unsafe {
             if let Some(ref mut timer) = TIMER_LIST[id] {
@@ -111,7 +111,7 @@ impl Timer {
 
     pub fn for_each<F>(mut f: F)
     where
-        F: FnMut(&mut Option<_Timer>, usize) -> bool,
+        F: FnMut(&mut Option<TimerInner>, usize) -> bool,
     {
         unsafe {
             for i in 0..MAX_TIMERS {
@@ -154,10 +154,10 @@ impl Delay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
-    use crate::systick::Systick;
-    use crate::task::Task;
-    use crate::task::TaskState;
+    use crate::sync::event::Event;
+    use crate::kernel::time::systick::Systick;
+    use crate::kernel::task::Task;
+    use crate::kernel::task::TaskState;
     use crate::utils::kernel_init;
 
     #[test]

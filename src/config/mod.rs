@@ -5,4 +5,4 @@ pub const MAX_SIGNALS: usize = 10;
 pub const MAX_TIMERS: usize = 10;
 pub const MAX_MUTEXES: usize = 10;
 pub const MAX_MQS: usize = 10;
-pub const HEAP_SIZE: usize = 8 * 1024;
+pub const HEAP_SIZE: usize = 1024 * 1024;

@@ -1,7 +1,8 @@
-use crate::arch::init_task_stack;
+use crate::hal::init_task_stack;
 use crate::config::MAX_TASKS;
 use crate::config::STACK_SIZE;
-use crate::event::Event;
+use crate::sync::event::Event;
+use crate::error::{Result, RtosError};
 use core::cmp::PartialEq;
 use core::fmt::Debug;
 use core::panic;
@@ -17,7 +18,7 @@ use std::boxed::Box;
 
 // 在lib.rs或main.rs中
 
-static TASK_LIST: Once<RwLock<[TCB; MAX_TASKS]>> = Once::new();
+static TASK_LIST: Once<RwLock<[TaskControlBlock; MAX_TASKS]>> = Once::new();
 
 #[unsafe(no_mangle)]
 static mut TASK_STACKS: [Stack; MAX_TASKS] = [const {
@@ -55,7 +56,7 @@ where
 }
 
 #[repr(C)]
-pub struct TCB {
+pub struct TaskControlBlock {
     pub(crate) stack_top: usize,
     pub(crate) name: &'static str,
     pub(crate) taskid: usize,
@@ -66,8 +67,8 @@ pub struct TCB {
 #[derive(Clone, PartialEq, Copy)]
 pub struct Task(pub usize);
 
-fn get_task_list() -> &'static RwLock<[TCB; MAX_TASKS]> {
-    TASK_LIST.call_once(|| RwLock::new([(); MAX_TASKS].map(|_| TCB::default())))
+fn get_task_list() -> &'static RwLock<[TaskControlBlock; MAX_TASKS]> {
+    TASK_LIST.call_once(|| RwLock::new([(); MAX_TASKS].map(|_| TaskControlBlock::default())))
 }
 
 // 关键：统一的包装器函数，有固定的入口地址
@@ -81,7 +82,7 @@ fn task_wrapper_entry(task_id: usize) {
     }
 }
 
-impl TCB {
+impl TaskControlBlock {
     fn default() -> Self {
         Self {
             stack_top: 0,
@@ -117,7 +118,7 @@ impl TCB {
 }
 
 impl Task {
-    pub fn new<F>(name: &'static str, func: F) -> Self
+    pub fn new<F>(name: &'static str, func: F) -> Result<Self>
     where
         F: TaskFunction,
     {
@@ -131,10 +132,10 @@ impl Task {
                         i,
                         addr_of!(TASK_STACKS[i].data) as usize + STACK_SIZE,
                     );
-                    return Task(i);
+                    return Ok(Task(i));
                 }
             }
-            panic!("No free task slot");
+            Err(RtosError::TaskSlotsFull)
         }
     }
 
@@ -180,7 +181,7 @@ impl Task {
     pub(crate) fn init() {
         unsafe {
             for i in 0..MAX_TASKS {
-                get_task_list().write()[i] = TCB::default();
+                get_task_list().write()[i] = TaskControlBlock::default();
                 TASK_STACKS[i] = Stack {
                     data: [0; STACK_SIZE],
                 };
@@ -238,8 +239,8 @@ mod tests {
     #[test]
     fn test_task() {
         kernel_init();
-        let task1 = Task::new("task1", task1);
-        let task2 = Task::new("task2", task2);
+        let task1 = Task::new("task1", task1).unwrap();
+        let task2 = Task::new("task2", task2).unwrap();
         assert_eq!(task1.get_state(), TaskState::Ready);
         assert_eq!(task2.get_state(), TaskState::Ready);
         assert_eq!(task1.get_name(), "task1");
@@ -253,19 +254,19 @@ mod tests {
 
     //检测任务数超过MAX_TASKS时，是否panic
     #[test]
-    #[should_panic]
     fn test_task_overflow() {
         kernel_init();
-        for _ in 0..MAX_TASKS + 1 {
-            Task::new("task", task1);
+        for _ in 0..MAX_TASKS {
+            Task::new("task", task1).unwrap();
         }
+        assert_eq!(Task::new("task", task1).err(), Some(RtosError::TaskSlotsFull));
     }
 
     //检测任务状态
     #[test]
     fn test_task_state() {
         kernel_init();
-        let mut task = Task::new("task", task1);
+        let mut task = Task::new("task", task1).unwrap();
         task.run();
         assert_eq!(task.get_state(), TaskState::Running);
         task.block(Event::Signal(1));
@@ -279,8 +280,8 @@ mod tests {
         kernel_init();
         //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
         let mut cnt = 0;
-        Task::new("task1", task1);
-        Task::new("task2", task2);
+        Task::new("task1", task1).unwrap();
+        Task::new("task2", task2).unwrap();
         Task::for_each_from(0, |task, id| {
             if cnt == 0 {
                 assert_eq!(task.get_name(), "task1");
@@ -311,8 +312,8 @@ mod tests {
         //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
         let mut cnt = 0;
         kernel_init();
-        Task::new("task1", task1);
-        Task::new("task2", task2);
+        Task::new("task1", task1).unwrap();
+        Task::new("task2", task2).unwrap();
         Task::for_each(|task, id| {
             if cnt == 0 {
                 assert_eq!(task.get_name(), "task1");
@@ -329,7 +330,7 @@ mod tests {
     #[test]
     fn test_task_state_transitions() {
         kernel_init();
-        let mut task = Task::new("transition_task", |_| {});
+        let mut task = Task::new("transition_task", |_| {}).unwrap();
 
         // 测试所有状态转换
         assert_eq!(task.get_state(), TaskState::Ready);
@@ -347,7 +348,7 @@ mod tests {
     #[test]
     fn test_task_stack_manipulation() {
         kernel_init();
-        let mut task = Task::new("stack_task", |_| {});
+        let mut task = Task::new("stack_task", |_| {}).unwrap();
 
         let original_stack_top = task.get_stack_top();
         assert_ne!(original_stack_top, 0);
@@ -377,9 +378,9 @@ mod tests {
         kernel_init();
 
         // 创建几个任务，但中间有空隙
-        Task::new("task_1", |_| {});
+        Task::new("task_1", |_| {}).unwrap();
         // task_2位置空出来
-        let task3 = Task::new("task_3", |_| {});
+        let task3 = Task::new("task_3", |_| {}).unwrap();
 
         let mut count = 0;
         let mut found_task3 = false;
@@ -400,9 +401,9 @@ mod tests {
         kernel_init();
 
         // 创建几个任务
-        let task1 = Task::new("task_1", |_| {});
-        let task2 = Task::new("task_2", |_| {});
-        let task3 = Task::new("task_3", |_| {});
+        let task1 = Task::new("task_1", |_| {}).unwrap();
+        let task2 = Task::new("task_2", |_| {}).unwrap();
+        let task3 = Task::new("task_3", |_| {}).unwrap();
 
         let mut count = 0;
         let mut found_task1 = false;

@@ -1,4 +1,4 @@
-use crate::task::Task;
+use crate::kernel::task::Task;
 
 static mut CURRENT_TIME: usize = 0;
 

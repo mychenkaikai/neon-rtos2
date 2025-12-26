@@ -1,8 +1,8 @@
 #[cfg(feature = "embedded-alloc")]
 extern crate alloc;
 
-use crate::task::Task;
-use crate::{event::Event, schedule::Scheduler};
+use crate::kernel::task::Task;
+use crate::{sync::event::Event, kernel::scheduler::Scheduler};
 #[cfg(feature = "embedded-alloc")]
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -232,8 +232,8 @@ impl Ipc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::Scheduler;
-    use crate::task::Task;
+    use crate::kernel::scheduler::Scheduler;
+    use crate::kernel::task::Task;
     use crate::utils::kernel_init;
 
     fn test1(_: usize) {}

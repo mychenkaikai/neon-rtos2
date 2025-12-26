@@ -1,7 +1,7 @@
-use crate::schedule::Scheduler;
-use crate::systick::Systick;
-use crate::task::Task;
-use crate::timer::Timer;
+use crate::kernel::scheduler::Scheduler;
+use crate::kernel::time::systick::Systick;
+use crate::kernel::task::Task;
+use crate::kernel::time::timer::Timer;
 use crate::utils::task_exit_error;
 use core::mem::size_of;
 use cortex_m::peripheral::SCB;
@@ -72,7 +72,7 @@ pub(crate) fn init_idle_task() {
             cortex_m::asm::wfi();
         }
     }
-    let task = Task::new("idle", idle_task);
+    let task = Task::new("idle", idle_task).unwrap();
 }
 
 #[panic_handler]

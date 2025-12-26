@@ -1,4 +1,4 @@
-use neon_rtos2::{task::Task, utils::kernel_init, schedule::Scheduler, event::Event};
+use neon_rtos2::{kernel::task::Task, utils::kernel_init, kernel::scheduler::Scheduler, sync::event::Event};
 
 #[test]
 fn test_basic_task_operations() {
@@ -6,8 +6,8 @@ fn test_basic_task_operations() {
     kernel_init();
     
     // 创建测试任务
-    let task1 = Task::new("task1", |_| {});
-    let task2 = Task::new("task2", |_| {});
+    let task1 = Task::new("task1", |_| {}).unwrap();
+    let task2 = Task::new("task2", |_| {}).unwrap();
     
     // 启动调度器
     Scheduler::start();
@@ -28,8 +28,8 @@ fn test_task_switching() {
     kernel_init();
     
     // 创建测试任务
-    Task::new("switch_task1", |_| {});
-    Task::new("switch_task2", |_| {});
+    Task::new("switch_task1", |_| {}).unwrap();
+    Task::new("switch_task2", |_| {}).unwrap();
     
     // 启动调度器
     Scheduler::start();
@@ -53,9 +53,9 @@ fn test_multiple_tasks() {
     kernel_init();
     
     // 创建多个测试任务
-    let task1 = Task::new("multi_task1", |_| {});
-    let task2 = Task::new("multi_task2", |_| {});
-    let task3 = Task::new("multi_task3", |_| {});
+    let task1 = Task::new("multi_task1", |_| {}).unwrap();
+    let task2 = Task::new("multi_task2", |_| {}).unwrap();
+    let task3 = Task::new("multi_task3", |_| {}).unwrap();
     
     // 启动调度器
     Scheduler::start();
@@ -81,16 +81,16 @@ fn test_schedule_loop() {
     kernel_init();
     
     // 创建10个测试任务
-    let task1 = Task::new("schedule_loop_task1", |_| {});
-    let task2 = Task::new("schedule_loop_task2", |_| {});
-    let task3 = Task::new("schedule_loop_task3", |_| {});
-    let task4 = Task::new("schedule_loop_task4", |_| {});
-    let task5 = Task::new("schedule_loop_task5", |_| {});
-    let task6 = Task::new("schedule_loop_task6", |_| {});
-    let task7 = Task::new("schedule_loop_task7", |_| {});
-    let task8 = Task::new("schedule_loop_task8", |_| {});
-    let task9 = Task::new("schedule_loop_task9", |_| {});
-    let task10 = Task::new("schedule_loop_task10", |_| {});
+    let task1 = Task::new("schedule_loop_task1", |_| {}).unwrap();
+    let task2 = Task::new("schedule_loop_task2", |_| {}).unwrap();
+    let task3 = Task::new("schedule_loop_task3", |_| {}).unwrap();
+    let task4 = Task::new("schedule_loop_task4", |_| {}).unwrap();
+    let task5 = Task::new("schedule_loop_task5", |_| {}).unwrap();
+    let task6 = Task::new("schedule_loop_task6", |_| {}).unwrap();
+    let task7 = Task::new("schedule_loop_task7", |_| {}).unwrap();
+    let task8 = Task::new("schedule_loop_task8", |_| {}).unwrap();
+    let task9 = Task::new("schedule_loop_task9", |_| {}).unwrap();
+    let task10 = Task::new("schedule_loop_task10", |_| {}).unwrap();
     // 启动调度器
     Scheduler::start();
     
@@ -168,16 +168,16 @@ fn test_schedule_block() {
     kernel_init();
     
     // 创建10个测试任务
-    let task1 = Task::new("schedule_block_task1", |_| {});
-    let task2 = Task::new("schedule_block_task2", |_| {});
-    let mut task3 = Task::new("schedule_block_task3", |_| {});
-    let task4 = Task::new("schedule_block_task4", |_| {});
-    let task5 = Task::new("schedule_block_task5", |_| {});
-    let task6 = Task::new("schedule_block_task6", |_| {});
-    let task7 = Task::new("schedule_block_task7", |_| {});
-    let task8 = Task::new("schedule_block_task8", |_| {});
-    let task9 = Task::new("schedule_block_task9", |_| {});
-    let task10 = Task::new("schedule_block_task10", |_| {});
+    let task1 = Task::new("schedule_block_task1", |_| {}).unwrap();
+    let task2 = Task::new("schedule_block_task2", |_| {}).unwrap();
+    let mut task3 = Task::new("schedule_block_task3", |_| {}).unwrap();
+    let task4 = Task::new("schedule_block_task4", |_| {}).unwrap();
+    let task5 = Task::new("schedule_block_task5", |_| {}).unwrap();
+    let task6 = Task::new("schedule_block_task6", |_| {}).unwrap();
+    let task7 = Task::new("schedule_block_task7", |_| {}).unwrap();
+    let task8 = Task::new("schedule_block_task8", |_| {}).unwrap();
+    let task9 = Task::new("schedule_block_task9", |_| {}).unwrap();
+    let task10 = Task::new("schedule_block_task10", |_| {}).unwrap();
 
     // 启动调度器
     Scheduler::start(); 
@@ -260,5 +260,3 @@ fn test_schedule_block() {
     let current_task = Scheduler::get_current_task();
     assert!(current_task.get_taskid() == task3.get_taskid());
 }
-
-
