@@ -326,6 +326,7 @@ impl Iterator for TaskIter {
 mod tests {
     use super::*;
     use crate::utils::kernel_init;
+    use serial_test::serial;
 
     fn task1(_args: usize) {
         // 简化的任务函数
@@ -336,6 +337,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_task() {
         kernel_init();
         let task1 = Task::new("task1", task1).unwrap();
@@ -353,6 +355,7 @@ mod tests {
 
     //检测任务数超过MAX_TASKS时，是否panic
     #[test]
+    #[serial]
     fn test_task_overflow() {
         kernel_init();
         for _ in 0..MAX_TASKS {
@@ -363,6 +366,7 @@ mod tests {
 
     //检测任务状态
     #[test]
+    #[serial]
     fn test_task_state() {
         kernel_init();
         let mut task = Task::new("task", task1).unwrap();
@@ -375,6 +379,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_task_for_each_from() {
         kernel_init();
         //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
@@ -407,6 +412,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_task_for_each() {
         //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
         let mut cnt = 0;
@@ -427,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_task_state_transitions() {
         kernel_init();
         let mut task = Task::new("transition_task", |_| {}).unwrap();
@@ -445,6 +452,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_task_stack_manipulation() {
         kernel_init();
         let mut task = Task::new("stack_task", |_| {}).unwrap();
@@ -459,6 +467,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_for_each_with_no_tasks() {
         // 重新初始化任务列表，不创建任务
         Task::init();
@@ -473,6 +482,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_for_each_from_with_gap() {
         kernel_init();
 
@@ -496,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_for_each_from_with_wrap_around() {
         kernel_init();
 

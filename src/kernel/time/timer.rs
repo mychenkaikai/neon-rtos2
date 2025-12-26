@@ -195,8 +195,10 @@ mod tests {
     use crate::kernel::task::Task;
     use crate::kernel::task::TaskState;
     use crate::utils::kernel_init;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_timer_for_each() {
         kernel_init();
         let mut timer1 = Timer::new(1000).unwrap();
@@ -238,9 +240,14 @@ mod tests {
             }
             return false;
         });
+        
+        // 手动清理，避免 Drop 时重复删除
+        core::mem::forget(timer1);
+        core::mem::forget(timer2);
     }
 
     #[test]
+    #[serial]
     fn test_timer_slots_full() {
         kernel_init();
         // 创建最大数量的定时器
@@ -257,6 +264,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_timer_start_stop() {
         kernel_init();
         let mut timer = Timer::new(1000).unwrap();
@@ -271,6 +279,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_timer_timeout() {
         kernel_init();
         let mut timer = Timer::new(500).unwrap();
