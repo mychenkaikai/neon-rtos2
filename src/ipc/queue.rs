@@ -164,8 +164,10 @@ mod tests {
     use crate::kernel::scheduler::Scheduler;
     use crate::kernel::task::Task;
     use crate::utils::kernel_init;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_mq() {
         kernel_init();
 
@@ -199,6 +201,7 @@ mod tests {
 
     // 测试两个任务同时 push 和 pop
     #[test]
+    #[serial]
     fn test_mq_multi_task() {
         kernel_init();
 
@@ -220,6 +223,7 @@ mod tests {
 
     // 测试两个任务同时 push 和 pop，但是一个任务先 push，一个任务后 push
     #[test]
+    #[serial]
     fn test_mq_multi_task_push_pop() {
         kernel_init();
 
@@ -236,6 +240,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mq_len_and_empty() {
         kernel_init();
         
@@ -261,6 +266,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mq_slots_full() {
         kernel_init();
         

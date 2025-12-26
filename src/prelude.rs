@@ -20,7 +20,7 @@
 //! ## 调度器
 //! - [`Scheduler`] - 任务调度器
 //!
-//! ## ��间管理
+//! ## 时间管理
 //! - [`Timer`] - 软件定时器
 //! - [`Delay`] - 延时功能
 //! - [`Systick`] - 系统滴答时钟
@@ -35,6 +35,12 @@
 //! - [`Mq`] - 静态分配的消息队列
 //! - [`Ipc`] - 类型安全的 IPC 通道
 //! - [`IpcHandle`] - IPC 句柄
+//!
+//! ## 异步运行时
+//! - [`Executor`] - 异步执行器
+//! - [`AsyncSignal`] - 异步信号量
+//! - [`sleep`] - 异步睡眠函数
+//! - [`yield_now`] - 让出执行权
 //!
 //! ## 错误处理
 //! - [`Result`] - Result 类型别名
@@ -118,6 +124,25 @@ pub use crate::ipc::channel::Ipc;
 
 /// IPC 句柄
 pub use crate::ipc::channel::IpcHandle;
+
+// ============================================================================
+// 异步运行时
+// ============================================================================
+
+/// 异步执行器
+pub use crate::runtime::Executor;
+
+/// 异步信号量
+pub use crate::runtime::AsyncSignal;
+
+/// 异步睡眠函数
+pub use crate::runtime::sleep;
+
+/// 让出执行权
+pub use crate::runtime::yield_now;
+
+/// 立即就绪的 Future
+pub use crate::runtime::ready;
 
 // ============================================================================
 // 错误处理

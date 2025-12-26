@@ -135,8 +135,10 @@ mod tests {
     use crate::kernel::task::Task;
     use crate::kernel::task::TaskState;
     use crate::utils::kernel_init;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     #[should_panic]
     fn test_mutex() {
         kernel_init();
@@ -175,6 +177,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mutex_lock_unlock() {
         kernel_init();
         let mutex = Mutex::new().unwrap();
@@ -219,12 +222,13 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mutex_lock_unlock_2() {
         kernel_init();
         let mutex = Mutex::new().unwrap();
         Task::new("test_mutex", |_| {}).unwrap();
         Task::new("test_mutex2", |_| {}).unwrap();
-        //测试状态是否正确
+        //测试状态是否��确
         Scheduler::start();
         assert_eq!(
             Scheduler::get_current_task().get_state(),
@@ -264,6 +268,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mutex_overflow() {
         kernel_init();
         
@@ -276,6 +281,7 @@ mod tests {
     }
     
     #[test]
+    #[serial]
     fn test_mutex_reuse() {
         kernel_init();
         Task::new("reuse_test", |_| {}).unwrap();
@@ -300,37 +306,55 @@ mod tests {
     }
     
     #[test]
+    #[serial]
     fn test_multiple_blocked_tasks() {
         kernel_init();
         
         let mutex = Mutex::new().unwrap();
-        Task::new("block_test1", |_| {}).unwrap();
-        Task::new("block_test2", |_| {}).unwrap();
-        Task::new("block_test3", |_| {}).unwrap();
+        let task1 = Task::new("block_test1", |_| {}).unwrap();
+        let task2 = Task::new("block_test2", |_| {}).unwrap();
+        let task3 = Task::new("block_test3", |_| {}).unwrap();
         
         Scheduler::start();
         
-        // 第一个任务获取锁
+        // 当前任务（task1）获取锁
+        let owner_task = Scheduler::get_current_task();
         mutex.lock();
+        assert_eq!(owner_task.get_state(), TaskState::Running);
         
-        // 切换到第二个任务，尝试获取锁，应该被阻塞
+        // 切换到第二个任务
         Scheduler::task_switch();
-        let task2 = Scheduler::get_current_task();
+        let blocked_task2 = Scheduler::get_current_task();
+        assert_ne!(blocked_task2.get_taskid(), owner_task.get_taskid());
+        
+        // 第二个任务尝试获取锁，应该被阻塞
         mutex.lock();
+        assert_eq!(blocked_task2.get_state(), TaskState::Blocked(Event::Mutex(mutex.0)));
         
-        // 切换到第三个任务，尝试获取锁，也应该被阻塞
+        // 切换到第三个任务
         Scheduler::task_switch();
-        let task3 = Scheduler::get_current_task();
-        mutex.lock();
+        let blocked_task3 = Scheduler::get_current_task();
         
-        // 切换回第一个任务
-        Scheduler::task_switch();
-        
-        // 第一个任务释放锁
-        mutex.unlock().unwrap();
-        
-        // 验证被阻塞的任务是否被唤醒
-        assert_eq!(task2.get_state(), TaskState::Ready);
-        assert_eq!(task3.get_state(), TaskState::Ready);
+        // 如果切换到的是 owner_task，则由它释放锁
+        if blocked_task3.get_taskid() == owner_task.get_taskid() {
+            // owner 释放锁
+            mutex.unlock().unwrap();
+            // 验证被阻塞的任务被唤醒
+            assert_eq!(blocked_task2.get_state(), TaskState::Ready);
+        } else {
+            // 第三个任务也尝试获取锁
+            mutex.lock();
+            assert_eq!(blocked_task3.get_state(), TaskState::Blocked(Event::Mutex(mutex.0)));
+            
+            // 切换回 owner 任务
+            Scheduler::task_switch();
+            
+            // owner 释放锁
+            mutex.unlock().unwrap();
+            
+            // 验证被阻塞的任务被唤醒
+            assert_eq!(blocked_task2.get_state(), TaskState::Ready);
+            assert_eq!(blocked_task3.get_state(), TaskState::Ready);
+        }
     }
 }
