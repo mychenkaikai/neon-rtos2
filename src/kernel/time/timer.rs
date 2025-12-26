@@ -158,6 +158,17 @@ impl Timer {
     }
 }
 
+impl Drop for Timer {
+    /// 当 Timer 被 drop 时，自动删除定时器
+    ///
+    /// 这允许槽位被后续的 Timer::new() 重用
+    fn drop(&mut self) {
+        unsafe {
+            TIMER_LIST[self.0] = None;
+        }
+    }
+}
+
 pub struct Delay;
 
 impl Delay {

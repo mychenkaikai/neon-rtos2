@@ -5,7 +5,6 @@ use crate::sync::event::Event;
 use crate::error::{Result, RtosError};
 use core::cmp::PartialEq;
 use core::fmt::Debug;
-use core::panic;
 use core::prelude::rust_2024::*;
 use core::ptr::addr_of;
 
@@ -15,6 +14,14 @@ use spin::{Once, RwLock};
 use alloc::boxed::Box;
 #[cfg(not(feature = "embedded-alloc"))]
 use std::boxed::Box;
+
+// 子模块
+pub mod priority;
+pub mod builder;
+
+// 重新导出
+pub use priority::Priority;
+pub use builder::TaskBuilder;
 
 // 在lib.rs或main.rs中
 
@@ -61,6 +68,7 @@ pub struct TaskControlBlock {
     pub(crate) name: &'static str,
     pub(crate) taskid: usize,
     pub(crate) state: TaskState,
+    pub(crate) priority: Priority,
     pub(crate) task_fn: Option<Box<dyn TaskFunction>>,
 }
 
@@ -89,6 +97,7 @@ impl TaskControlBlock {
             name: "noinit",
             taskid: 0,
             state: TaskState::Uninit,
+            priority: Priority::Normal,
             task_fn: None,
         }
     }
@@ -178,6 +187,24 @@ impl Task {
         }
     }
 
+    /// 获取任务优先级
+    ///
+    /// # 返回值
+    /// 任务的当前优先级
+    pub fn get_priority(&self) -> Priority {
+        unsafe { get_task_list().read()[self.0].priority }
+    }
+
+    /// 设置任务优先级
+    ///
+    /// # 参数
+    /// - `priority`: 新的优先级
+    pub fn set_priority(&mut self, priority: Priority) {
+        unsafe {
+            get_task_list().write()[self.0].priority = priority;
+        }
+    }
+
     pub(crate) fn init() {
         unsafe {
             for i in 0..MAX_TASKS {
@@ -220,6 +247,78 @@ impl Task {
                 }
             }
         }
+    }
+
+    /// 返回所有已初始化任务的迭代器
+    ///
+    /// # 示例
+    /// ```rust
+    /// // 统计就绪任务数量
+    /// let ready_count = Task::iter()
+    ///     .filter(|t| t.get_state() == TaskState::Ready)
+    ///     .count();
+    ///
+    /// // 遍历所有任务
+    /// Task::iter()
+    ///     .for_each(|t| println!("Task: {}", t.get_name()));
+    /// ```
+    pub fn iter() -> TaskIter {
+        TaskIter::new()
+    }
+
+    /// 返回所有就绪任务的迭代器
+    pub fn ready_tasks() -> impl Iterator<Item = Task> {
+        Self::iter().filter(|t| t.get_state() == TaskState::Ready)
+    }
+
+    /// 返回所有阻塞任务的迭代器
+    pub fn blocked_tasks() -> impl Iterator<Item = Task> {
+        Self::iter().filter(|t| matches!(t.get_state(), TaskState::Blocked(_)))
+    }
+
+    /// 创建任务构建器
+    ///
+    /// # 参数
+    /// - `name`: 任务名称
+    ///
+    /// # 示例
+    /// ```rust
+    /// let task = Task::builder("my_task")
+    ///     .priority(Priority::High)
+    ///     .spawn(|| { /* ... */ })?;
+    /// ```
+    pub fn builder(name: &'static str) -> TaskBuilder {
+        TaskBuilder::new(name)
+    }
+}
+
+/// 任务迭代器
+///
+/// 遍历所有已初始化的任务
+pub struct TaskIter {
+    current: usize,
+}
+
+impl TaskIter {
+    /// 创建新的任务迭代器
+    fn new() -> Self {
+        Self { current: 0 }
+    }
+}
+
+impl Iterator for TaskIter {
+    type Item = Task;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let task_list = get_task_list().read();
+        while self.current < MAX_TASKS {
+            let idx = self.current;
+            self.current += 1;
+            if task_list[idx].state != TaskState::Uninit {
+                return Some(Task(idx));
+            }
+        }
+        None
     }
 }
 

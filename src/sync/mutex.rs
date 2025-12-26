@@ -2,6 +2,7 @@ use crate::config::MAX_MUTEXES;
 use crate::kernel::scheduler::Scheduler;
 use crate::kernel::task::Task;
 use crate::sync::event::Event;
+use crate::sync::guard::MutexGuard;
 use crate::error::{Result, RtosError};
 
 static mut MUTEX_LIST: [MutexInner; MAX_MUTEXES] = [MutexInner {
@@ -66,6 +67,63 @@ impl Mutex {
             MUTEX_LIST[self.0].owner = None;
             Event::wake_task(Event::Mutex(self.0));
             Ok(())
+        }
+    }
+
+    /// 获取锁，返回 RAII 守卫
+    ///
+    /// 当返回的 MutexGuard 离开作用域时，锁会自动释放。
+    ///
+    /// # 返回值
+    /// - `MutexGuard` - 锁守卫，离开作用域自动释放
+    ///
+    /// # 示例
+    /// ```rust
+    /// {
+    ///     let _guard = mutex.lock_guard();
+    ///     // 临界区代码
+    /// } // 自动释放锁
+    /// ```
+    pub fn lock_guard(&self) -> MutexGuard<'_> {
+        self.lock();
+        MutexGuard::new(self)
+    }
+
+    /// 闭包风格 API
+    ///
+    /// 在持有锁期间执行闭包，闭包执行完毕后自动释放锁。
+    ///
+    /// # 参数
+    /// - `f`: 在持有锁期间执行的闭包
+    ///
+    /// # 返回值
+    /// - `R`: 闭包的返回值
+    ///
+    /// # 示例
+    /// ```rust
+    /// let result = mutex.with_lock(|| {
+    ///     // 临界区代码
+    ///     42
+    /// });
+    /// ```
+    pub fn with_lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = self.lock_guard();
+        f()
+    }
+}
+
+impl Drop for Mutex {
+    /// 当 Mutex 被 drop 时，自动释放槽位
+    ///
+    /// 这允许槽位被后续的 Mutex::new() 重用
+    fn drop(&mut self) {
+        unsafe {
+            MUTEX_LIST[self.0].used = false;
+            MUTEX_LIST[self.0].locked = false;
+            MUTEX_LIST[self.0].owner = None;
         }
     }
 }
@@ -209,9 +267,10 @@ mod tests {
     fn test_mutex_overflow() {
         kernel_init();
         
-        // 分配超过最大数量的互斥锁
+        // 分配超过最大数量的互斥锁，需要保存到 Vec 中防止被 drop
+        let mut mutexes = Vec::new();
         for _ in 0..MAX_MUTEXES {
-            Mutex::new().unwrap();
+            mutexes.push(Mutex::new().unwrap());
         }
         assert_eq!(Mutex::new().err(), Some(RtosError::MutexSlotsFull));
     }

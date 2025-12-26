@@ -147,6 +147,17 @@ where
         self.count == N
     }
 }
+
+impl<T, const N: usize> Drop for Mq<T, N> {
+    /// 当 Mq 被 drop 时，自动释放槽位
+    ///
+    /// 这允许槽位被后续的 Mq::new() 重用
+    fn drop(&mut self) {
+        unsafe {
+            MQ_LIST[self.id] = None;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
