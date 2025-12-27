@@ -31,6 +31,11 @@ use crate::error::Result;
 pub struct TaskBuilder {
     name: &'static str,
     priority: Priority,
+    /// 栈大小配置
+    /// 
+    /// 注意：当前版本使用固定栈大小（由 `config::STACK_SIZE` 定义），
+    /// 此字段预留给未来动态栈分配功能扩展使用。
+    #[allow(dead_code)]
     stack_size: usize,
 }
 

@@ -34,8 +34,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use crate::compat::{Arc, VecDeque};
 use spin::Mutex;
 
 // ============================================================================

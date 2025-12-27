@@ -1,53 +1,64 @@
 use crate::kernel::task::{Task, TaskState, Priority};
 use crate::hal::init_idle_task;
+use core::sync::atomic::{AtomicBool, Ordering};
+use spin::{Once, RwLock};
 
-static mut SCHEDULER: Scheduler = Scheduler {
-    current_task: None, 
-    next_task: None,
-    is_running: false,
-    use_priority: false,
-};
-
-pub struct Scheduler {
+/// 调度器内部状态
+struct SchedulerInner {
     current_task: Option<Task>,
     next_task: Option<Task>,
-    is_running: bool,
-    /// 是否启用优先级调度
-    use_priority: bool,
 }
+
+/// 全局调度器状态
+static SCHEDULER_INNER: Once<RwLock<SchedulerInner>> = Once::new();
+static SCHEDULER_RUNNING: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_USE_PRIORITY: AtomicBool = AtomicBool::new(false);
+
+fn get_scheduler_inner() -> &'static RwLock<SchedulerInner> {
+    SCHEDULER_INNER.call_once(|| RwLock::new(SchedulerInner {
+        current_task: None,
+        next_task: None,
+    }))
+}
+
+pub struct Scheduler;
 
 impl Scheduler {
     pub fn init() {
-        unsafe {
-            SCHEDULER = Scheduler {
-                current_task: None,
-                next_task: None,
-                is_running: false,
-                use_priority: false,
-            };
-
-            init_idle_task();
-
+        // 重置调度器状态
+        {
+            let mut inner = get_scheduler_inner().write();
+            inner.current_task = None;
+            inner.next_task = None;
         }
+        SCHEDULER_RUNNING.store(false, Ordering::Release);
+        SCHEDULER_USE_PRIORITY.store(false, Ordering::Release);
+        
+        init_idle_task();
     }
 
     /// 启用优先级调度
     ///
     /// 启用后，调度器会优先选择优先级最高的就绪任务运行。
     pub fn enable_priority_scheduling() {
-        unsafe { SCHEDULER.use_priority = true };
+        SCHEDULER_USE_PRIORITY.store(true, Ordering::Release);
     }
 
     /// 禁用优先级调度
     ///
     /// 禁用后，调度器使用轮转调度算法。
     pub fn disable_priority_scheduling() {
-        unsafe { SCHEDULER.use_priority = false };
+        SCHEDULER_USE_PRIORITY.store(false, Ordering::Release);
     }
 
     /// 检查是否启用优先级调度
     pub fn is_priority_scheduling_enabled() -> bool {
-        unsafe { SCHEDULER.use_priority }
+        SCHEDULER_USE_PRIORITY.load(Ordering::Acquire)
+    }
+
+    /// 检查调度器是否正在运行
+    pub fn is_running() -> bool {
+        SCHEDULER_RUNNING.load(Ordering::Acquire)
     }
 
     /// 基于优先级的调度
@@ -56,11 +67,17 @@ impl Scheduler {
     /// 如果有多个相同优先级的任务，选择第一个找到的。
     pub fn schedule_by_priority() {
         // 如果调度器未运行，直接返回
-        if !unsafe { SCHEDULER.is_running } {
+        if !Self::is_running() {
             return;
         }
 
-        let mut current_task = unsafe { SCHEDULER.current_task.unwrap() };
+        let mut current_task = {
+            let inner = get_scheduler_inner().read();
+            match inner.current_task {
+                Some(task) => task,
+                None => return,
+            }
+        };
 
         // 使用迭代器找到最高优先级的就绪任务
         let next_task = Task::ready_tasks()
@@ -77,13 +94,13 @@ impl Scheduler {
 
                 // 运行下一个任务
                 next.run();
-                unsafe { SCHEDULER.current_task = Some(next) };
+                get_scheduler_inner().write().current_task = Some(next);
             }
 
             // 没找到其他任务，但当前任务就绪
             (None, TaskState::Ready) => {
                 current_task.run();
-                unsafe { SCHEDULER.current_task = Some(current_task) };
+                get_scheduler_inner().write().current_task = Some(current_task);
             }
 
             // 其他情况保持不变
@@ -97,11 +114,17 @@ impl Scheduler {
     /// 通常在 SysTick 中断或任务唤醒时调用。
     pub fn preempt_check() {
         // 如果调度器未运行或未启用优先级调度，直接返回
-        if !unsafe { SCHEDULER.is_running } || !unsafe { SCHEDULER.use_priority } {
+        if !Self::is_running() || !Self::is_priority_scheduling_enabled() {
             return;
         }
 
-        let current_task = unsafe { SCHEDULER.current_task.unwrap() };
+        let current_task = {
+            let inner = get_scheduler_inner().read();
+            match inner.current_task {
+                Some(task) => task,
+                None => return,
+            }
+        };
         let current_priority = current_task.get_priority();
 
         // 检查是否有更高优先级的就绪任务
@@ -113,22 +136,30 @@ impl Scheduler {
         }
     }
 
-    //使用task::for_each_from遍历所有任务,找到当前任务之后的下一个非阻塞任务,如果当前任务是最后一个任务,则找到第一个任务
-    //但也要考虑其他任务找不到准备状态，此时currenttask还是原任务
+    /// 任务切换
+    ///
+    /// 使用 task::for_each_from 遍历所有任务，找到当前任务之后的下一个非阻塞任务。
+    /// 如果当前任务是最后一个任务，则从头开始查找。
     pub fn task_switch() {
         // 如果调度器未运行，直接返回
-        if !unsafe { SCHEDULER.is_running } {
+        if !Self::is_running() {
             return;
         }
 
         // 如果启用了优先级调度，使用优先级调度算法
-        if unsafe { SCHEDULER.use_priority } {
+        if Self::is_priority_scheduling_enabled() {
             Self::schedule_by_priority();
             return;
         }
 
         // 否则使用轮转调度算法
-        let mut current_task = unsafe { SCHEDULER.current_task.unwrap() };
+        let mut current_task = {
+            let inner = get_scheduler_inner().read();
+            match inner.current_task {
+                Some(task) => task,
+                None => return,
+            }
+        };
 
         // 查找下一个准备好的任务
         let mut next_task: Option<Task> = None;
@@ -151,13 +182,13 @@ impl Scheduler {
 
                 // 运行下一个任务
                 next.run();
-                unsafe { SCHEDULER.current_task = Some(next) };
+                get_scheduler_inner().write().current_task = Some(next);
             }
 
             // 没找到其他任务，但当前任务就绪
             (None, TaskState::Ready) => {
                 current_task.run();
-                unsafe { SCHEDULER.current_task = Some(current_task) };
+                get_scheduler_inner().write().current_task = Some(current_task);
             }
 
             // 其他情况保持不变
@@ -166,24 +197,25 @@ impl Scheduler {
     }
 
     pub fn start() {
-        //此时当前任务还未设置,所以需要设置为第一个任务
-        unsafe {
-            SCHEDULER.current_task = Some(Task(0));
-            Task(0).run();
+        // 设置第一个任务为当前任务
+        {
+            let mut inner = get_scheduler_inner().write();
+            inner.current_task = Some(Task(0));
         }
-        unsafe { SCHEDULER.is_running = true };
-        //触发当前架构的任务切换
+        Task(0).run();
+        SCHEDULER_RUNNING.store(true, Ordering::Release);
+        
+        // 触发当前架构的任务切换
         crate::hal::start_first_task();
     }
 
-    //关闭调度器
+    /// 关闭调度器
     pub fn stop() {
-        unsafe { SCHEDULER.is_running = false };
+        SCHEDULER_RUNNING.store(false, Ordering::Release);
     }
 
-
     pub fn get_current_task() -> Task {
-        unsafe { SCHEDULER.current_task.unwrap() }
+        get_scheduler_inner().read().current_task.unwrap()
     }
 }
 
@@ -279,19 +311,19 @@ mod tests {
         Task::new("task4", task4).unwrap();
         Task::new("task5", task5).unwrap();
         Scheduler::start();
-        unsafe { SCHEDULER.current_task.unwrap() }.block(Event::Signal(1));
+        Scheduler::get_current_task().block(Event::Signal(1));
         assert_eq!(
-            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            Scheduler::get_current_task().get_state(),
             TaskState::Blocked(Event::Signal(1))
         );
         Scheduler::task_switch();
         assert_eq!(
-            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            Scheduler::get_current_task().get_state(),
             TaskState::Running
         );
         Scheduler::task_switch();
         assert_eq!(
-            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            Scheduler::get_current_task().get_state(),
             TaskState::Running
         );
     }
@@ -306,12 +338,12 @@ mod tests {
         Task::new("task4", task4).unwrap();
         Task::new("task5", task5).unwrap();
         Scheduler::start();
-        unsafe { SCHEDULER.current_task.unwrap() }.block(Event::Signal(1));
+        Scheduler::get_current_task().block(Event::Signal(1));
         //保存此时的current_task为block_task
-        let block_task = unsafe { SCHEDULER.current_task.unwrap() };
+        let block_task = Scheduler::get_current_task();
         Scheduler::task_switch();
         assert_eq!(
-            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            Scheduler::get_current_task().get_state(),
             TaskState::Running
         );
         //测试block_task是否还是原任务
@@ -321,7 +353,7 @@ mod tests {
         );
         Scheduler::task_switch();
         assert_eq!(
-            unsafe { SCHEDULER.current_task.unwrap() }.get_state(),
+            Scheduler::get_current_task().get_state(),
             TaskState::Running
         );
         //测试block_task是否还是原任务
@@ -338,7 +370,7 @@ mod tests {
         Task::new("task1", task1).unwrap();
         Task::new("task2", task2).unwrap();
         Scheduler::start();
-        let current_task = unsafe { SCHEDULER.current_task.unwrap() };
+        let current_task = Scheduler::get_current_task();
         Scheduler::stop();
         Scheduler::task_switch();
         assert_eq!(current_task.get_state(), TaskState::Running);
@@ -386,7 +418,7 @@ mod tests {
         kernel_init();
         
         let mut task1 = Task::new("unblock_test1", |_| {}).unwrap();
-        let mut task2 = Task::new("unblock_test2", |_| {}).unwrap();
+        let task2 = Task::new("unblock_test2", |_| {}).unwrap();
         
         Scheduler::start();
         
@@ -419,15 +451,15 @@ mod tests {
         
         // 启动调度器
         Scheduler::start();
-        assert!(unsafe { SCHEDULER.is_running });
+        assert!(Scheduler::is_running());
         
         // 停止调度器
         Scheduler::stop();
-        assert!(!unsafe { SCHEDULER.is_running });
+        assert!(!Scheduler::is_running());
         
         // 重新启动调度器
         Scheduler::start();
-        assert!(unsafe { SCHEDULER.is_running });
+        assert!(Scheduler::is_running());
     }
 
     // ========================================================================
@@ -467,7 +499,7 @@ mod tests {
             .spawn(|_| {})
             .unwrap();
         
-        let normal_task = Task::builder("normal_priority")
+        let _normal_task = Task::builder("normal_priority")
             .priority(Priority::Normal)
             .spawn(|_| {})
             .unwrap();
@@ -491,7 +523,7 @@ mod tests {
         kernel_init();
         
         // 创建低优先级任务
-        let mut low_task = Task::builder("low")
+        let _low_task = Task::builder("low")
             .priority(Priority::Low)
             .spawn(|_| {})
             .unwrap();
@@ -526,17 +558,17 @@ mod tests {
         kernel_init();
         
         // 创建多个相同优先级的任务
-        let task1 = Task::builder("normal1")
+        let _task1 = Task::builder("normal1")
             .priority(Priority::Normal)
             .spawn(|_| {})
             .unwrap();
         
-        let task2 = Task::builder("normal2")
+        let _task2 = Task::builder("normal2")
             .priority(Priority::Normal)
             .spawn(|_| {})
             .unwrap();
         
-        let task3 = Task::builder("normal3")
+        let _task3 = Task::builder("normal3")
             .priority(Priority::Normal)
             .spawn(|_| {})
             .unwrap();
@@ -557,7 +589,7 @@ mod tests {
         kernel_init();
         
         // 创建任务
-        let low_task = Task::builder("low")
+        let _low_task = Task::builder("low")
             .priority(Priority::Low)
             .spawn(|_| {})
             .unwrap();
@@ -567,7 +599,7 @@ mod tests {
             .spawn(|_| {})
             .unwrap();
         
-        let normal_task = Task::builder("normal")
+        let _normal_task = Task::builder("normal")
             .priority(Priority::Normal)
             .spawn(|_| {})
             .unwrap();

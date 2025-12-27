@@ -11,8 +11,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use alloc::boxed::Box;
-use alloc::collections::VecDeque;
+use crate::compat::{Box, VecDeque};
 use super::waker::TaskWaker;
 
 /// 异步任务包装器

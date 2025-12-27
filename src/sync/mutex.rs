@@ -4,13 +4,9 @@ use crate::kernel::task::Task;
 use crate::sync::event::Event;
 use crate::sync::guard::MutexGuard;
 use crate::error::{Result, RtosError};
+use spin::{Once, RwLock};
 
-static mut MUTEX_LIST: [MutexInner; MAX_MUTEXES] = [MutexInner {
-    locked: false,
-    used: false,
-    owner: None,
-}; MAX_MUTEXES];
-
+/// 互斥锁内部状态
 #[derive(PartialEq, Clone, Copy)]
 pub struct MutexInner {
     used: bool,
@@ -18,56 +14,69 @@ pub struct MutexInner {
     owner: Option<Task>,
 }
 
+impl Default for MutexInner {
+    fn default() -> Self {
+        Self {
+            locked: false,
+            used: false,
+            owner: None,
+        }
+    }
+}
+
+/// 全局互斥锁列表
+static MUTEX_LIST: Once<RwLock<[MutexInner; MAX_MUTEXES]>> = Once::new();
+
+fn get_mutex_list() -> &'static RwLock<[MutexInner; MAX_MUTEXES]> {
+    MUTEX_LIST.call_once(|| {
+        RwLock::new([MutexInner::default(); MAX_MUTEXES])
+    })
+}
+
 #[derive(Debug)]
 pub struct Mutex(usize);
 
 impl Mutex {
     pub fn init() {
-        unsafe {
-            for i in 0..MAX_MUTEXES {
-                MUTEX_LIST[i] = MutexInner {
-                    locked: false,
-                    used: false,
-                    owner: None,
-                };
-            }
+        let mut list = get_mutex_list().write();
+        for i in 0..MAX_MUTEXES {
+            list[i] = MutexInner::default();
         }
     }
 
     pub fn new() -> Result<Self> {
-        unsafe {
-            for i in 0..MAX_MUTEXES {
-                if !MUTEX_LIST[i].used {
-                    MUTEX_LIST[i].used = true;
-                    MUTEX_LIST[i].owner = None;
-                    return Ok(Mutex(i));
-                }
+        let mut list = get_mutex_list().write();
+        for i in 0..MAX_MUTEXES {
+            if !list[i].used {
+                list[i].used = true;
+                list[i].owner = None;
+                return Ok(Mutex(i));
             }
         }
         Err(RtosError::MutexSlotsFull)
     }
 
     pub fn lock(&self) {
-        unsafe {
-            if MUTEX_LIST[self.0].locked {
-                Scheduler::get_current_task().block(Event::Mutex(self.0));
-                return;
-            }
-            MUTEX_LIST[self.0].locked = true;
-            MUTEX_LIST[self.0].owner = Some(Scheduler::get_current_task());
+        let mut list = get_mutex_list().write();
+        if list[self.0].locked {
+            drop(list); // 释放锁后再阻塞
+            Scheduler::get_current_task().block(Event::Mutex(self.0));
+            return;
         }
+        list[self.0].locked = true;
+        list[self.0].owner = Some(Scheduler::get_current_task());
     }
 
     pub fn unlock(&self) -> Result<()> {
-        unsafe {
-            if MUTEX_LIST[self.0].owner != Some(Scheduler::get_current_task()) {
-                return Err(RtosError::MutexNotOwned);
-            }
-            MUTEX_LIST[self.0].locked = false;
-            MUTEX_LIST[self.0].owner = None;
-            Event::wake_task(Event::Mutex(self.0));
-            Ok(())
+        let mut list = get_mutex_list().write();
+        if list[self.0].owner != Some(Scheduler::get_current_task()) {
+            return Err(RtosError::MutexNotOwned);
         }
+        list[self.0].locked = false;
+        list[self.0].owner = None;
+        drop(list); // 释放锁后再唤醒
+        Event::wake_task(Event::Mutex(self.0));
+        Ok(())
     }
 
     /// 获取锁，返回 RAII 守卫
@@ -120,11 +129,10 @@ impl Drop for Mutex {
     ///
     /// 这允许槽位被后续的 Mutex::new() 重用
     fn drop(&mut self) {
-        unsafe {
-            MUTEX_LIST[self.0].used = false;
-            MUTEX_LIST[self.0].locked = false;
-            MUTEX_LIST[self.0].owner = None;
-        }
+        let mut list = get_mutex_list().write();
+        list[self.0].used = false;
+        list[self.0].locked = false;
+        list[self.0].owner = None;
     }
 }
 

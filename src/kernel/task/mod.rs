@@ -3,18 +3,13 @@ use crate::config::MAX_TASKS;
 use crate::config::STACK_SIZE;
 use crate::sync::event::Event;
 use crate::error::{Result, RtosError};
+use crate::compat::Box;
 use core::cmp::PartialEq;
 use core::fmt::Debug;
 use core::prelude::rust_2024::*;
 use core::ptr::addr_of;
 
 use spin::{Once, RwLock};
-
-// 在 no_std 环境使用 alloc，在测试环境使用 std
-#[cfg(not(test))]
-use alloc::boxed::Box;
-#[cfg(test)]
-use std::boxed::Box;
 
 // 子模块
 pub mod priority;
@@ -84,12 +79,10 @@ fn get_task_list() -> &'static RwLock<[TaskControlBlock; MAX_TASKS]> {
 
 // 关键：统一的包装器函数，有固定的入口地址
 fn task_wrapper_entry(task_id: usize) {
-    unsafe {
-        let mut task_list = get_task_list().write();
-        if let Some(task_fn) = task_list[task_id].task_fn.take() {
-            drop(task_list); // 提前释放写锁
-            task_fn.call(task_id);
-        }
+    let mut task_list = get_task_list().write();
+    if let Some(task_fn) = task_list[task_id].task_fn.take() {
+        drop(task_list); // 提前释放写锁
+        task_fn.call(task_id);
     }
 }
 
@@ -134,60 +127,49 @@ impl Task {
     where
         F: TaskFunction,
     {
-        unsafe {
-            let mut task_list = get_task_list().write();
-            for i in 0..MAX_TASKS {
-                if task_list[i].state == TaskState::Uninit {
-                    task_list[i].init_unified(
-                        name,
-                        func,
-                        i,
-                        addr_of!(TASK_STACKS[i].data) as usize + STACK_SIZE,
-                    );
-                    return Ok(Task(i));
-                }
+        let mut task_list = get_task_list().write();
+        for i in 0..MAX_TASKS {
+            if task_list[i].state == TaskState::Uninit {
+                // SAFETY: TASK_STACKS 是静态数组，我们通过 task_list 的写锁保证了
+                // 同一时间只有一个任务在初始化特定的栈槽位
+                let stack_top = unsafe { addr_of!(TASK_STACKS[i].data) as usize + STACK_SIZE };
+                task_list[i].init_unified(name, func, i, stack_top);
+                return Ok(Task(i));
             }
-            Err(RtosError::TaskSlotsFull)
         }
+        Err(RtosError::TaskSlotsFull)
     }
 
     pub fn run(&mut self) {
-        unsafe {
-            get_task_list().write()[self.0].state = TaskState::Running;
-        }
+        get_task_list().write()[self.0].state = TaskState::Running;
     }
+
     pub fn ready(&mut self) {
-        unsafe {
-            get_task_list().write()[self.0].state = TaskState::Ready;
-        }
+        get_task_list().write()[self.0].state = TaskState::Ready;
     }
 
     pub fn block(&mut self, reason: Event) {
-        unsafe {
-            get_task_list().write()[self.0].state = TaskState::Blocked(reason);
-        }
+        get_task_list().write()[self.0].state = TaskState::Blocked(reason);
     }
 
     pub fn get_state(&self) -> TaskState {
-        unsafe { get_task_list().read()[self.0].state }
+        get_task_list().read()[self.0].state
     }
 
     pub fn get_name(&self) -> &'static str {
-        unsafe { get_task_list().read()[self.0].name }
+        get_task_list().read()[self.0].name
     }
 
     pub fn get_taskid(&self) -> usize {
-        unsafe { get_task_list().read()[self.0].taskid }
+        get_task_list().read()[self.0].taskid
     }
 
     pub fn get_stack_top(&self) -> usize {
-        unsafe { get_task_list().read()[self.0].stack_top }
+        get_task_list().read()[self.0].stack_top
     }
 
     pub fn set_stack_top(&mut self, stack_top: usize) {
-        unsafe {
-            get_task_list().write()[self.0].stack_top = stack_top;
-        }
+        get_task_list().write()[self.0].stack_top = stack_top;
     }
 
     /// 获取任务优先级
@@ -195,7 +177,7 @@ impl Task {
     /// # 返回值
     /// 任务的当前优先级
     pub fn get_priority(&self) -> Priority {
-        unsafe { get_task_list().read()[self.0].priority }
+        get_task_list().read()[self.0].priority
     }
 
     /// 设置任务优先级
@@ -203,15 +185,17 @@ impl Task {
     /// # 参数
     /// - `priority`: 新的优先级
     pub fn set_priority(&mut self, priority: Priority) {
-        unsafe {
-            get_task_list().write()[self.0].priority = priority;
-        }
+        get_task_list().write()[self.0].priority = priority;
     }
 
     pub(crate) fn init() {
+        for i in 0..MAX_TASKS {
+            get_task_list().write()[i] = TaskControlBlock::default();
+        }
+        // TASK_STACKS 是静态数组，需要 unsafe 访问
+        // 这是必要的 unsafe，因为我们需要重置静态可变数组
         unsafe {
             for i in 0..MAX_TASKS {
-                get_task_list().write()[i] = TaskControlBlock::default();
                 TASK_STACKS[i] = Stack {
                     data: [0; STACK_SIZE],
                 };
@@ -224,11 +208,9 @@ impl Task {
     where
         F: FnMut(&mut Task, usize) -> (),
     {
-        unsafe {
-            for i in 0..MAX_TASKS {
-                if get_task_list().write()[i].state != TaskState::Uninit {
-                    f(&mut Task(i), i);
-                }
+        for i in 0..MAX_TASKS {
+            if get_task_list().read()[i].state != TaskState::Uninit {
+                f(&mut Task(i), i);
             }
         }
     }
@@ -238,16 +220,14 @@ impl Task {
     where
         F: FnMut(&mut Task, usize) -> (),
     {
-        unsafe {
-            for i in start..MAX_TASKS {
-                if get_task_list().write()[i].state != TaskState::Uninit {
-                    f(&mut Task(i), i);
-                }
+        for i in start..MAX_TASKS {
+            if get_task_list().read()[i].state != TaskState::Uninit {
+                f(&mut Task(i), i);
             }
-            for i in 0..start {
-                if get_task_list().write()[i].state != TaskState::Uninit {
-                    f(&mut Task(i), i);
-                }
+        }
+        for i in 0..start {
+            if get_task_list().read()[i].state != TaskState::Uninit {
+                f(&mut Task(i), i);
             }
         }
     }

@@ -57,8 +57,10 @@ mod tests {
     use crate::kernel::scheduler::Scheduler;
     use crate::kernel::task::Task;
     use crate::utils::kernel_init;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_mutex_guard_auto_unlock() {
         kernel_init();
         let mutex = Mutex::new().unwrap();
@@ -80,6 +82,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mutex_with_lock() {
         kernel_init();
         let mutex = Mutex::new().unwrap();
@@ -100,6 +103,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mutex_guard_nested_scope() {
         kernel_init();
         let mutex = Mutex::new().unwrap();
@@ -119,7 +123,7 @@ mod tests {
 
             value += 100;
         }
-        // 锁在这里释放
+        // 锁��这里释放
 
         assert_eq!(value, 111);
     }

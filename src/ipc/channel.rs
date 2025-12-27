@@ -1,15 +1,8 @@
-// 在 no_std 环境使用 alloc，在测试环境使用 std
-#[cfg(not(test))]
-extern crate alloc;
-
 use crate::kernel::task::Task;
 use crate::{sync::event::Event, kernel::scheduler::Scheduler};
+use crate::compat::{Box, Vec, VecDeque};
 
-#[cfg(not(test))]
-use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
-#[cfg(test)]
-use std::{boxed::Box, collections::VecDeque, vec::Vec};
-
+use core::any::Any;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
@@ -17,41 +10,27 @@ use spin::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpcHandle(usize);
 
-// 消息类型，使用类型擦除
-#[derive(Debug)]
+// 消息类型，使用 Box<dyn Any> 进行类型安全的类型擦除
 struct Message {
-    data: Vec<u8>,
-    type_id: core::any::TypeId,
+    data: Box<dyn Any + Send>,
 }
 
 impl Message {
-    fn new<T: 'static>(data: T) -> Self {
-        let bytes = unsafe {
-            let ptr = &data as *const T as *const u8;
-            let size = core::mem::size_of::<T>();
-            Vec::from(core::slice::from_raw_parts(ptr, size))
-        };
-        core::mem::forget(data); // 避免析构
-
-        Message {
-            data: bytes,
-            type_id: core::any::TypeId::of::<T>(),
+    fn new<T: 'static + Send>(data: T) -> Self {
+        Self {
+            data: Box::new(data),
         }
     }
 
     fn try_into<T: 'static>(self) -> Result<T, Self> {
-        if self.type_id == core::any::TypeId::of::<T>() {
-            if self.data.len() == core::mem::size_of::<T>() {
-                unsafe {
-                    let ptr = self.data.as_ptr() as *const T;
-                    Ok(core::ptr::read(ptr))
-                }
-            } else {
-                Err(self)
-            }
-        } else {
-            Err(self)
+        match self.data.downcast::<T>() {
+            Ok(boxed) => Ok(*boxed),
+            Err(data) => Err(Self { data }),
         }
+    }
+    
+    fn is_type<T: 'static>(&self) -> bool {
+        self.data.is::<T>()
     }
 }
 
@@ -109,7 +88,7 @@ impl IpcManager {
         IpcHandle(handle_id)
     }
 
-    fn send_message<T: 'static>(&mut self, handle: IpcHandle, data: T) -> Result<(), IpcError> {
+    fn send_message<T: 'static + Send>(&mut self, handle: IpcHandle, data: T) -> Result<(), IpcError> {
         let queue_opt = self.queues.get_mut(handle.0);
 
         match queue_opt {
@@ -152,7 +131,7 @@ impl IpcManager {
                 } else {
                     // 先检查类型是否匹配，不要立即消费消息
                     if let Some(front_message) = queue.queue.front() {
-                        if front_message.type_id != core::any::TypeId::of::<T>() {
+                        if !front_message.is_type::<T>() {
                             return Err(IpcError::TypeMismatch);
                         }
                     }
@@ -161,7 +140,7 @@ impl IpcManager {
                     let message = queue.queue.pop_front().unwrap();
 
                     // 唤醒等待发送的任务
-                    if let Some(waiting_task) = queue.waiting_senders.pop() {
+                    if let Some(_waiting_task) = queue.waiting_senders.pop() {
                         Event::wake_task(Event::Mq(handle.0));
                     }
 
@@ -207,7 +186,7 @@ impl Ipc {
     }
 
     /// 发送消息到指定队列
-    pub fn send<T: 'static>(handle: IpcHandle, data: T) -> Result<(), IpcError> {
+    pub fn send<T: 'static + Send>(handle: IpcHandle, data: T) -> Result<(), IpcError> {
         IPC_MANAGER.lock().send_message(handle, data)
     }
 
@@ -222,7 +201,7 @@ impl Ipc {
     }
 
     /// 非阻塞发送（如果队列满则立即返回错误）
-    pub fn try_send<T: 'static>(handle: IpcHandle, data: T) -> Result<(), IpcError> {
+    pub fn try_send<T: 'static + Send>(handle: IpcHandle, data: T) -> Result<(), IpcError> {
         // 这里可以实现非阻塞版本
         Self::send(handle, data)
     }
