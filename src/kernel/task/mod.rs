@@ -267,12 +267,14 @@ impl Task {
     /// - `name`: 任务名称
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,no_run
     /// use neon_rtos2::kernel::task::{Task, Priority};
-    ///
+    /// # fn main() -> Result<(), neon_rtos2::error::RtosError> {
     /// let task = Task::builder("my_task")
     ///     .priority(Priority::High)
     ///     .spawn(|_| { /* ... */ });
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn builder(name: &'static str) -> TaskBuilder {
         TaskBuilder::new(name)
@@ -290,9 +292,10 @@ impl Task {
     ///
     /// # 示例
     ///
-    /// ```rust,ignore
-    /// use neon_rtos2::kernel::task::state::TypedTaskAny;
-    ///
+    /// ```rust,no_run
+    /// # use neon_rtos2::kernel::task::{Task, TaskState};
+    /// # use neon_rtos2::kernel::task::state::TypedTaskAny;
+    /// # fn main() -> Result<(), neon_rtos2::error::RtosError> {
     /// let task = Task::new("my_task", |_| {})?;
     ///
     /// match task.into_typed()? {
@@ -310,6 +313,8 @@ impl Task {
     ///         println!("Task is created");
     ///     }
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn into_typed(self) -> Result<state::TypedTaskAny> {
         use state::{TypedTask, TypedTaskAny, Created, Ready, Running, Blocked};

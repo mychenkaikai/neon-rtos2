@@ -26,8 +26,10 @@
 //!
 //! ### 实现自定义驱动
 //!
-//! ```rust,ignore
-//! use neon_rtos2::drivers::{Device, Read, Write, DeviceError};
+//! ```rust,no_run
+//! # use neon_rtos2::drivers::{Device, Read, Write};
+//! # #[derive(Debug)]
+//! # struct DeviceError;
 //!
 //! struct MyUart {
 //!     base_addr: usize,
@@ -68,8 +70,8 @@
 //!
 //! ### 使用设备驱动宏
 //!
-//! ```rust,ignore
-//! use neon_rtos2::device_driver;
+//! ```rust,no_run
+//! # use neon_rtos2::device_driver;
 //!
 //! device_driver! {
 //!     name: Uart0,
@@ -88,8 +90,8 @@
 //!
 //! ### 使用位域宏
 //!
-//! ```rust,ignore
-//! use neon_rtos2::bitfield;
+//! ```rust,no_run
+//! # use neon_rtos2::bitfield;
 //!
 //! bitfield! {
 //!     /// UART 状态寄存器

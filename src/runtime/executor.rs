@@ -43,7 +43,9 @@ impl AsyncTask {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use neon_rtos2::runtime::Executor;
+/// # fn main() {
 /// let mut executor = Executor::new();
 ///
 /// executor.spawn(async {
@@ -51,6 +53,7 @@ impl AsyncTask {
 /// });
 ///
 /// executor.run();
+/// # }
 /// ```
 pub struct Executor {
     /// 就绪队列

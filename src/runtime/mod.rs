@@ -40,16 +40,20 @@
 //!
 //! ### 使用 Select
 //!
-//! ```rust,ignore
-//! use neon_rtos2::select;
-//!
-//! async fn handle_events() {
-//!     select! {
-//!         msg = rx.recv() => println!("Received: {:?}", msg),
-//!         _ = timer.sleep(1000) => println!("Timeout!"),
-//!     }
-//! }
-//! ```
+/// ```rust,no_run
+/// # use neon_rtos2::select;
+/// # use neon_rtos2::kernel::time::timer::Timer;
+/// # struct Rx;
+/// # impl Rx { async fn recv(&self) -> i32 { 0 } }
+/// # let rx = Rx;
+/// # let timer = Timer;
+/// async fn handle_events() {
+///     select! {
+///         msg = rx.recv() => println!("Received: {:?}", msg),
+///         _ = Timer::sleep(1000) => println!("Timeout!"),
+///     }
+/// }
+/// ```
 
 mod waker;
 mod executor;

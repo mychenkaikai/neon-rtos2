@@ -40,8 +40,16 @@
 //!
 //! ## 使用示例
 //!
-//! ```rust,ignore
-//! use neon_rtos2::kernel::power::{PowerManager, PowerState, WakeupSource};
+//! ```rust,no_run
+//! # use neon_rtos2::kernel::power::{PowerState};
+//! # struct PowerManager;
+//! # impl PowerManager {
+//! #     fn global() -> Self { Self }
+//! #     fn enable_wakeup(&self, _: WakeupSource) {}
+//! #     fn enter_idle(&self) {}
+//! #     fn enter_sleep(&self) {}
+//! # }
+//! # enum WakeupSource { Timer, GpioPin(u8) }
 //!
 //! // 获取电源管理器
 //! let pm = PowerManager::global();

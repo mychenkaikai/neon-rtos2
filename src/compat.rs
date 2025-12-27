@@ -4,7 +4,7 @@
 //!
 //! # 使用方法
 //!
-//! ```rust,ignore
+//! ```rust
 //! use crate::compat::{Box, Vec, VecDeque};
 //! ```
 //!

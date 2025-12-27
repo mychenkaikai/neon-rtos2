@@ -4,8 +4,8 @@
 //!
 //! ## 使用示例
 //!
-//! ```rust,ignore
-//! use neon_rtos2::device_driver;
+//! ```rust
+//! # use neon_rtos2::device_driver;
 //!
 //! device_driver! {
 //!     name: Uart0,
@@ -24,7 +24,8 @@
 ///
 /// # 语法
 ///
-/// ```rust,ignore
+/// ```rust
+/// # use neon_rtos2::device_driver;
 /// device_driver! {
 ///     name: DeviceName,
 ///     base_addr: 0x4000_0000,
@@ -43,7 +44,8 @@
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust
+/// # use neon_rtos2::device_driver;
 /// device_driver! {
 ///     name: Uart0,
 ///     base_addr: 0x4000_0000,
@@ -120,7 +122,8 @@ macro_rules! device_driver {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust
+/// # use neon_rtos2::bitfield;
 /// bitfield! {
 ///     /// UART 状态寄存器
 ///     pub struct UartStatus(u32) {
@@ -209,7 +212,8 @@ macro_rules! bitfield {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use neon_rtos2::interrupt_handler;
 /// interrupt_handler! {
 ///     name: uart0_irq,
 ///     handler: || {

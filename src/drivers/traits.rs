@@ -27,8 +27,11 @@
 //!
 //! ## 使用示例
 //!
-//! ```rust,ignore
-//! use neon_rtos2::drivers::{Device, Read, Write, GpioPin};
+//! ```rust,no_run
+//! # use neon_rtos2::drivers::{Device, Read, Write, GpioPin};
+//!
+//! #[derive(Debug)]
+//! struct UartError;
 //!
 //! // 实现自定义 UART 驱动
 //! struct MyUart {
@@ -72,7 +75,11 @@ use crate::error::RtosError;
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use neon_rtos2::drivers::Device;
+/// # struct MyDevice;
+/// # #[derive(Debug)]
+/// # struct MyDeviceError;
 /// impl Device for MyDevice {
 ///     type Error = MyDeviceError;
 ///     

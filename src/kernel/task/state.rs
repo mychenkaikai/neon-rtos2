@@ -9,9 +9,19 @@
 //!
 //! ## 使用示例
 //!
-//! ```rust,ignore
-//! use neon_rtos2::kernel::task::state::*;
-//!
+//! ```rust,no_run
+//! # use neon_rtos2::kernel::task::state::*;
+//! # use neon_rtos2::kernel::task::state::TypedTask;
+//! # use neon_rtos2::kernel::task::state::Created;
+//! # use neon_rtos2::kernel::task::state::Ready;
+//! # use neon_rtos2::kernel::task::state::Running;
+//! # use neon_rtos2::kernel::task::state::Blocked;
+//! # use neon_rtos2::kernel::task::state::TypedTaskAny;
+//! # use neon_rtos2::kernel::task::state::TaskStateMarker;
+//! # use neon_rtos2::kernel::task::Task;
+//! # use neon_rtos2::prelude::*;
+//! # fn main() -> Result<(), RtosError> {
+//! # kernel_init();
 //! // 创建任务（Created 状态）
 //! let task = TypedTask::<Created>::new("my_task", |_| {
 //!     loop { /* 任务逻辑 */ }
@@ -25,6 +35,8 @@
 //!
 //! // 以下代码无法编译！
 //! // task.start(); // 错误：Running 状态没有 start 方法
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## 状态转换图
@@ -113,7 +125,11 @@ mod private {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use neon_rtos2::kernel::task::state::*;
+/// # use neon_rtos2::prelude::*;
+/// # fn main() -> Result<(), RtosError> {
+/// # kernel_init();
 /// // 创建任务
 /// let task = TypedTask::<Created>::new("task", |_| {})?;
 ///
@@ -124,6 +140,8 @@ mod private {
 /// // 编译错误示例：
 /// // let task = TypedTask::<Running>::new(...); // 错误：只能创建 Created 状态
 /// // task.start(); // 错误：Running 没有 start 方法
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct TypedTask<S: TaskStateMarker> {
@@ -155,12 +173,18 @@ impl TypedTask<Created> {
     ///
     /// # 示例
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use neon_rtos2::kernel::task::state::*;
+    /// # use neon_rtos2::prelude::*;
+    /// # fn main() -> Result<(), RtosError> {
+    /// # kernel_init();
     /// let task = TypedTask::<Created>::new("my_task", |_| {
     ///     loop {
     ///         // 任务逻辑
     ///     }
     /// })?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn new<F>(name: &'static str, func: F) -> Result<Self>
     where
@@ -198,9 +222,15 @@ impl TypedTask<Created> {
     ///
     /// # 示例
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use neon_rtos2::kernel::task::state::*;
+    /// # use neon_rtos2::prelude::*;
+    /// # fn main() -> Result<(), RtosError> {
+    /// # kernel_init();
     /// let task = TypedTask::<Created>::new("task", |_| {})?;
     /// let task = task.start(); // 现在是 Ready 状态
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn start(self) -> TypedTask<Ready> {
         // 任务创建时已经是 Ready 状态，这里只是类型转换
@@ -417,12 +447,18 @@ impl<S: TaskStateMarker> TypedTask<S> {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use neon_rtos2::prelude::*;
+/// # use neon_rtos2::kernel::task::state::TypedTask;
+/// # fn main() -> Result<(), RtosError> {
+/// # kernel_init();
 /// let task = TypedTask::builder("my_task")
 ///     .priority(Priority::High)
 ///     .spawn(|_| {
 ///         // 任务逻辑
 ///     })?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct TypedTaskBuilder {
     name: &'static str,
@@ -478,7 +514,11 @@ impl TypedTaskBuilder {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use neon_rtos2::prelude::*;
+/// # use neon_rtos2::kernel::task::state::TypedTaskAny;
+/// # fn main() -> Result<(), RtosError> {
+/// # kernel_init();
 /// let task = Task::new("task", |_| {})?;
 /// match task.into_typed()? {
 ///     TypedTaskAny::Ready(ready_task) => {
@@ -494,6 +534,8 @@ impl TypedTaskBuilder {
 ///         // 处理创建状态的任务
 ///     }
 /// }
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub enum TypedTaskAny {
@@ -573,9 +615,17 @@ impl From<Task> for TypedTask<Ready> {
     ///
     /// # 示例
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use neon_rtos2::kernel::task::Task;
+    /// # use neon_rtos2::kernel::task::state::TypedTask;
+    /// # use neon_rtos2::kernel::task::state::Ready;
+    /// # use neon_rtos2::prelude::*;
+    /// # fn main() -> Result<(), RtosError> {
+    /// # kernel_init();
     /// let task = Task::new("task", |_| {})?;
     /// let typed_task: TypedTask<Ready> = task.into();
+    /// # Ok(())
+    /// # }
     /// ```
     fn from(task: Task) -> Self {
         Self {

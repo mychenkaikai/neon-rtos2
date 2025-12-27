@@ -17,7 +17,8 @@ impl Signal {
     /// 注意：使用前必须调用 `open()` 或 `ensure_init()` 进行初始化
     /// 
     /// # 示例
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use neon_rtos2::sync::Signal;
     /// static mut MY_SIGNAL: Signal = Signal::new_uninit();
     /// 
     /// // 使用前初始化
@@ -35,7 +36,8 @@ impl Signal {
     /// 这是创建信号量的推荐方式，无需额外调用 `open()`
     /// 
     /// # 示例
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use neon_rtos2::sync::Signal;
     /// let signal = Signal::create();
     /// signal.wait();
     /// ```
@@ -66,7 +68,8 @@ impl Signal {
     /// 如果已初始化，则不做任何操作。
     /// 
     /// # 示例
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use neon_rtos2::sync::Signal;
     /// let mut signal = Signal::new_uninit();
     /// signal.ensure_init();
     /// signal.wait();

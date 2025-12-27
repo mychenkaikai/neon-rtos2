@@ -20,26 +20,24 @@
 //!
 //! ## 快速开始
 //!
-//! ```rust,ignore
-//! use neon_rtos2::prelude::*;
+//! ```rust,no_run
+//! # use neon_rtos2::prelude::*;
+//! # fn main() -> Result<(), RtosError> {
+//! # kernel_init();
+//! // 创建任务（Builder 模式）
+//! let task = Task::builder("my_task")
+//!     .priority(Priority::High)
+//!     .spawn(|_| {
+//!         loop {
+//!             info!("Task running");
+//!             Delay::delay(1000).unwrap();
+//!         }
+//!     }).unwrap();
 //!
-//! fn main() {
-//!     // 初始化内核
-//!     kernel_init();
-//!
-//!     // 创建任务（Builder 模式）
-//!     let task = Task::builder("my_task")
-//!         .priority(Priority::High)
-//!         .spawn(|_| {
-//!             loop {
-//!                 info!("Task running");
-//!                 Delay::delay(1000).unwrap();
-//!             }
-//!         }).unwrap();
-//!
-//!     // 启动调度器
-//!     Scheduler::start();
-//! }
+//! // 启动调度器
+//! Scheduler::start();
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## 架构分层
@@ -80,7 +78,7 @@
 //!
 //! 推荐使用 `prelude` 模块一次性导入所有常用类型：
 //!
-//! ```rust,ignore
+//! ```rust
 //! use neon_rtos2::prelude::*;
 //! ```
 //!

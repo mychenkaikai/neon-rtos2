@@ -19,7 +19,9 @@ use crate::kernel::time::systick::Systick;
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use neon_rtos2::runtime::AsyncSignal;
+/// # use neon_rtos2::kernel::time::timer::Timer;
 /// static SIGNAL: AsyncSignal = AsyncSignal::new();
 ///
 /// // 生产者
