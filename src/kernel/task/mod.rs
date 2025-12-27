@@ -273,6 +273,63 @@ impl Task {
     pub fn builder(name: &'static str) -> TaskBuilder {
         TaskBuilder::new(name)
     }
+
+    /// 尝试转换为类型安全的任务句柄
+    ///
+    /// 根据任务当前状态返回对应的 `TypedTask` 变体。
+    /// 这是从普通 `Task` 转换到类型状态系统的推荐方式。
+    ///
+    /// # 返回值
+    ///
+    /// - `Ok(TypedTaskAny)`: 成功转换，包含对应状态的 `TypedTask`
+    /// - `Err(RtosError::InvalidTaskState)`: 任务处于未初始化状态
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// use neon_rtos2::kernel::task::state::TypedTaskAny;
+    ///
+    /// let task = Task::new("my_task", |_| {})?;
+    ///
+    /// match task.into_typed()? {
+    ///     TypedTaskAny::Ready(ready_task) => {
+    ///         println!("Task is ready");
+    ///         let running_task = ready_task.run();
+    ///     }
+    ///     TypedTaskAny::Running(running_task) => {
+    ///         println!("Task is running");
+    ///     }
+    ///     TypedTaskAny::Blocked(blocked_task) => {
+    ///         println!("Task is blocked on: {:?}", blocked_task.blocked_event());
+    ///     }
+    ///     TypedTaskAny::Created(created_task) => {
+    ///         println!("Task is created");
+    ///     }
+    /// }
+    /// ```
+    pub fn into_typed(self) -> Result<state::TypedTaskAny> {
+        use state::{TypedTask, TypedTaskAny, Created, Ready, Running, Blocked};
+        use core::marker::PhantomData;
+
+        match self.get_state() {
+            TaskState::Uninit => Err(RtosError::InvalidTaskState),
+            TaskState::Ready => Ok(TypedTaskAny::Ready(TypedTask {
+                inner: self,
+                blocked_event: None,
+                _state: PhantomData,
+            })),
+            TaskState::Running => Ok(TypedTaskAny::Running(TypedTask {
+                inner: self,
+                blocked_event: None,
+                _state: PhantomData,
+            })),
+            TaskState::Blocked(event) => Ok(TypedTaskAny::Blocked(TypedTask {
+                inner: self,
+                blocked_event: Some(event),
+                _state: PhantomData,
+            })),
+        }
+    }
 }
 
 /// 任务迭代器

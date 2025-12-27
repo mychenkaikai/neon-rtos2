@@ -128,11 +128,11 @@ mod private {
 #[derive(Debug)]
 pub struct TypedTask<S: TaskStateMarker> {
     /// 内部任务句柄
-    inner: Task,
+    pub(crate) inner: Task,
     /// 阻塞事件（仅 Blocked 状态使用）
-    blocked_event: Option<Event>,
+    pub(crate) blocked_event: Option<Event>,
     /// 状态标记（零大小类型，不占用内存）
-    _state: PhantomData<S>,
+    pub(crate) _state: PhantomData<S>,
 }
 
 // ============================================================================
@@ -472,10 +472,111 @@ impl TypedTaskBuilder {
 // 从普通 Task 转换
 // ============================================================================
 
+/// 任意状态的类型安全任务
+///
+/// 用于从普通 `Task` 转换时，根据实际状态返回对应的 `TypedTask` 变体
+///
+/// # 示例
+///
+/// ```rust,ignore
+/// let task = Task::new("task", |_| {})?;
+/// match task.into_typed()? {
+///     TypedTaskAny::Ready(ready_task) => {
+///         // 处理就绪状态的任务
+///     }
+///     TypedTaskAny::Running(running_task) => {
+///         // 处理运行状态的任务
+///     }
+///     TypedTaskAny::Blocked(blocked_task) => {
+///         // 处理阻塞状态的任务
+///     }
+///     TypedTaskAny::Created(_) => {
+///         // 处理创建状态的任务
+///     }
+/// }
+/// ```
+#[derive(Debug)]
+pub enum TypedTaskAny {
+    /// 已创建状态
+    Created(TypedTask<Created>),
+    /// 就绪状态
+    Ready(TypedTask<Ready>),
+    /// 运行状态
+    Running(TypedTask<Running>),
+    /// 阻塞状态
+    Blocked(TypedTask<Blocked>),
+}
+
+impl TypedTaskAny {
+    /// 尝试转换为 Ready 状态
+    ///
+    /// # 返回值
+    ///
+    /// 如果任务处于 Ready 状态，返回 `Some(TypedTask<Ready>)`，否则返回 `None`
+    pub fn into_ready(self) -> Option<TypedTask<Ready>> {
+        match self {
+            TypedTaskAny::Ready(task) => Some(task),
+            _ => None,
+        }
+    }
+
+    /// 尝试转换为 Running 状态
+    pub fn into_running(self) -> Option<TypedTask<Running>> {
+        match self {
+            TypedTaskAny::Running(task) => Some(task),
+            _ => None,
+        }
+    }
+
+    /// 尝试转换为 Blocked 状态
+    pub fn into_blocked(self) -> Option<TypedTask<Blocked>> {
+        match self {
+            TypedTaskAny::Blocked(task) => Some(task),
+            _ => None,
+        }
+    }
+
+    /// 尝试转换为 Created 状态
+    pub fn into_created(self) -> Option<TypedTask<Created>> {
+        match self {
+            TypedTaskAny::Created(task) => Some(task),
+            _ => None,
+        }
+    }
+
+    /// 获取任务 ID
+    pub fn id(&self) -> usize {
+        match self {
+            TypedTaskAny::Created(task) => task.id(),
+            TypedTaskAny::Ready(task) => task.id(),
+            TypedTaskAny::Running(task) => task.id(),
+            TypedTaskAny::Blocked(task) => task.id(),
+        }
+    }
+
+    /// 获取任务名称
+    pub fn name(&self) -> &'static str {
+        match self {
+            TypedTaskAny::Created(task) => task.name(),
+            TypedTaskAny::Ready(task) => task.name(),
+            TypedTaskAny::Running(task) => task.name(),
+            TypedTaskAny::Blocked(task) => task.name(),
+        }
+    }
+}
+
 impl From<Task> for TypedTask<Ready> {
     /// 从普通 Task 转换为 TypedTask<Ready>
     ///
-    /// 假设传入的 Task 处于 Ready 状态
+    /// **注意**：此方法假设传入的 Task 处于 Ready 状态。
+    /// 如果不确定任务状态，请使用 `Task::into_typed()` 方法。
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// let task = Task::new("task", |_| {})?;
+    /// let typed_task: TypedTask<Ready> = task.into();
+    /// ```
     fn from(task: Task) -> Self {
         Self {
             inner: task,
@@ -575,6 +676,95 @@ mod tests {
         let typed_task: TypedTask<Ready> = task.into();
         
         assert_eq!(typed_task.name(), "from_task");
+    }
+
+    #[test]
+    #[serial]
+    fn test_task_into_typed_ready() {
+        kernel_init();
+        
+        let task = Task::new("typed_ready", |_| {}).unwrap();
+        let typed = task.into_typed().unwrap();
+        
+        match typed {
+            TypedTaskAny::Ready(ready_task) => {
+                assert_eq!(ready_task.name(), "typed_ready");
+            }
+            _ => panic!("Expected Ready state"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_task_into_typed_running() {
+        kernel_init();
+        
+        let mut task = Task::new("typed_running", |_| {}).unwrap();
+        task.run();
+        
+        let typed = task.into_typed().unwrap();
+        
+        match typed {
+            TypedTaskAny::Running(running_task) => {
+                assert_eq!(running_task.name(), "typed_running");
+            }
+            _ => panic!("Expected Running state"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_task_into_typed_blocked() {
+        kernel_init();
+        
+        let mut task = Task::new("typed_blocked", |_| {}).unwrap();
+        task.block(Event::Signal(42));
+        
+        let typed = task.into_typed().unwrap();
+        
+        match typed {
+            TypedTaskAny::Blocked(blocked_task) => {
+                assert_eq!(blocked_task.name(), "typed_blocked");
+                assert_eq!(blocked_task.blocked_event(), Some(Event::Signal(42)));
+            }
+            _ => panic!("Expected Blocked state"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_typed_task_any_conversions() {
+        kernel_init();
+        
+        // Test into_ready
+        let task = Task::new("conv_ready", |_| {}).unwrap();
+        let typed = task.into_typed().unwrap();
+        assert!(typed.into_ready().is_some());
+        
+        // Test into_running
+        let mut task = Task::new("conv_running", |_| {}).unwrap();
+        task.run();
+        let typed = task.into_typed().unwrap();
+        assert!(typed.into_running().is_some());
+        
+        // Test into_blocked
+        let mut task = Task::new("conv_blocked", |_| {}).unwrap();
+        task.block(Event::Timer(1));
+        let typed = task.into_typed().unwrap();
+        assert!(typed.into_blocked().is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn test_typed_task_any_accessors() {
+        kernel_init();
+        
+        let task = Task::new("accessor_test", |_| {}).unwrap();
+        let task_id = task.get_taskid();
+        let typed = task.into_typed().unwrap();
+        
+        assert_eq!(typed.id(), task_id);
+        assert_eq!(typed.name(), "accessor_test");
     }
 }
 
