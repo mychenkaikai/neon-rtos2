@@ -5,6 +5,7 @@ target = "riscv32imac-unknown-none-elf"
 runner = "qemu-system-riscv32 -machine virt -nographic -semihosting-config enable=on,target=native -kernel"
 rustflags = [
     "-C", "link-arg=-Tmemory.x",
+    "-C", "link-arg=-Tlink.x",
     "-C", "link-arg=--nmagic",
 ]
 

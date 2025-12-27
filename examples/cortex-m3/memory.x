@@ -7,3 +7,7 @@ MEMORY
   FLASH : ORIGIN = 0x00000000, LENGTH = 256K
   RAM : ORIGIN = 0x20000000, LENGTH = 64K
 }
+
+/* 栈配置 - 栈从 RAM 顶部向下生长 */
+_stack_start = ORIGIN(RAM) + LENGTH(RAM);
+_stack_end = ORIGIN(RAM);

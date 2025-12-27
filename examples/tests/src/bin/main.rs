@@ -20,7 +20,7 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
+
 use cortex_m::Peripherals;
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::entry;
@@ -58,6 +58,21 @@ static mut TEST_RESULTS: [Option<TestResult>; 32] = [None; 32];
 static mut TEST_COUNT: usize = 0;
 static mut TESTS_PASSED: usize = 0;
 static mut TESTS_FAILED: usize = 0;
+
+/// 安全地读取测试计数
+fn get_test_count() -> usize {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TEST_COUNT)) }
+}
+
+/// 安全地读取通过数
+fn get_tests_passed() -> usize {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TESTS_PASSED)) }
+}
+
+/// 安全地读取失败数
+fn get_tests_failed() -> usize {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TESTS_FAILED)) }
+}
 
 /// 记录测试结果
 fn report_test(name: &'static str, passed: bool, message: &'static str) {
@@ -303,7 +318,13 @@ fn test_mutex_closure() -> bool {
 fn test_timer_basic() -> bool {
     info!("Testing: Timer Basic");
     
-    let mut timer = Timer::new(100); // 100ms 定时器
+    let timer_result = Timer::new(100); // 100ms 定时器
+    
+    if !test_assert!(timer_result.is_ok(), "timer_creation", "Timer creation should succeed") {
+        return false;
+    }
+    
+    let mut timer = timer_result.unwrap();
     
     // 测试初始状态
     if !test_assert!(!timer.is_running(), "timer_initial_stopped", "Timer should not be running initially") {
@@ -311,13 +332,13 @@ fn test_timer_basic() -> bool {
     }
     
     // 测试启动
-    timer.start();
+    let _ = timer.start();
     if !test_assert!(timer.is_running(), "timer_started", "Timer should be running after start") {
         return false;
     }
     
     // 测试停止
-    timer.stop();
+    let _ = timer.stop();
     test_assert!(!timer.is_running(), "timer_stopped", "Timer should not be running after stop")
 }
 
@@ -343,29 +364,29 @@ fn test_message_queue() -> bool {
     
     let mut mq = result.unwrap();
     
-    // 测试发送
-    let send_result = mq.send(42);
-    if !test_assert!(send_result.is_ok(), "mq_send", "Send should succeed") {
+    // 测试发送 (使用 push)
+    let send_result = mq.push(42);
+    if !test_assert!(send_result, "mq_send", "Push should succeed") {
         return false;
     }
     
-    // 测试接收
-    let received = mq.receive();
+    // 测试接收 (使用 pop)
+    let received = mq.pop();
     if !test_assert!(received == Some(42), "mq_receive", "Should receive 42") {
         return false;
     }
     
-    // 测试空队列接收
-    let empty_receive = mq.receive();
+    // 测试空队���接收
+    let empty_receive = mq.pop();
     if !test_assert!(empty_receive.is_none(), "mq_receive_empty", "Empty queue should return None") {
         return false;
     }
     
     // 测试队列满
     for i in 0..8 {
-        let _ = mq.send(i);
+        let _ = mq.push(i);
     }
-    if !test_assert!(mq.is_full(), "mq_full", "Queue should be full after 8 sends") {
+    if !test_assert!(mq.is_full(), "mq_full", "Queue should be full after 8 pushes") {
         return false;
     }
     
@@ -498,20 +519,25 @@ fn run_all_tests() {
     info!("================================================");
     info!("               Test Results");
     info!("================================================");
-    unsafe {
-        info!("Total:  {}", TEST_COUNT);
-        info!("Passed: {}", TESTS_PASSED);
-        info!("Failed: {}", TESTS_FAILED);
-        
-        if TESTS_FAILED == 0 {
-            info!("");
-            info!("All tests PASSED!");
-        } else {
-            error!("");
-            error!("Some tests FAILED!");
-            error!("Failed tests:");
-            for i in 0..TEST_COUNT {
-                if let Some(result) = &TEST_RESULTS[i] {
+    
+    let total = get_test_count();
+    let passed = get_tests_passed();
+    let failed = get_tests_failed();
+    
+    info!("Total:  {}", total);
+    info!("Passed: {}", passed);
+    info!("Failed: {}", failed);
+    
+    if failed == 0 {
+        info!("");
+        info!("All tests PASSED!");
+    } else {
+        error!("");
+        error!("Some tests FAILED!");
+        error!("Failed tests:");
+        unsafe {
+            for i in 0..total {
+                if let Some(result) = &*core::ptr::addr_of!(TEST_RESULTS[i]) {
                     if !result.passed {
                         error!("  - {}: {}", result.name, result.message);
                     }
@@ -576,23 +602,5 @@ fn main() -> ! {
     loop {}
 }
 
-// ============================================================================
-// Panic 处理
-// ============================================================================
-
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    error!("!!! TEST PANIC !!!");
-    if let Some(location) = info.location() {
-        error!("Location: {}:{}", location.file(), location.line());
-    }
-    if let Some(message) = info.message().as_str() {
-        error!("Message: {}", message);
-    }
-    
-    // 测试失败，退出 QEMU
-    debug::exit(debug::EXIT_FAILURE);
-    
-    loop {}
-}
+// 使用库提供的默认 panic handler
+neon_rtos2::default_panic_handler!();

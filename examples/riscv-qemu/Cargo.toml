@@ -5,15 +5,25 @@ edition = "2021"
 authors = ["Neon-RTOS2 Team"]
 description = "RISC-V QEMU example for Neon-RTOS2"
 
+# 独立于主 workspace
+[workspace]
+
 [dependencies]
 # Neon-RTOS2 with RISC-V support
 neon-rtos2 = { path = "../..", features = ["riscv"] }
 
 # RISC-V runtime - provides startup code, #[entry] macro, etc.
-riscv-rt = "0.12"
+riscv-rt = { version = "0.12", features = ["single-hart"] }
 
 # RISC-V low-level access (optional, for direct hardware access)
 riscv = "0.11"
+
+# Critical section implementation for RISC-V - 需要 restore-state-usize 来保存 mstatus
+critical-section = { version = "1.2", features = ["restore-state-usize"] }
+
+[build-dependencies]
+# 用于复制 memory.x
+# 无需额外依赖
 
 [profile.dev]
 panic = "abort"

@@ -4,12 +4,14 @@
 //!
 //! # 功能演示
 //!
+//! - **用户配置日志输出**（UART 地址由用户指定）
 //! - 内核初始化
 //! - Builder 模式创建任务
 //! - 任务优先级设置
 //! - 信号量同步
 //! - 任务迭代器
 //! - 延时功能
+//! - 日志系统（使用 `info!`, `debug!` 等宏）
 //!
 //! # 运行方式
 //!
@@ -34,7 +36,22 @@ use core::panic::PanicInfo;
 
 // 导入 RTOS 功能
 use neon_rtos2::prelude::*;
-use neon_rtos2::{info, debug, warn, error, define_signal};
+use neon_rtos2::{info, debug, warn, error, trace, define_signal};
+
+// ============================================================================
+// 用户配置：日志输出
+// ============================================================================
+
+/// QEMU RISC-V virt 平台的 UART 基地址
+/// 
+/// 不同的芯片/平台需要修改这个地址：
+/// - QEMU virt: 0x1000_0000
+/// - K210: 0x3800_0000
+/// - 其他芯片请查阅数据手册
+const UART_BASE_ADDR: usize = 0x1000_0000;
+
+/// 使用 UartOutput 并指定地址
+static UART_OUTPUT: UartOutput<UART_BASE_ADDR> = UartOutput::new();
 
 // ============================================================================
 // 信号量定义
@@ -47,53 +64,6 @@ define_signal!(TASK_SYNC);
 define_signal!(DATA_READY);
 
 // ============================================================================
-// UART 输出（QEMU virt 平台）
-// ============================================================================
-
-/// QEMU virt 平台 UART 基地址
-const UART_BASE: usize = 0x1000_0000;
-
-/// 通过 UART 输出单个字符
-fn uart_putc(c: u8) {
-    unsafe {
-        core::ptr::write_volatile(UART_BASE as *mut u8, c);
-    }
-}
-
-/// 输出字符串
-fn print(s: &str) {
-    for byte in s.bytes() {
-        uart_putc(byte);
-    }
-}
-
-/// 输出带换行的字符串
-fn println(s: &str) {
-    print(s);
-    uart_putc(b'\n');
-}
-
-/// 输出数字
-fn print_num(mut n: u32) {
-    if n == 0 {
-        uart_putc(b'0');
-        return;
-    }
-    
-    let mut buf = [0u8; 10];
-    let mut i = 0;
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        uart_putc(buf[i]);
-    }
-}
-
-// ============================================================================
 // 任务函数
 // ============================================================================
 
@@ -101,19 +71,17 @@ fn print_num(mut n: u32) {
 /// 
 /// 模拟传感器数据采集，周期性发送数据就绪信号
 fn sensor_task(_: usize) {
-    println("[Sensor] Task started (High Priority)");
+    info!("Sensor task started (High Priority)");
     let mut reading = 0u32;
     
     loop {
         // 模拟传感器读取
         reading = reading.wrapping_add(1);
         
-        print("[Sensor] Reading #");
-        print_num(reading);
-        println(" - sending DATA_READY signal");
+        debug!("Sensor: Reading #{} - sending DATA_READY signal", reading);
         
         // 发送数据就绪信号
-        DATA_READY.signal();
+        DATA_READY().send();
         
         // 延时 2 秒
         Delay::delay(2000).unwrap();
@@ -124,21 +92,19 @@ fn sensor_task(_: usize) {
 /// 
 /// 等待传感器数据，处理后发送同步信号
 fn processor_task(_: usize) {
-    println("[Processor] Task started (Normal Priority)");
+    info!("Processor task started (Normal Priority)");
     let mut processed = 0u32;
     
     loop {
         // 等待数据就绪
-        print("[Processor] Waiting for data...");
-        DATA_READY.wait();
+        debug!("Processor: Waiting for data...");
+        DATA_READY().wait();
         
         processed = processed.wrapping_add(1);
-        print(" Got it! Processed count: ");
-        print_num(processed);
-        println("");
+        info!("Processor: Got data! Processed count: {}", processed);
         
         // 处理完成，发送同步信号
-        TASK_SYNC.signal();
+        TASK_SYNC().send();
     }
 }
 
@@ -146,17 +112,15 @@ fn processor_task(_: usize) {
 /// 
 /// 等待处理完成信号，记录日志
 fn logger_task(_: usize) {
-    println("[Logger] Task started (Normal Priority)");
+    info!("Logger task started (Normal Priority)");
     let mut log_count = 0u32;
     
     loop {
         // 等待同步信号
-        TASK_SYNC.wait();
+        TASK_SYNC().wait();
         
         log_count = log_count.wrapping_add(1);
-        print("[Logger] Log entry #");
-        print_num(log_count);
-        println(" - Data processing completed");
+        info!("Logger: Log entry #{} - Data processing completed", log_count);
     }
 }
 
@@ -164,53 +128,41 @@ fn logger_task(_: usize) {
 /// 
 /// 周期性监控系统状态，展示任务迭代器的使用
 fn monitor_task(_: usize) {
-    println("[Monitor] Task started (Low Priority)");
+    info!("Monitor task started (Low Priority)");
     let mut tick = 0u32;
     
     loop {
         tick = tick.wrapping_add(1);
         
-        println("");
-        print("========== System Monitor (tick ");
-        print_num(tick);
-        println(") ==========");
+        info!("");
+        info!("========== System Monitor (tick {}) ==========", tick);
         
         // 使用迭代器统计任务状态
         let total = Task::iter().count();
         let ready = Task::ready_tasks().count();
         let blocked = Task::blocked_tasks().count();
         
-        print("Total tasks: ");
-        print_num(total as u32);
-        println("");
-        
-        print("Ready tasks: ");
-        print_num(ready as u32);
-        println("");
-        
-        print("Blocked tasks: ");
-        print_num(blocked as u32);
-        println("");
+        info!("Total tasks: {}", total);
+        info!("Ready tasks: {}", ready);
+        info!("Blocked tasks: {}", blocked);
         
         // 遍历所有任务并显示状态
-        println("Task list:");
+        info!("Task list:");
         Task::iter().for_each(|task| {
-            print("  - ");
-            print(task.get_name());
-            print(" (ID: ");
-            print_num(task.get_taskid() as u32);
-            print(", State: ");
-            match task.get_state() {
-                TaskState::Uninit => print("Uninit"),
-                TaskState::Ready => print("Ready"),
-                TaskState::Running => print("Running"),
-                TaskState::Blocked(_) => print("Blocked"),
-            }
-            println(")");
+            let state_str = match task.get_state() {
+                TaskState::Uninit => "Uninit",
+                TaskState::Ready => "Ready",
+                TaskState::Running => "Running",
+                TaskState::Blocked(_) => "Blocked",
+            };
+            debug!("  - {} (ID: {}, State: {})", 
+                   task.get_name(), 
+                   task.get_taskid(),
+                   state_str);
         });
         
-        println("==========================================");
-        println("");
+        info!("==========================================");
+        info!("");
         
         // 延时 5 秒
         Delay::delay(5000).unwrap();
@@ -221,14 +173,12 @@ fn monitor_task(_: usize) {
 /// 
 /// 简单的心跳指示，证明系统在运行
 fn heartbeat_task(_: usize) {
-    println("[Heartbeat] Task started (Idle Priority)");
+    info!("Heartbeat task started (Idle Priority)");
     let mut beat = 0u32;
     
     loop {
         beat = beat.wrapping_add(1);
-        print("[Heartbeat] ");
-        print_num(beat);
-        println("");
+        trace!("Heartbeat: {}", beat);
         
         // 延时 3 秒
         Delay::delay(3000).unwrap();
@@ -241,80 +191,197 @@ fn heartbeat_task(_: usize) {
 
 #[entry]
 fn main() -> ! {
-    // 打印欢迎信息
-    println("");
-    println("================================================");
-    println("       Neon-RTOS2 RISC-V QEMU Example");
-    println("================================================");
-    println("");
-    println("This example demonstrates:");
-    println("  - Kernel initialization");
-    println("  - Task creation with Builder pattern");
-    println("  - Task priorities");
-    println("  - Signal synchronization");
-    println("  - Task iterators");
-    println("  - Delay functionality");
-    println("");
+    // ========================================
+    // 1. 配置日志输出（必须最先执行！）
+    // ========================================
+    // 用户在这里指定日志输出方式
+    // 可以是 UART、RTT、或其他���定义实现
+    set_log_output(&UART_OUTPUT);
     
-    // 初始化内核
-    println("[Main] Initializing kernel...");
+    // 设置日志级别
+    set_log_level(LogLevel::Debug);
+    
+    // ========================================
+    // 2. 初始化内核
+    // ========================================
     kernel_init();
-    println("[Main] Kernel initialized successfully!");
-    println("");
+    
+    // 打印欢迎信息
+    info!("");
+    info!("================================================");
+    info!("       Neon-RTOS2 RISC-V QEMU Example");
+    info!("================================================");
+    info!("");
+    info!("This example demonstrates:");
+    info!("  - Kernel initialization");
+    info!("  - Task creation with Builder pattern");
+    info!("  - Task priorities");
+    info!("  - Signal synchronization");
+    info!("  - Task iterators");
+    info!("  - Delay functionality");
+    info!("  - Log system (info!, debug!, etc.)");
+    info!("");
+    
+    info!("Kernel initialized successfully!");
+    info!("");
     
     // 创建任务 - 使用 Builder 模式（推荐方式）
-    println("[Main] Creating tasks with Builder pattern...");
+    info!("Creating tasks with Builder pattern...");
     
     // 高优先级传感器任务
     Task::builder("sensor")
         .priority(Priority::High)
         .spawn(sensor_task)
         .expect("Failed to create sensor task");
-    println("[Main] Created: sensor (High Priority)");
+    info!("  Created: sensor (High Priority)");
     
     // 普通优先级处理器任务
     Task::builder("processor")
         .priority(Priority::Normal)
         .spawn(processor_task)
         .expect("Failed to create processor task");
-    println("[Main] Created: processor (Normal Priority)");
+    info!("  Created: processor (Normal Priority)");
     
     // 普通优先级日志任务
     Task::builder("logger")
         .priority(Priority::Normal)
         .spawn(logger_task)
         .expect("Failed to create logger task");
-    println("[Main] Created: logger (Normal Priority)");
+    info!("  Created: logger (Normal Priority)");
     
     // 低优先级监控任务
     Task::builder("monitor")
         .priority(Priority::Low)
         .spawn(monitor_task)
         .expect("Failed to create monitor task");
-    println("[Main] Created: monitor (Low Priority)");
+    info!("  Created: monitor (Low Priority)");
     
     // 空闲优先级心跳任务
     Task::builder("heartbeat")
         .priority(Priority::Idle)
         .spawn(heartbeat_task)
         .expect("Failed to create heartbeat task");
-    println("[Main] Created: heartbeat (Idle Priority)");
+    info!("  Created: heartbeat (Idle Priority)");
     
-    println("");
-    println("[Main] All tasks created successfully!");
-    println("[Main] Starting scheduler...");
-    println("");
-    println("================================================");
-    println("");
+    info!("");
+    info!("All tasks created successfully!");
+    info!("Starting scheduler...");
+    info!("");
+    info!("================================================");
+    info!("");
     
     // 启动调度器
     Scheduler::start();
     
     // 不应该到达这里
-    println("[Main] ERROR: Scheduler returned unexpectedly!");
+    error!("Scheduler returned unexpectedly!");
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
+}
+
+// ============================================================================
+// RISC-V 异常处理函数 (riscv-rt 0.12 需要)
+// ============================================================================
+
+/// 默认中断处理函数
+#[export_name = "DefaultHandler"]
+fn default_handler() {
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+/// 异常处理函数
+#[export_name = "ExceptionHandler"]
+fn exception_handler(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+/// 指令未对齐异常
+#[export_name = "InstructionMisaligned"]
+fn instruction_misaligned(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 指令访问错误
+#[export_name = "InstructionFault"]
+fn instruction_fault(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 非法指令
+#[export_name = "IllegalInstruction"]
+fn illegal_instruction(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 断点
+#[export_name = "Breakpoint"]
+fn breakpoint(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 加载未对齐
+#[export_name = "LoadMisaligned"]
+fn load_misaligned(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 加载访问错误
+#[export_name = "LoadFault"]
+fn load_fault(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 存储未对齐
+#[export_name = "StoreMisaligned"]
+fn store_misaligned(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 存储访问错误
+#[export_name = "StoreFault"]
+fn store_fault(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 用户态环境调用
+#[export_name = "UserEnvCall"]
+fn user_env_call(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 监管态环境调用
+#[export_name = "SupervisorEnvCall"]
+fn supervisor_env_call(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 机器态环境调用
+#[export_name = "MachineEnvCall"]
+fn machine_env_call(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 指令页错误
+#[export_name = "InstructionPageFault"]
+fn instruction_page_fault(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 加载页错误
+#[export_name = "LoadPageFault"]
+fn load_page_fault(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
+}
+
+/// 存储页错误
+#[export_name = "StorePageFault"]
+fn store_page_fault(_trap_frame: &riscv_rt::TrapFrame) -> ! {
+    loop { unsafe { core::arch::asm!("wfi") }; }
 }
 
 // ============================================================================
@@ -323,25 +390,20 @@ fn main() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println("");
-    println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    println("                   PANIC!");
-    println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    error!("");
+    error!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    error!("                   PANIC!");
+    error!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     
     if let Some(location) = info.location() {
-        print("Location: ");
-        println(location.file());
-        print("Line: ");
-        print_num(location.line());
-        println("");
+        error!("Location: {}:{}", location.file(), location.line());
     }
     
     if let Some(message) = info.message().as_str() {
-        print("Message: ");
-        println(message);
+        error!("Message: {}", message);
     }
     
-    println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    error!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     
     loop {
         unsafe { core::arch::asm!("wfi") };

@@ -1,5 +1,5 @@
 /* RISC-V QEMU virt machine memory layout */
-/* 兼容 riscv-rt 的链接脚本 */
+/* 兼容 riscv-rt 0.12 的链接脚本 */
 
 MEMORY
 {
@@ -27,3 +27,19 @@ PROVIDE(_stack_start = ORIGIN(RAM) + LENGTH(RAM));
 PROVIDE(_max_hart_id = 0);
 PROVIDE(_hart_stack_size = 16K);
 PROVIDE(_heap_size = 64K);
+
+/* riscv-rt 0.12 需要的符号 */
+PROVIDE(_mp_hook = default_mp_hook);
+PROVIDE(__pre_init = default_pre_init);
+PROVIDE(_setup_interrupts = default_setup_interrupts);
+PROVIDE(_start_trap = default_start_trap);
+
+/* 丢弃 .eh_frame 段，避免重定位问题 */
+SECTIONS
+{
+    /DISCARD/ :
+    {
+        *(.eh_frame)
+        *(.eh_frame_hdr)
+    }
+}

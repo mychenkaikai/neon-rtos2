@@ -1,6 +1,7 @@
 //! Cortex-M3 完整示例
 //!
 //! 展示 Neon-RTOS2 的主要功能：
+//! - **用户配置日志输出**（可选半主机或 UART）
 //! - Builder 模式创建任务
 //! - 任务优先级设置
 //! - 互斥锁（RAII 风格）
@@ -18,17 +19,17 @@
 //! # 运行方式
 //!
 //! ```bash
-//! # 使用 QEMU 运行
+//! # 使用 QEMU 运行（半主机模式）
 //! cargo run --release
 //!
-//! # 或者烧录到实际硬件
+//! # 或者烧录到实际硬件（建议使用 UART 模式）
 //! cargo flash --release --chip STM32F103C8
 //! ```
 
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
+
 use cortex_m::Peripherals;
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::entry;
@@ -36,7 +37,34 @@ use cortex_m_rt::entry;
 // 导入 RTOS prelude - 包含所有常用类型
 use neon_rtos2::prelude::*;
 use neon_rtos2::{debug, error, info, warn, trace, define_signal};
-use neon_rtos2::log::{LogLevel, set_log_level};
+
+// ============================================================================
+// 用户配置：日志输出方式
+// ============================================================================
+
+/// 日志输出配置
+/// 
+/// 根据你的使用场景选择合适的输出方式：
+/// 
+/// ## 选项 1: 半主机输出（调试用，需要连接调试器）
+/// ```rust
+/// static LOG_OUTPUT: SemihostOutput = SemihostOutput;
+/// ```
+/// 
+/// ## 选项 2: UART 输出（生产环境推荐）
+/// ```rust
+/// const UART_BASE: usize = 0x4001_3804; // STM32F1 USART1 DR 寄存器
+/// static LOG_OUTPUT: UartOutput<UART_BASE> = UartOutput::new();
+/// ```
+/// 
+/// ## 选项 3: 禁用日志输出
+/// ```rust
+/// static LOG_OUTPUT: NullOutput = NullOutput;
+/// ```
+
+// 当前使用半主机输出（适合 QEMU 调试）
+// 如果要烧录到实际硬件，请改用 UART 输出
+static LOG_OUTPUT: SemihostOutput = SemihostOutput;
 
 // ============================================================================
 // 系统配置
@@ -101,7 +129,7 @@ fn sensor_task(_: usize) {
         debug!("Sensor: new reading = {}", reading);
         
         // 发送数据就绪信号
-        SENSOR_DATA_READY.signal();
+        SENSOR_DATA_READY().send();
         
         // 采样间隔 500ms
         Delay::delay(500).unwrap();
@@ -119,7 +147,7 @@ fn processor_task(_: usize) {
     loop {
         // 等待传感器数据就绪
         debug!("Processor: waiting for sensor data...");
-        SENSOR_DATA_READY.wait();
+        SENSOR_DATA_READY().wait();
         
         // 读取并处理数据
         let value = unsafe { SENSOR_VALUE };
@@ -132,7 +160,7 @@ fn processor_task(_: usize) {
         info!("Processor: processed value {} -> {}", value, processed);
         
         // 通知处理完成
-        PROCESSING_DONE.signal();
+        PROCESSING_DONE().send();
     }
 }
 
@@ -147,7 +175,7 @@ fn logger_task(_: usize) {
     
     loop {
         // 等待处理完成
-        PROCESSING_DONE.wait();
+        PROCESSING_DONE().wait();
         
         log_count = log_count.wrapping_add(1);
         let count = unsafe { PROCESS_COUNT };
@@ -155,7 +183,7 @@ fn logger_task(_: usize) {
         info!("Logger: entry #{} - total processed: {}", log_count, count);
         
         // 发送日志同步信号（可用于其他任务）
-        LOG_SYNC.signal();
+        LOG_SYNC().send();
     }
 }
 
@@ -275,8 +303,8 @@ fn timer_demo_task(_: usize) {
     info!("Timer demo task started (Low Priority)");
     
     // 创建 3 秒定时器
-    let mut timer = Timer::new(3000);
-    timer.start();
+    let mut timer = Timer::new(3000).expect("Failed to create timer");
+    timer.start().unwrap();
     
     let mut timeout_count = 0u32;
     
@@ -286,7 +314,7 @@ fn timer_demo_task(_: usize) {
             info!("Timer demo: timeout #{} (3 seconds elapsed)", timeout_count);
             
             // 重启定时器
-            timer.start();
+            timer.start().unwrap();
         }
         
         // 检查间隔 100ms
@@ -318,12 +346,19 @@ fn heartbeat_task(_: usize) {
 #[entry]
 fn main() -> ! {
     // ========================================
-    // 1. 内核初始化
+    // 1. 配置日志输出（必须最先执行！）
     // ========================================
-    kernel_init();
+    // 用户在这里指定日志输出方式
+    // 可以是半主机、UART、或其他自定义实现
+    set_log_output(&LOG_OUTPUT);
     
     // 设置日志级别
     set_log_level(LogLevel::Debug);
+    
+    // ========================================
+    // 2. 内核初始化
+    // ========================================
+    kernel_init();
     
     info!("================================================");
     info!("    Neon-RTOS2 Cortex-M3 Complete Example");
@@ -424,26 +459,6 @@ fn main() -> ! {
     loop {}
 }
 
-// ============================================================================
-// Panic 处理
-// ============================================================================
-
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    error!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    error!("                   PANIC!");
-    error!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    
-    if let Some(location) = info.location() {
-        error!("Location: {}:{}", location.file(), location.line());
-    }
-    
-    if let Some(message) = info.message().as_str() {
-        error!("Message: {}", message);
-    }
-    
-    error!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    
-    loop {}
-}
+// 使用库提供的默认 panic handler
+// 如果需要自定义 panic 行为，可以删除此行并自己实现 #[panic_handler]
+neon_rtos2::default_panic_handler!();

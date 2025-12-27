@@ -11,6 +11,11 @@ cortex-m = "0.7.7"
 cortex-m-rt = "0.7.3"
 alloc-cortex-m = "0.4.4"
 
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
 
 [[bin]]
 name = "mutex_test"

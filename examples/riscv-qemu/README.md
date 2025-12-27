@@ -8,8 +8,9 @@
 - ✅ Builder 模式创建任务 (`Task::builder()`)
 - ✅ 任务优先级设置 (`Priority::High/Normal/Low/Idle`)
 - ✅ 信号量同步 (`define_signal!`, `signal()`, `wait()`)
-- ✅ 任务迭代器 (`Task::iter()`, `Task::ready_tasks()`)
+- ✅ 任务迭代��� (`Task::iter()`, `Task::ready_tasks()`)
 - ✅ 延时功能 (`Delay::delay()`)
+- ✅ **日志系统** (`info!`, `debug!`, `error!`, `warn!`, `trace!`)
 
 ## 环境要求
 
@@ -58,41 +59,43 @@ cargo run --release
 ## 预期输出
 
 ```
-================================================
-       Neon-RTOS2 RISC-V QEMU Example
-================================================
-
-This example demonstrates:
-  - Kernel initialization
-  - Task creation with Builder pattern
-  - Task priorities
-  - Signal synchronization
-  - Task iterators
-  - Delay functionality
-
-[Main] Initializing kernel...
-[Main] Kernel initialized successfully!
-
-[Main] Creating tasks with Builder pattern...
-[Main] Created: sensor (High Priority)
-[Main] Created: processor (Normal Priority)
-[Main] Created: logger (Normal Priority)
-[Main] Created: monitor (Low Priority)
-[Main] Created: heartbeat (Idle Priority)
-
-[Main] All tasks created successfully!
-[Main] Starting scheduler...
-================================================
-
-[Sensor] Task started (High Priority)
-[Processor] Task started (Normal Priority)
-[Logger] Task started (Normal Priority)
-[Monitor] Task started (Low Priority)
-[Heartbeat] Task started (Idle Priority)
-
-[Sensor] Reading #1 - sending DATA_READY signal
-[Processor] Waiting for data... Got it! Processed count: 1
-[Logger] Log entry #1 - Data processing completed
+[INFO] 
+[INFO] ================================================
+[INFO]        Neon-RTOS2 RISC-V QEMU Example
+[INFO] ================================================
+[INFO] 
+[INFO] This example demonstrates:
+[INFO]   - Kernel initialization
+[INFO]   - Task creation with Builder pattern
+[INFO]   - Task priorities
+[INFO]   - Signal synchronization
+[INFO]   - Task iterators
+[INFO]   - Delay functionality
+[INFO]   - Log system (info!, debug!, etc.)
+[INFO] 
+[INFO] Kernel initialized successfully!
+[INFO] 
+[INFO] Creating tasks with Builder pattern...
+[INFO]   Created: sensor (High Priority)
+[INFO]   Created: processor (Normal Priority)
+[INFO]   Created: logger (Normal Priority)
+[INFO]   Created: monitor (Low Priority)
+[INFO]   Created: heartbeat (Idle Priority)
+[INFO] 
+[INFO] All tasks created successfully!
+[INFO] Starting scheduler...
+[INFO] 
+[INFO] ================================================
+[INFO] 
+[INFO] Sensor task started (High Priority)
+[INFO] Processor task started (Normal Priority)
+[INFO] Logger task started (Normal Priority)
+[INFO] Monitor task started (Low Priority)
+[INFO] Heartbeat task started (Idle Priority)
+[DEBUG] Sensor: Reading #1 - sending DATA_READY signal
+[DEBUG] Processor: Waiting for data...
+[INFO] Processor: Got data! Processed count: 1
+[INFO] Logger: Log entry #1 - Data processing completed
 ...
 ```
 
