@@ -87,7 +87,10 @@ impl Mutex {
     /// - `MutexGuard` - 锁守卫，离开作用域自动释放
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,no_run
+    /// use neon_rtos2::sync::mutex::Mutex;
+    ///
+    /// let mutex = Mutex::new().unwrap();
     /// {
     ///     let _guard = mutex.lock_guard();
     ///     // 临界区代码
@@ -109,7 +112,10 @@ impl Mutex {
     /// - `R`: 闭包的返回值
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,no_run
+    /// use neon_rtos2::sync::mutex::Mutex;
+    ///
+    /// let mutex = Mutex::new().unwrap();
     /// let result = mutex.with_lock(|| {
     ///     // 临界区代码
     ///     42

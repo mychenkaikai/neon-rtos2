@@ -236,6 +236,8 @@ impl Task {
     ///
     /// # 示例
     /// ```rust
+    /// use neon_rtos2::kernel::task::{Task, TaskState};
+    ///
     /// // 统计就绪任务数量
     /// let ready_count = Task::iter()
     ///     .filter(|t| t.get_state() == TaskState::Ready)
@@ -266,9 +268,11 @@ impl Task {
     ///
     /// # 示例
     /// ```rust
+    /// use neon_rtos2::kernel::task::{Task, Priority};
+    ///
     /// let task = Task::builder("my_task")
     ///     .priority(Priority::High)
-    ///     .spawn(|| { /* ... */ })?;
+    ///     .spawn(|_| { /* ... */ });
     /// ```
     pub fn builder(name: &'static str) -> TaskBuilder {
         TaskBuilder::new(name)

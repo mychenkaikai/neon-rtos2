@@ -11,24 +11,27 @@
 //!
 //! ## 使用示例
 //!
-//! ```rust,ignore
-//! use neon_rtos2::runtime::channel;
+//! ```rust,no_run
+//! use neon_rtos2::runtime::channel::channel;
 //!
-//! let (tx, rx) = channel::<u32>(16);
+//! async fn example() {
+//!     let (tx, rx) = channel::<u32>(16);
 //!
-//! // 生产者
-//! executor.spawn(async move {
-//!     for i in 0..10 {
-//!         tx.send(i).await.unwrap();
-//!     }
-//! });
+//!     // 生产者
+//!     let tx1 = tx.clone();
+//!     let producer = async move {
+//!         for i in 0..10 {
+//!             tx1.send(i).await.unwrap();
+//!         }
+//!     };
 //!
-//! // 消费者
-//! executor.spawn(async move {
-//!     while let Some(value) = rx.recv().await {
-//!         println!("Received: {}", value);
-//!     }
-//! });
+//!     // 消费者
+//!     let consumer = async move {
+//!         while let Some(value) = rx.recv().await {
+//!             // println!("Received: {}", value);
+//!         }
+//!     };
+//! }
 //! ```
 
 use core::future::Future;
@@ -346,23 +349,31 @@ impl<'a, T> Future for RecvFuture<'a, T> {
 /// - `(Sender<T>, Receiver<T>)`: 发送端和接收端
 ///
 /// # 示例
+/// ```rust,no_run
+/// use neon_rtos2::runtime::channel::channel;
 ///
-/// ```rust,ignore
-/// let (tx, rx) = channel::<u32>(16);
+/// async fn example() {
+///     let (tx, rx) = channel::<u32>(16);
 ///
-/// // 生产者
-/// executor.spawn(async move {
-///     for i in 0..10 {
-///         tx.send(i).await.unwrap();
-///     }
-/// });
+///     // 生产者
+///     let tx1 = tx.clone();
+///     let producer = async move {
+///         for i in 0..10 {
+///             tx1.send(i).await.unwrap();
+///         }
+///     };
 ///
-/// // 消费者
-/// executor.spawn(async move {
-///     while let Some(value) = rx.recv().await {
-///         println!("Received: {}", value);
-///     }
-/// });
+///     // 消费者
+///     let consumer = async move {
+///         while let Some(value) = rx.recv().await {
+///             // println!("Received: {}", value);
+///         }
+///     };
+///     
+///     // 注意：实际使用中通常会将 producer 和 consumer spawn 到执行器中
+///     // executor.spawn(producer);
+///     // executor.spawn(consumer);
+/// }
 /// ```
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Mutex::new(ChannelInner::new(capacity)));

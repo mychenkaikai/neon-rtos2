@@ -11,8 +11,10 @@ use super::Mutex;
 ///
 /// # 示例
 ///
-/// ```rust
-/// let mutex = Mutex::new()?;
+/// ```rust,no_run
+/// use neon_rtos2::sync::mutex::Mutex;
+///
+/// let mutex = Mutex::new().unwrap();
 /// {
 ///     let _guard = mutex.lock_guard();
 ///     // 临界区代码

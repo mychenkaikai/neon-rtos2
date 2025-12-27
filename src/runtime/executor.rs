@@ -78,10 +78,15 @@ impl Executor {
     ///
     /// # 示例
     ///
-    /// ```rust,ignore
-    /// let task_id = executor.spawn(async {
-    ///     // 异步逻辑
-    /// });
+    /// ```rust,no_run
+    /// use neon_rtos2::runtime::Executor;
+    ///
+    /// fn main() {
+    ///     let mut executor = Executor::new();
+    ///     let task_id = executor.spawn(async {
+    ///         // 异步逻辑
+    ///     });
+    /// }
     /// ```
     pub fn spawn<F>(&mut self, future: F) -> usize
     where

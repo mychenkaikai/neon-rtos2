@@ -13,25 +13,29 @@
 //!
 //! ### 基本用法
 //!
-//! ```rust,ignore
-//! use neon_rtos2::runtime::{Executor, spawn, channel};
+//! ```rust,no_run
+//! use neon_rtos2::runtime::{Executor, channel::channel};
 //!
-//! // 创建执行器
-//! let mut executor = Executor::new();
+//! fn main() {
+//!     // 创建执行器
+//!     let mut executor = Executor::new();
 //!
-//! // 创建通道
-//! let (tx, rx) = channel::<u32>(16);
+//!     // 创建通道
+//!     let (tx, rx) = channel::<u32>(16);
 //!
-//! // 添加异步任务
-//! executor.spawn(async {
-//!     loop {
-//!         signal.wait().await;
-//!         // 处理信号
-//!     }
-//! });
+//!     // 添加异步任务
+//!     executor.spawn(async move {
+//!         loop {
+//!             // 模拟等待信号
+//!             // signal.wait().await;
+//!             // 处理信号
+//!             break; // 避免无限循环导致测试卡死
+//!         }
+//!     });
 //!
-//! // 运行执行器
-//! executor.run();
+//!     // 运行执行器
+//!     executor.run();
+//! }
 //! ```
 //!
 //! ### 使用 Select

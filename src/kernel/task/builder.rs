@@ -14,11 +14,13 @@ use crate::error::Result;
 /// # 示例
 ///
 /// ```rust
+/// use neon_rtos2::kernel::task::{Task, Priority};
+///
 /// // 使用默认配置
 /// let task = Task::builder("simple_task")
 ///     .spawn(|_| {
 ///         // 任务逻辑
-///     })?;
+///     });
 ///
 /// // 自定义配置
 /// let task = Task::builder("custom_task")
@@ -26,7 +28,7 @@ use crate::error::Result;
 ///     .stack_size(8192)
 ///     .spawn(|_| {
 ///         // 任务逻辑
-///     })?;
+///     });
 /// ```
 pub struct TaskBuilder {
     name: &'static str,
@@ -63,10 +65,12 @@ impl TaskBuilder {
     ///
     /// # 示例
     /// ```rust
+    /// use neon_rtos2::kernel::task::{Task, Priority};
+    ///
     /// Task::builder("high_priority_task")
     ///     .priority(Priority::High)
-    ///     .spawn(|_| {})?;
-    /// ```
+    ///     .spawn(|_| {});
+    /// ``````
     pub fn priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
         self
@@ -82,9 +86,11 @@ impl TaskBuilder {
     ///
     /// # 示例
     /// ```rust
+    /// use neon_rtos2::kernel::task::Task;
+    ///
     /// Task::builder("large_stack_task")
     ///     .stack_size(8192)
-    ///     .spawn(|_| {})?;
+    ///     .spawn(|_| {});
     /// ```
     pub fn stack_size(mut self, size: usize) -> Self {
         // 确保 8 字节对齐
@@ -118,13 +124,15 @@ impl TaskBuilder {
     ///
     /// # 示例
     /// ```rust
+    /// use neon_rtos2::kernel::task::{Task, Priority};
+    ///
     /// let task = Task::builder("my_task")
     ///     .priority(Priority::High)
     ///     .spawn(|task_id| {
     ///         loop {
     ///             // 任务逻辑
     ///         }
-    ///     })?;
+    ///     });
     /// ```
     pub fn spawn<F>(self, func: F) -> Result<Task>
     where

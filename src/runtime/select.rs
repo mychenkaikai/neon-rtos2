@@ -11,19 +11,22 @@
 //!
 //! ## 使用示例
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use neon_rtos2::select;
+//! use core::time::Duration;
+//!
+//! // 模拟异步接收
+//! async fn recv() -> i32 { 42 }
+//! // 模拟异步睡眠
+//! async fn sleep(_dur: Duration) {}
 //!
 //! async fn example() {
 //!     select! {
-//!         data = sensor_rx.recv() => {
-//!             println!("Received sensor data: {:?}", data);
+//!         data = recv() => {
+//!             // println!("Received data: {:?}", data);
 //!         }
-//!         cmd = command_rx.recv() => {
-//!             println!("Received command: {:?}", cmd);
-//!         }
-//!         _ = timer.sleep(Duration::from_secs(1)) => {
-//!             println!("Timeout!");
+//!         _ = sleep(Duration::from_secs(1)) => {
+//!             // println!("Timeout!");
 //!         }
 //!     }
 //! }
@@ -239,13 +242,15 @@ where
 ///
 /// # 示例
 ///
-/// ```rust,ignore
-/// use neon_rtos2::runtime::select2;
+/// ```rust,no_run
+/// use neon_rtos2::runtime::select::{select2, Either};
 ///
 /// async fn example() {
+///     let future_a = async { 1 };
+///     let future_b = async { 2 };
 ///     match select2(future_a, future_b).await {
-///         Either::First(a) => println!("A completed: {:?}", a),
-///         Either::Second(b) => println!("B completed: {:?}", b),
+///         Either::First(a) => {}, // println!("A completed: {:?}", a),
+///         Either::Second(b) => {}, // println!("B completed: {:?}", b),
 ///     }
 /// }
 /// ```
@@ -282,6 +287,43 @@ where
 // Select 宏
 // ============================================================================
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __select_future {
+    // 递归终止条件：最后一个 Future
+    ($pat:pat = $fut:expr => $expr:expr $(,)?) => {
+        $fut
+    };
+    // 递归步骤：构建 Select2 链
+    ($pat:pat = $fut:expr => $expr:expr, $($rest:tt)+) => {
+        $crate::runtime::select::select2($fut, $crate::__select_future!($($rest)+))
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __select_match {
+    // 递归终止条件：处理最后一个结果
+    ($val:ident, $pat:pat = $fut:expr => $expr:expr $(,)?) => {
+        {
+            let $pat = $val;
+            $expr
+        }
+    };
+    // 递归步骤：解构 Either
+    ($val:ident, $pat:pat = $fut:expr => $expr:expr, $($rest:tt)+) => {
+        {
+            use $crate::runtime::select::Either;
+            match $val {
+                Either::First($pat) => $expr,
+                Either::Second(next_val) => {
+                    $crate::__select_match!(next_val, $($rest)+)
+                }
+            }
+        }
+    };
+}
+
 /// 同时等待多个异步操作，返回第一个完成的结果
 ///
 /// # 语法
@@ -298,35 +340,42 @@ where
 ///
 /// ## 基本用法
 ///
-/// ```rust,ignore
-/// select! {
-///     msg = rx.recv() => {
-///         println!("Received: {:?}", msg);
-///     }
-///     _ = timer.sleep(Duration::from_secs(1)) => {
-///         println!("Timeout!");
+/// ```rust,no_run
+/// use neon_rtos2::select;
+/// use core::time::Duration;
+///
+/// async fn recv() -> i32 { 42 }
+/// async fn sleep(_: Duration) {}
+///
+/// async fn example() {
+///     select! {
+///         msg = recv() => {
+///             // println!("Received: {:?}", msg);
+///         }
+///         _ = sleep(Duration::from_secs(1)) => {
+///             // println!("Timeout!");
+///         }
 ///     }
 /// }
 /// ```
 ///
 /// ## 带返回值
 ///
-/// ```rust,ignore
-/// let result = select! {
-///     data = sensor.read() => ProcessResult::Sensor(data),
-///     cmd = command.recv() => ProcessResult::Command(cmd),
-/// };
-/// ```
+/// ```rust,no_run
+/// use neon_rtos2::select;
 ///
-/// ## 使用 default 分支
+/// struct Data(i32);
+/// struct Cmd(i32);
+/// enum ProcessResult { Sensor(Data), Command(Cmd) }
 ///
-/// ```rust,ignore
-/// select! {
-///     msg = rx.recv() => handle_message(msg),
-///     default => {
-///         // 没有 Future 就绪时执行
-///         do_other_work();
-///     }
+/// async fn read_sensor() -> Data { Data(1) }
+/// async fn recv_cmd() -> Cmd { Cmd(2) }
+///
+/// async fn example() {
+///     let result = select! {
+///         data = read_sensor() => ProcessResult::Sensor(data),
+///         cmd = recv_cmd() => ProcessResult::Command(cmd),
+///     };
 /// }
 /// ```
 ///
@@ -337,49 +386,29 @@ where
 /// - 分支按顺序检查，如果多个同时就绪，返回第一个
 #[macro_export]
 macro_rules! select {
-    // 两个分支
-    (
-        $pat1:pat = $fut1:expr => $expr1:expr,
-        $pat2:pat = $fut2:expr => $expr2:expr $(,)?
-    ) => {{
+    // 必须至少有两个分支 (单个分支直接 await 即可，但为了完整性也可以支持)
+    // 这里我们支持 1+ 个分支
+    
+    // 单个分支的情况
+    ($pat:pat = $fut:expr => $expr:expr $(,)?) => {
+        {
+            let $pat = $fut.await;
+            $expr
+        }
+    };
+
+    // 多个分支的情况
+    ($($args:tt)+) => {{
         use $crate::runtime::select::{select2, Either};
         
-        match select2($fut1, $fut2).await {
-            Either::First($pat1) => $expr1,
-            Either::Second($pat2) => $expr2,
-        }
-    }};
-
-    // 三个分支
-    (
-        $pat1:pat = $fut1:expr => $expr1:expr,
-        $pat2:pat = $fut2:expr => $expr2:expr,
-        $pat3:pat = $fut3:expr => $expr3:expr $(,)?
-    ) => {{
-        use $crate::runtime::select::{select3, Either3};
+        // 1. 构建 Future 链
+        let future_chain = $crate::__select_future!($($args)+);
         
-        match select3($fut1, $fut2, $fut3).await {
-            Either3::First($pat1) => $expr1,
-            Either3::Second($pat2) => $expr2,
-            Either3::Third($pat3) => $expr3,
-        }
-    }};
-
-    // 四个分支
-    (
-        $pat1:pat = $fut1:expr => $expr1:expr,
-        $pat2:pat = $fut2:expr => $expr2:expr,
-        $pat3:pat = $fut3:expr => $expr3:expr,
-        $pat4:pat = $fut4:expr => $expr4:expr $(,)?
-    ) => {{
-        use $crate::runtime::select::{select4, Either4};
+        // 2. 等待结果并匹配
+        let result = future_chain.await;
         
-        match select4($fut1, $fut2, $fut3, $fut4).await {
-            Either4::First($pat1) => $expr1,
-            Either4::Second($pat2) => $expr2,
-            Either4::Third($pat3) => $expr3,
-            Either4::Fourth($pat4) => $expr4,
-        }
+        // 3. 递归匹配结果
+        $crate::__select_match!(result, $($args)+)
     }};
 }
 
@@ -394,29 +423,25 @@ macro_rules! select {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
-/// // 高优先级消息总是优先处理
-/// select_biased! {
-///     msg = high_priority_rx.recv() => handle_high_priority(msg),
-///     msg = low_priority_rx.recv() => handle_low_priority(msg),
+/// ```rust,no_run
+/// use neon_rtos2::select_biased;
+///
+/// async fn recv_high() -> i32 { 1 }
+/// async fn recv_low() -> i32 { 2 }
+///
+/// async fn example() {
+///     // 高优先级消息总是优先处理
+///     select_biased! {
+///         msg = Box::pin(recv_high()) => {}, // handle_high_priority(msg),
+///         msg = Box::pin(recv_low()) => {},  // handle_low_priority(msg),
+///     }
 /// }
 /// ```
 #[macro_export]
 macro_rules! select_biased {
     // 与 select! 相同的实现，因为我们的实现本身就是有序的
-    (
-        $pat1:pat = $fut1:expr => $expr1:expr,
-        $pat2:pat = $fut2:expr => $expr2:expr $(,)?
-    ) => {{
-        $crate::select!($pat1 = $fut1 => $expr1, $pat2 = $fut2 => $expr2)
-    }};
-
-    (
-        $pat1:pat = $fut1:expr => $expr1:expr,
-        $pat2:pat = $fut2:expr => $expr2:expr,
-        $pat3:pat = $fut3:expr => $expr3:expr $(,)?
-    ) => {{
-        $crate::select!($pat1 = $fut1 => $expr1, $pat2 = $fut2 => $expr2, $pat3 = $fut3 => $expr3)
+    ($($args:tt)+) => {{
+        $crate::select!($($args)+)
     }};
 }
 
@@ -451,8 +476,15 @@ impl<F: Future + Unpin, const N: usize> Future for Race<F, N> {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
-/// let result = race2(fetch_from_server_a(), fetch_from_server_b()).await;
+/// ```rust,no_run
+/// use neon_rtos2::runtime::select::race2;
+///
+/// async fn fetch_a() -> i32 { 1 }
+/// async fn fetch_b() -> i32 { 2 }
+///
+/// async fn example() {
+///     let result = race2(fetch_a(), fetch_b()).await;
+/// }
 /// ```
 pub fn race2<F: Future + Unpin>(a: F, b: F) -> Race<F, 2> {
     Race {
@@ -704,6 +736,61 @@ mod tests {
         match Pin::new(&mut select).poll(&mut cx) {
             Poll::Pending => {} // 预期结果
             Poll::Ready(_) => panic!("Expected Pending when all futures are pending"),
+        }
+    }
+
+    /// 测试 select! 宏支持 5 个分支
+    #[test]
+    fn test_select_macro_5_branches() {
+        use core::pin::Pin;
+        
+        let f1 = Pending;
+        let f2 = Pending;
+        let f3 = Pending;
+        let f4 = Pending;
+        let f5 = Ready::new(5);
+        
+        let fut = async {
+            crate::select! {
+                _ = f1 => 0,
+                _ = f2 => 0,
+                _ = f3 => 0,
+                _ = f4 => 0,
+                v5 = f5 => v5,
+            }
+        };
+        
+        // 手动构建 Pin
+        // 注意：在 no_std 测试中，我们使用 Box::pin
+        let mut boxed = Box::pin(fut);
+        let mut cx = create_test_context();
+        
+        match boxed.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => assert_eq!(val, 5),
+            Poll::Pending => panic!("Should be ready"),
+        }
+    }
+
+    /// 测试 select! 宏支持 3 个分支 (验证兼容性)
+    #[test]
+    fn test_select_macro_3_branches() {
+        let f1 = Pending;
+        let f2 = Ready::new(2);
+        let f3 = Pending;
+        
+        let mut fut = Box::pin(async {
+            crate::select! {
+                _ = f1 => 0,
+                v2 = f2 => v2,
+                _ = f3 => 0,
+            }
+        });
+        
+        let mut cx = create_test_context();
+        
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => assert_eq!(val, 2),
+            Poll::Pending => panic!("Should be ready"),
         }
     }
 
