@@ -167,6 +167,22 @@ pub use crate::log::set_log_level;
 /// 获取日志级别
 pub use crate::log::get_log_level;
 
+/// 设置日志输出
+pub use crate::log::set_log_output;
+
+/// 日志输出 trait
+pub use crate::log::LogOutput;
+
+/// UART 输出实现
+pub use crate::log::UartOutput;
+
+/// 空输出实现
+pub use crate::log::NullOutput;
+
+/// 半主机输出实现（仅 Cortex-M3）
+#[cfg(feature = "cortex_m3")]
+pub use crate::log::SemihostOutput;
+
 // ============================================================================
 // 工具函数
 // ============================================================================

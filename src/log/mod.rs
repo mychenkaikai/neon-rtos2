@@ -1,9 +1,69 @@
-//! 日志模块，支持在不同环境下的日志打印
-//! - QEMU环境：使用cortex-m-semihosting的hprintln
-//! - 真实设备：使用串口打印
-//! - 测试环境：使用标准库的println
+//! 日志模块 - 可配置的日志输出系统
+//!
+//! ## 设计理念
+//!
+//! 日志输出方式由**用户配置**，而非库硬编码。这样：
+//! - 换芯片不需要修改库代码
+//! - 用户可以选择 UART、半主机、RTT 等任意输出方式
+//! - 用户控制硬件地址等配置
+//!
+//! ## 使用方法
+//!
+//! ### 1. 实现 LogOutput trait
+//!
+//! ```rust,ignore
+//! use neon_rtos2::log::{LogOutput, set_log_output};
+//!
+//! // 定义你的 UART 输出
+//! struct MyUart;
+//!
+//! impl LogOutput for MyUart {
+//!     fn write_str(&self, s: &str) {
+//!         const UART_BASE: usize = 0x4000_0000; // 你的 UART 地址
+//!         for byte in s.bytes() {
+//!             unsafe { core::ptr::write_volatile(UART_BASE as *mut u8, byte); }
+//!         }
+//!     }
+//! }
+//!
+//! // 在 main 开始时注册
+//! fn main() {
+//!     set_log_output(&MyUart);
+//!     // ...
+//! }
+//! ```
+//!
+//! ### 2. 使用预定义的输出实现
+//!
+//! ```rust,ignore
+//! use neon_rtos2::log::{set_log_output, UartOutput, SemihostOutput};
+//!
+//! // 使用 UART 输出（指定地址）
+//! static UART: UartOutput<0x1000_0000> = UartOutput::new();
+//! set_log_output(&UART);
+//!
+//! // 或使用半主机输出（仅调试用）
+//! static SEMIHOST: SemihostOutput = SemihostOutput;
+//! set_log_output(&SEMIHOST);
+//! ```
+//!
+//! ### 3. 使用日志宏
+//!
+//! ```rust,ignore
+//! use neon_rtos2::{info, debug, error, warn, trace};
+//! use neon_rtos2::log::{set_log_level, LogLevel};
+//!
+//! set_log_level(LogLevel::Debug);
+//!
+//! info!("Hello, RTOS!");
+//! debug!("Debug value: {}", 42);
+//! ```
 
 use core::fmt::{self, Write};
+
+// ============================================================================
+// 日志级别
+// ============================================================================
 
 /// 日志级别
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,31 +96,180 @@ pub fn get_log_level() -> LogLevel {
     unsafe { GLOBAL_LOG_LEVEL }
 }
 
-/// 日志记录器特征
-pub trait Logger {
-    /// 写入字符串到日志
-    fn write_str(&self, s: &str) -> fmt::Result;
+// ============================================================================
+// LogOutput Trait - 用户实现此 trait 来定义日志输出方式
+// ============================================================================
+
+/// 日志输出 trait
+/// 
+/// 用户需要实现此 trait 来定义日志的输出方式。
+/// 
+/// # 示例
+/// 
+/// ```rust,ignore
+/// struct MyUart;
+/// 
+/// impl LogOutput for MyUart {
+///     fn write_str(&self, s: &str) {
+///         // 写入到你的 UART
+///         for byte in s.bytes() {
+///             unsafe { 
+///                 core::ptr::write_volatile(0x4000_0000 as *mut u8, byte); 
+///             }
+///         }
+///     }
+/// }
+/// ```
+pub trait LogOutput: Sync {
+    /// 写入字符串到输出设备
+    fn write_str(&self, s: &str);
     
-    /// 刷新日志
-    fn flush(&self) -> fmt::Result;
+    /// 刷新输出（可选实现）
+    fn flush(&self) {}
 }
 
-/// QEMU环境下打印日志
-#[cfg(all(feature = "cortex_m3", not(test)))]
+// ============================================================================
+// 全局日志输出注册
+// ============================================================================
+
+/// 空输出实现（默认）
+struct NullOutputInner;
+
+impl LogOutput for NullOutputInner {
+    #[inline(always)]
+    fn write_str(&self, _s: &str) {
+        // 什么都不做
+    }
+}
+
+/// 默认的空输出
+static NULL_OUTPUT: NullOutputInner = NullOutputInner;
+
+/// 全局日志输出器
+static mut GLOBAL_LOG_OUTPUT: &dyn LogOutput = &NULL_OUTPUT;
+
+/// 设置全局日志输出
+/// 
+/// **必须在使用任何日志宏之前调用此函数！**
+/// 
+/// # 参数
+/// 
+/// - `output`: 实现了 `LogOutput` trait 的静态引用
+/// 
+/// # 示例
+/// 
+/// ```rust,ignore
+/// static MY_UART: MyUart = MyUart;
+/// set_log_output(&MY_UART);
+/// ```
+/// 
+/// # 安全性
+/// 
+/// 此函数应该在单线程环境下调用（通常在 main 函数开始时）。
+pub fn set_log_output(output: &'static dyn LogOutput) {
+    unsafe {
+        GLOBAL_LOG_OUTPUT = output;
+    }
+}
+
+/// 获取当前日志输出器
+#[inline(always)]
+fn get_log_output() -> &'static dyn LogOutput {
+    unsafe { GLOBAL_LOG_OUTPUT }
+}
+
+// ============================================================================
+// 预定义的日志输出实现
+// ============================================================================
+
+/// 空输出 - 丢弃所有日志
+/// 
+/// 用于禁用日志输出或作为占位符。
+pub struct NullOutput;
+
+impl LogOutput for NullOutput {
+    #[inline(always)]
+    fn write_str(&self, _s: &str) {}
+}
+
+/// UART 输出 - 通过内存映射 UART 输出日志
+/// 
+/// 使用 const generic 指定 UART 基地址，零运行时开销。
+/// 
+/// # 类型参数
+/// 
+/// - `BASE_ADDR`: UART 数据寄存器的内存地址
+/// 
+/// # 示例
+/// 
+/// ```rust,ignore
+/// // QEMU RISC-V virt 平台
+/// static UART: UartOutput<0x1000_0000> = UartOutput::new();
+/// 
+/// // STM32 USART1
+/// static UART: UartOutput<0x4001_1004> = UartOutput::new();
+/// 
+/// set_log_output(&UART);
+/// ```
+pub struct UartOutput<const BASE_ADDR: usize>;
+
+impl<const BASE_ADDR: usize> UartOutput<BASE_ADDR> {
+    /// 创建新的 UART 输出实例
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl<const BASE_ADDR: usize> LogOutput for UartOutput<BASE_ADDR> {
+    #[inline(always)]
+    fn write_str(&self, s: &str) {
+        for byte in s.bytes() {
+            unsafe {
+                core::ptr::write_volatile(BASE_ADDR as *mut u8, byte);
+            }
+        }
+    }
+}
+
+/// 半主机输出 - 通过调试器输出日志（仅用于调试）
+/// 
+/// **注意**: 半主机输出需要连接调试器，生产环境不应使用！
+/// 
+/// # 示例
+/// 
+/// ```rust,ignore
+/// #[cfg(feature = "cortex_m3")]
+/// {
+///     static SEMIHOST: SemihostOutput = SemihostOutput;
+///     set_log_output(&SEMIHOST);
+/// }
+/// ```
+#[cfg(feature = "cortex_m3")]
+pub struct SemihostOutput;
+
+#[cfg(feature = "cortex_m3")]
+impl LogOutput for SemihostOutput {
+    fn write_str(&self, s: &str) {
+        cortex_m_semihosting::hprint!("{}", s);
+    }
+}
+
+// ============================================================================
+// 内部日志写入函数
+// ============================================================================
+
+/// 写入日志字符串
 #[inline(always)]
 pub fn log_write(s: &str) -> fmt::Result {
-    cortex_m_semihosting::hprint!("{}", s);
+    get_log_output().write_str(s);
     Ok(())
 }
 
-/// 测试环境下打印日志（包括单元测试和集成测试）
-#[cfg(any(test, not(feature = "cortex_m3")))]
+/// 测试环境下的日志写入（覆盖上面的实现）
+#[cfg(test)]
 #[inline(always)]
-pub fn log_write(_s: &str) -> fmt::Result {
-    // 在非嵌入式环境下，日志输出为空操作
-    // 如果需要输出，可以使用 println! 但需要 std
-    #[cfg(test)]
-    print!("{}", _s);
+pub fn log_write_test(s: &str) -> fmt::Result {
+    print!("{}", s);
     Ok(())
 }
 

@@ -75,10 +75,8 @@ pub(crate) fn init_idle_task() {
     let task = Task::new("idle", idle_task).unwrap();
 }
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+// 注意：panic_handler 已移至用户代码或使用 default_panic_handler! 宏
+// 这样用户可以自定义 panic 行为
 use critical_section::RawRestoreState;
 struct CriticalSection;
 critical_section::set_impl!(CriticalSection);

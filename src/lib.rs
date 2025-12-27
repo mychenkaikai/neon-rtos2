@@ -155,3 +155,69 @@ pub mod drivers;
 
 /// 宏辅助工具
 pub use paste;
+
+// ============================================================================
+// Panic Handler 宏
+// ============================================================================
+
+/// 默认的 panic handler 实现（Cortex-M3）
+/// 
+/// 在用户代码中调用此宏来使用库提供的默认 panic 处理。
+/// 
+/// # 示例
+/// 
+/// ```rust,ignore
+/// // 在 main.rs 中
+/// neon_rtos2::default_panic_handler!();
+/// ```
+/// 
+/// # 自定义 panic handler
+/// 
+/// 如果你需要自定义 panic 行为（如输出到 UART、保存崩溃日志等），
+/// 可以不使用此宏，而是自己实现 `#[panic_handler]`：
+/// 
+/// ```rust,ignore
+/// #[panic_handler]
+/// fn panic(info: &core::panic::PanicInfo) -> ! {
+///     // 你的自定义逻辑
+///     error!("PANIC: {:?}", info);
+///     loop {}
+/// }
+/// ```
+#[macro_export]
+#[cfg(feature = "cortex_m3")]
+macro_rules! default_panic_handler {
+    () => {
+        #[panic_handler]
+        fn panic(_info: &core::panic::PanicInfo) -> ! {
+            loop {}
+        }
+    };
+}
+
+/// 默认的 panic handler 实现（RISC-V）
+#[macro_export]
+#[cfg(feature = "riscv")]
+macro_rules! default_panic_handler {
+    () => {
+        #[panic_handler]
+        fn panic(info: &core::panic::PanicInfo) -> ! {
+            $crate::error!("PANIC!");
+            if let Some(location) = info.location() {
+                $crate::error!("Location: {}:{}", location.file(), location.line());
+            }
+            loop {
+                unsafe { core::arch::asm!("wfi") };
+            }
+        }
+    };
+}
+
+/// 默认的 panic handler 实现（测试/其他平台）
+#[macro_export]
+#[cfg(all(not(feature = "cortex_m3"), not(feature = "riscv")))]
+macro_rules! default_panic_handler {
+    () => {
+        // 测试环境下不需要 panic_handler
+    };
+}

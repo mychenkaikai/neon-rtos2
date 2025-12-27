@@ -379,13 +379,13 @@ pub fn systick_handler(ticks: u32) {
 
 // 上下文切换的汇编代码在 asm/context.s 中实现
 
-/// 保存当前上下文并切换到新任务
-///
-/// # Safety
-///
-/// 此函数直接操作栈指针，必须在正确的上下文中调用
+// 保存当前上下文并切换到新任务
+//
+// # Safety
+//
+// 此函数直接操作栈指针，必须在正确的上下文中调用
 #[cfg(target_arch = "riscv32")]
-extern "C" {
+unsafe extern "C" {
     pub fn context_switch(current_sp: *mut usize, next_sp: usize);
 }
 
@@ -464,6 +464,27 @@ mod tests {
         
         // 检查对齐
         assert_eq!(aligned & 0x7, 0);
+    }
+}
+
+// ============================================================================
+// Critical Section 实现
+// ============================================================================
+
+use critical_section::RawRestoreState;
+
+struct RiscvCriticalSectionImpl;
+critical_section::set_impl!(RiscvCriticalSectionImpl);
+
+unsafe impl critical_section::Impl for RiscvCriticalSectionImpl {
+    unsafe fn acquire() -> RawRestoreState {
+        let prev = read_mstatus();
+        disable_interrupts();
+        prev as RawRestoreState
+    }
+
+    unsafe fn release(prev: RawRestoreState) {
+        restore_interrupts(prev as usize);
     }
 }
 
