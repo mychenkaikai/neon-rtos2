@@ -1,0 +1,21 @@
+[package]
+name = "riscv-qemu-example"
+version = "0.1.0"
+edition = "2021"
+authors = ["Neon-RTOS2 Team"]
+description = "RISC-V QEMU example for Neon-RTOS2"
+
+[dependencies]
+neon-rtos2 = { path = "../..", features = ["riscv"] }
+
+[profile.dev]
+panic = "abort"
+opt-level = 0
+debug = true
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+debug = false
+
