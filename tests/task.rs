@@ -1,6 +1,8 @@
 use neon_rtos2::{kernel::task::Task, utils::kernel_init, kernel::scheduler::Scheduler, sync::event::Event};
+use serial_test::serial;
 
 #[test]
+#[serial]
 fn test_basic_task_operations() {
     // 初始化内核
     kernel_init();
@@ -23,6 +25,7 @@ fn test_basic_task_operations() {
 }
 
 #[test]
+#[serial]
 fn test_task_switching() {
     // 初始化内核
     kernel_init();
