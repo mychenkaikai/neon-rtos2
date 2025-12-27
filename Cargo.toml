@@ -14,9 +14,11 @@ members = [
 paste = "1.0"
 
 [features]
-default = ["cortex_m3"]
-cortex_m3 = ["cortex-m", "cortex-m-rt", "embedded-alloc", "spin","cortex-m-semihosting","critical-section"]
-riscv = ["riscv-rt", "embedded-alloc","critical-section"]
+# 默认启用 spin（测试需要），但不启用 embedded-alloc
+default = ["spin"]
+# 嵌入式目标 features
+cortex_m3 = ["cortex-m", "cortex-m-rt", "embedded-alloc", "spin", "cortex-m-semihosting", "critical-section"]
+riscv = ["riscv-rt", "embedded-alloc", "critical-section", "spin"]
 
 [dependencies.critical-section]
 version = "1.2"
@@ -24,6 +26,7 @@ optional = true
 
 [dev-dependencies]
 critical-section = { version = "1.2", features = ["std"] }
+serial_test = "3.0"
 
 [dependencies.cortex-m]
 version = "0.7.7"
