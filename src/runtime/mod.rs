@@ -7,8 +7,11 @@
 //! - 🚀 **轻量级执行器**: 适合嵌入式环境的简单执行器
 //! - ⚡ **零成本 Waker**: 基于任务 ID 的唤醒机制
 //! - 🔄 **异步原语**: 异步信号量、定时器、通道
+//! - 🎯 **Select 宏**: 同时等待多个异步操作
 //!
 //! ## 使用示例
+//!
+//! ### 基本用法
 //!
 //! ```rust,ignore
 //! use neon_rtos2::runtime::{Executor, spawn, channel};
@@ -30,14 +33,36 @@
 //! // 运行执行器
 //! executor.run();
 //! ```
+//!
+//! ### 使用 Select
+//!
+//! ```rust,ignore
+//! use neon_rtos2::select;
+//!
+//! async fn handle_events() {
+//!     select! {
+//!         msg = rx.recv() => println!("Received: {:?}", msg),
+//!         _ = timer.sleep(1000) => println!("Timeout!"),
+//!     }
+//! }
+//! ```
 
 mod waker;
 mod executor;
 mod future;
 mod channel;
+pub mod select;
 
 pub use waker::TaskWaker;
 pub use executor::Executor;
 pub use future::*;
 pub use channel::{channel, unbounded, Sender, Receiver, SendError, RecvError};
+
+// 重新导出 select 模块的类型
+pub use select::{
+    Select2, Select3, Select4,
+    Either, Either3, Either4,
+    select2, select3, select4,
+    Race, race2, race3,
+};
 

@@ -1,3 +1,4 @@
 pub mod task;
 pub mod scheduler;
 pub mod time;
+pub mod power;

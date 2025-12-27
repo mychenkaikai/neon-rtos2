@@ -53,11 +53,14 @@ pub fn log_write(s: &str) -> fmt::Result {
     Ok(())
 }
 
-/// 测试环境下打印日志
-#[cfg(test)]
+/// 测试环境下打印日志（包括单元测试和集成测试）
+#[cfg(any(test, not(feature = "cortex_m3")))]
 #[inline(always)]
-pub fn log_write(s: &str) -> fmt::Result {
-    print!("{}", s);
+pub fn log_write(_s: &str) -> fmt::Result {
+    // 在非嵌入式环境下，日志输出为空操作
+    // 如果需要输出，可以使用 println! 但需要 std
+    #[cfg(test)]
+    print!("{}", _s);
     Ok(())
 }
 

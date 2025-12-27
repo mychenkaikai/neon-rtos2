@@ -10,18 +10,21 @@ use core::ptr::addr_of;
 
 use spin::{Once, RwLock};
 
-#[cfg(feature = "embedded-alloc")]
+// 在 no_std 环境使用 alloc，在测试环境使用 std
+#[cfg(not(test))]
 use alloc::boxed::Box;
-#[cfg(not(feature = "embedded-alloc"))]
+#[cfg(test)]
 use std::boxed::Box;
 
 // 子模块
 pub mod priority;
 pub mod builder;
+pub mod state;
 
 // 重新导出
 pub use priority::Priority;
 pub use builder::TaskBuilder;
+pub use state::{TypedTask, TypedTaskBuilder, TaskStateMarker, Created, Ready, Running, Blocked};
 
 // 在lib.rs或main.rs中
 
@@ -72,7 +75,7 @@ pub struct TaskControlBlock {
     pub(crate) task_fn: Option<Box<dyn TaskFunction>>,
 }
 
-#[derive(Clone, PartialEq, Copy)]
+#[derive(Clone, PartialEq, Copy, Debug)]
 pub struct Task(pub usize);
 
 fn get_task_list() -> &'static RwLock<[TaskControlBlock; MAX_TASKS]> {

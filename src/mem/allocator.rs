@@ -1,11 +1,8 @@
-// 测试环境使用标准库分配器，不需要自定义分配器
-#[cfg(test)]
-pub fn init_heap() {
-    // 测试环境下使用 std 的分配器，无需初始化
-}
+// ============================================================================
+// 嵌入式环境使用 embedded-alloc
+// ============================================================================
 
-// 非测试环境使用 embedded-alloc
-#[cfg(not(test))]
+#[cfg(feature = "embedded-alloc")]
 mod embedded_heap {
     use crate::config::HEAP_SIZE;
     use core::mem::MaybeUninit;
@@ -48,7 +45,16 @@ mod embedded_heap {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(feature = "embedded-alloc")]
 pub fn init_heap() {
     embedded_heap::init_heap();
+}
+
+// ============================================================================
+// 非嵌入式环境（测试/主机）使用标准库分配器
+// ============================================================================
+
+#[cfg(not(feature = "embedded-alloc"))]
+pub fn init_heap() {
+    // 使用 std 的分配器，无需初始化
 }

@@ -1,10 +1,15 @@
-#[cfg(feature = "embedded-alloc")]
+// 在 no_std 环境使用 alloc，在测试环境使用 std
+#[cfg(not(test))]
 extern crate alloc;
 
 use crate::kernel::task::Task;
 use crate::{sync::event::Event, kernel::scheduler::Scheduler};
-#[cfg(feature = "embedded-alloc")]
+
+#[cfg(not(test))]
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+#[cfg(test)]
+use std::{boxed::Box, collections::VecDeque, vec::Vec};
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 

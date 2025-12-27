@@ -265,16 +265,22 @@ pub struct SendFuture<'a, T> {
     value: Option<T>,
 }
 
+// SendFuture 是 Unpin 的，因为它不包含自引用
+impl<'a, T> Unpin for SendFuture<'a, T> {}
+
 impl<'a, T> Future for SendFuture<'a, T> {
     type Output = Result<(), SendError<T>>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let value = match self.value.take() {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // 因为 SendFuture 是 Unpin 的，可以安全地获取可变引用
+        let this = self.get_mut();
+        
+        let value = match this.value.take() {
             Some(v) => v,
             None => panic!("SendFuture polled after completion"),
         };
         
-        let mut inner = self.sender.inner.lock();
+        let mut inner = this.sender.inner.lock();
         
         if inner.closed {
             return Poll::Ready(Err(SendError::Closed(value)));
@@ -290,10 +296,10 @@ impl<'a, T> Future for SendFuture<'a, T> {
             
             Poll::Ready(Ok(()))
         } else {
-            // 通道已满，注册 waker 并重新存储值
+            // 通道已满，注册 waker 并��新存储值
             inner.send_waiters.push_back(cx.waker().clone());
             drop(inner);
-            self.value = Some(value);
+            this.value = Some(value);
             Poll::Pending
         }
     }
