@@ -62,97 +62,275 @@ struct SignalInner {
 }
 
 /// 等待者列表
-/// 使用固定大小数组避免动态分配
+/// 使用位图 + 数组实现高效的等待者管理
+/// 
+/// ## 优化说明
+/// - 使用 `u16` 位图标记哪些槽位被使用
+/// - `push` 操作：O(1) - 使用 `trailing_zeros` 找到第一个空闲位
+/// - `remove` 操作：O(n) 查找 + O(1) 移除 - 直接清除对应位
+/// - `pop_front` 操作：O(1) - 使用 `trailing_zeros` 找到第一个使用位
+/// - 内存布局更紧凑，缓存友好
 pub struct WaiterList {
-    tasks: [Option<usize>; 16], // 最多 16 个等待者
-    len: usize,
+    /// 存储任务 ID 的数组
+    tasks: [usize; 16],
+    /// 位图：第 i 位为 1 表示 tasks[i] 有效
+    bitmap: u16,
+    /// FIFO 顺序追踪：记录插入顺序
+    /// 使用环形缓冲区索引
+    order: [u8; 16],
+    /// 下一个插入位置（用于 FIFO 顺序）
+    order_head: u8,
+    /// 下一个弹出位置（用于 FIFO 顺序）
+    order_tail: u8,
+    /// 有效元素数量
+    order_len: u8,
 }
 
 impl WaiterList {
     /// 创建新的等待者列表
     pub const fn new() -> Self {
         Self {
-            tasks: [None; 16],
-            len: 0,
+            tasks: [0; 16],
+            bitmap: 0,
+            order: [0; 16],
+            order_head: 0,
+            order_tail: 0,
+            order_len: 0,
         }
     }
 
     /// 添加等待者
+    /// 
+    /// 时间复杂度：O(1)
+    /// 
+    /// # 返回值
+    /// - `true`: 成功添加
+    /// - `false`: 队列已满
     pub fn push(&mut self, task_id: usize) -> bool {
-        if self.len < self.tasks.len() {
-            self.tasks[self.len] = Some(task_id);
-            self.len += 1;
-            true
-        } else {
-            false // 等待队列已满
+        // 使用位图找到第一个空闲槽位
+        let free_bitmap = !self.bitmap;
+        if free_bitmap == 0 {
+            return false; // 所有槽位都被使用
         }
+        
+        let slot = free_bitmap.trailing_zeros() as usize;
+        if slot >= 16 {
+            return false;
+        }
+        
+        // 存储任务 ID
+        self.tasks[slot] = task_id;
+        // 标记槽位为已使用
+        self.bitmap |= 1 << slot;
+        
+        // 记录插入顺序（用于 FIFO）
+        self.order[self.order_head as usize] = slot as u8;
+        self.order_head = (self.order_head + 1) % 16;
+        self.order_len += 1;
+        
+        true
     }
 
-    /// 弹出一个等待者（LIFO）
+    /// 弹出一个等待者（LIFO - 最后插入的）
+    /// 
+    /// 时间复杂度：O(1)
     pub fn pop(&mut self) -> Option<usize> {
-        if self.len > 0 {
-            self.len -= 1;
-            self.tasks[self.len].take()
-        } else {
-            None
+        if self.bitmap == 0 {
+            return None;
         }
+        
+        // LIFO: 弹出最后插入的
+        if self.order_len == 0 {
+            return None;
+        }
+        
+        // 回退 head 指针
+        self.order_head = if self.order_head == 0 { 15 } else { self.order_head - 1 };
+        let slot = self.order[self.order_head as usize] as usize;
+        self.order_len -= 1;
+        
+        // 清除位图
+        self.bitmap &= !(1 << slot);
+        
+        Some(self.tasks[slot])
     }
 
-    /// 弹出第一个等待者（FIFO）
+    /// 弹出第一个等待者（FIFO - 最先插入的）
+    /// 
+    /// 时间复杂度：O(1)
     pub fn pop_front(&mut self) -> Option<usize> {
-        if self.len > 0 {
-            let task_id = self.tasks[0].take();
-            // 移动所有元素
-            for i in 0..self.len - 1 {
-                self.tasks[i] = self.tasks[i + 1];
-            }
-            self.tasks[self.len - 1] = None;
-            self.len -= 1;
-            task_id
-        } else {
-            None
+        if self.bitmap == 0 || self.order_len == 0 {
+            return None;
         }
+        
+        // FIFO: 弹出最先插入的
+        let slot = self.order[self.order_tail as usize] as usize;
+        self.order_tail = (self.order_tail + 1) % 16;
+        self.order_len -= 1;
+        
+        // 清除位图
+        self.bitmap &= !(1 << slot);
+        
+        Some(self.tasks[slot])
     }
 
-    /// 移除指定的等待者
+    /// 移除指定的��待者
+    /// 
+    /// 时间复杂度：O(n) 查找 + O(1) 移除
+    /// 
+    /// # 返回值
+    /// - `true`: 成功移除
+    /// - `false`: 未找到指定任务
     pub fn remove(&mut self, task_id: usize) -> bool {
-        for i in 0..self.len {
-            if self.tasks[i] == Some(task_id) {
-                // 移除并压缩数组
-                for j in i..self.len - 1 {
-                    self.tasks[j] = self.tasks[j + 1];
-                }
-                self.tasks[self.len - 1] = None;
-                self.len -= 1;
+        // 遍历所有有效槽位
+        let mut bitmap = self.bitmap;
+        while bitmap != 0 {
+            let slot = bitmap.trailing_zeros() as usize;
+            if self.tasks[slot] == task_id {
+                // 找到了，清除位图
+                self.bitmap &= !(1 << slot);
+                
+                // 从顺序数组中移除（需要遍历找到并标记）
+                // 这里简化处理：不从 order 数组中移除，
+                // 而是在 pop_front 时跳过已清除的槽位
+                self.compact_order();
+                
                 return true;
             }
+            bitmap &= !(1 << slot);
         }
         false
     }
+    
+    /// 压缩顺序数组，移除已删除的槽位
+    fn compact_order(&mut self) {
+        if self.order_len == 0 {
+            return;
+        }
+        
+        let mut new_order = [0u8; 16];
+        let mut new_len = 0u8;
+        
+        let mut i = self.order_tail;
+        for _ in 0..self.order_len {
+            let slot = self.order[i as usize];
+            // 检查该槽位是否仍然有效
+            if (self.bitmap & (1 << slot)) != 0 {
+                new_order[new_len as usize] = slot;
+                new_len += 1;
+            }
+            i = (i + 1) % 16;
+        }
+        
+        self.order = new_order;
+        self.order_tail = 0;
+        self.order_head = new_len;
+        self.order_len = new_len;
+    }
 
     /// 检查是否为空
+    /// 
+    /// 时间复杂度：O(1)
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.bitmap == 0
     }
 
     /// 获取等待者数量
+    /// 
+    /// 时间复杂度：O(1) - 使用 popcount 指令
+    #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.bitmap.count_ones() as usize
     }
 
     /// 获取所有等待者的迭代器
-    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.tasks[..self.len].iter().filter_map(|&id| id)
+    /// 
+    /// 按 FIFO 顺序返回
+    pub fn iter(&self) -> WaiterListIter<'_> {
+        WaiterListIter {
+            list: self,
+            current: self.order_tail,
+            remaining: self.order_len,
+        }
     }
 
     /// 清空所有等待者，返回被清空的任务 ID 列表
+    /// 
+    /// 时间复杂度：O(n)，n 为等待者数量
     pub fn drain(&mut self) -> [Option<usize>; 16] {
         let mut result = [None; 16];
-        for i in 0..self.len {
-            result[i] = self.tasks[i].take();
+        let mut idx = 0;
+        
+        // 按 FIFO 顺序返回
+        let mut i = self.order_tail;
+        for _ in 0..self.order_len {
+            let slot = self.order[i as usize] as usize;
+            if (self.bitmap & (1 << slot)) != 0 {
+                result[idx] = Some(self.tasks[slot]);
+                idx += 1;
+            }
+            i = (i + 1) % 16;
         }
-        self.len = 0;
+        
+        // 清空状态
+        self.bitmap = 0;
+        self.order_head = 0;
+        self.order_tail = 0;
+        self.order_len = 0;
+        
         result
+    }
+    
+    /// 检查是否包含指定任务
+    /// 
+    /// 时间复杂度：O(n)
+    pub fn contains(&self, task_id: usize) -> bool {
+        let mut bitmap = self.bitmap;
+        while bitmap != 0 {
+            let slot = bitmap.trailing_zeros() as usize;
+            if self.tasks[slot] == task_id {
+                return true;
+            }
+            bitmap &= !(1 << slot);
+        }
+        false
+    }
+    
+    /// 获取容量
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        16
+    }
+}
+
+/// WaiterList 的迭代器
+pub struct WaiterListIter<'a> {
+    list: &'a WaiterList,
+    current: u8,
+    remaining: u8,
+}
+
+impl<'a> Iterator for WaiterListIter<'a> {
+    type Item = usize;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.remaining > 0 {
+            let slot = self.list.order[self.current as usize] as usize;
+            self.current = (self.current + 1) % 16;
+            self.remaining -= 1;
+            
+            // 检查槽位是否有效
+            if (self.list.bitmap & (1 << slot)) != 0 {
+                return Some(self.list.tasks[slot]);
+            }
+        }
+        None
+    }
+    
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.list.len();
+        (len, Some(len))
     }
 }
 

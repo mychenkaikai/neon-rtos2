@@ -3,6 +3,8 @@ use crate::kernel::task::TaskState;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Event {
+    /// 无事件（用于默认值）
+    None,
     Signal(usize),
     Timer(usize),
     Ipc(usize),

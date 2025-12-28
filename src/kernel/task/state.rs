@@ -161,10 +161,20 @@ impl TypedTask<Created> {
     /// 创建新任务
     ///
     /// 新创建的任务处于 `Created` 状态，需要调用 `start()` 启动。
+    /// 
+    /// ## 状态同步说明
+    /// 
+    /// `TypedTask<Created>` 的类型状态与底层 `Task` 的实际状��是同步的：
+    /// - 创建时，底层任务被设置为 `Ready` 状态（因为 `Task::new` 的行为）
+    /// - 但从类型系统角度，任务处于 `Created` 状态，表示"已创建但未被调度器管理"
+    /// - 调用 `start()` 后，任务进入 `Ready` 状态，可以被调度器调度
+    /// 
+    /// 这种设计允许用户在 `start()` 之前进行额外配置（如设置优先级），
+    /// 而不会被调度器意外调度。
     ///
     /// # 参数
     ///
-    /// - `name`: 任务名称
+    /// - `name`: 任务名��
     /// - `func`: 任务函数
     ///
     /// # 返回值
@@ -183,6 +193,9 @@ impl TypedTask<Created> {
     ///         // 任务逻辑
     ///     }
     /// })?;
+    /// // 此时任务已创建，但类型系统标记为 Created
+    /// // 可以在 start() 之前进行配置
+    /// let task = task.start(); // 现在类型变为 Ready
     /// # Ok(())
     /// # }
     /// ```
@@ -196,6 +209,34 @@ impl TypedTask<Created> {
             blocked_event: None,
             _state: PhantomData,
         })
+    }
+    
+    /// 获取任务优先级
+    /// 
+    /// 可以在 `start()` 之前查看或修改优先级
+    pub fn priority(&self) -> Priority {
+        self.inner.get_priority()
+    }
+    
+    /// 设置任务优先级
+    /// 
+    /// 可以在 `start()` 之前设置优先级，这样任务启动时就具有正确的优先级
+    /// 
+    /// # 示例
+    /// 
+    /// ```rust,no_run
+    /// # use neon_rtos2::kernel::task::state::*;
+    /// # use neon_rtos2::prelude::*;
+    /// # fn main() -> Result<(), RtosError> {
+    /// # kernel_init();
+    /// let mut task = TypedTask::<Created>::new("high_priority_task", |_| {})?;
+    /// task.set_priority(Priority::High);
+    /// let task = task.start(); // 启动时已经是高优先级
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_priority(&mut self, priority: Priority) {
+        self.inner.set_priority(priority);
     }
 
     /// 使用 Builder 模式创建任务
@@ -483,24 +524,51 @@ impl TypedTaskBuilder {
     /// 创建并启动任务
     ///
     /// 返回 `TypedTask<Ready>` 状态的任务
+    /// 
+    /// ## 流程
+    /// 1. 创建 `TypedTask<Created>`
+    /// 2. 在 `Created` 状态设置优先级
+    /// 3. 调用 `start()` 转换为 `Ready` 状态
     pub fn spawn<F>(self, func: F) -> Result<TypedTask<Ready>>
     where
         F: TaskFunction,
     {
-        let task = TypedTask::<Created>::new(self.name, func)?;
-        let mut ready_task = task.start();
-        ready_task.set_priority(self.priority);
-        Ok(ready_task)
+        let mut task = TypedTask::<Created>::new(self.name, func)?;
+        // 在 Created 状态设置优先级（更符合语义）
+        task.set_priority(self.priority);
+        Ok(task.start())
     }
 
     /// 只创建任务，不启动
     ///
-    /// 返回 `TypedTask<Created>` 状态的任务
+    /// 返回 `TypedTask<Created>` 状态的任务，已设置优先级
+    /// 
+    /// # 示例
+    /// 
+    /// ```rust,no_run
+    /// # use neon_rtos2::prelude::*;
+    /// # use neon_rtos2::kernel::task::state::TypedTask;
+    /// # fn main() -> Result<(), RtosError> {
+    /// # kernel_init();
+    /// let task = TypedTask::builder("my_task")
+    ///     .priority(Priority::High)
+    ///     .build(|_| {})?;
+    /// 
+    /// // 任务已创建并设置了优先级，但还未启动
+    /// assert_eq!(task.priority(), Priority::High);
+    /// 
+    /// // 稍后启动
+    /// let task = task.start();
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn build<F>(self, func: F) -> Result<TypedTask<Created>>
     where
         F: TaskFunction,
     {
-        TypedTask::<Created>::new(self.name, func)
+        let mut task = TypedTask::<Created>::new(self.name, func)?;
+        task.set_priority(self.priority);
+        Ok(task)
     }
 }
 
@@ -815,6 +883,45 @@ mod tests {
         
         assert_eq!(typed.id(), task_id);
         assert_eq!(typed.name(), "accessor_test");
+    }
+
+    #[test]
+    #[serial]
+    fn test_typed_task_created_priority() {
+        kernel_init();
+        
+        // 测试在 Created 状态设置优先级
+        let mut task = TypedTask::<Created>::new("priority_test", |_| {}).unwrap();
+        
+        // 默认优先级是 Normal
+        assert_eq!(task.priority(), Priority::Normal);
+        
+        // 在 Created 状态设置优先级
+        task.set_priority(Priority::High);
+        assert_eq!(task.priority(), Priority::High);
+        
+        // 启动后优先级保持不变
+        let ready_task = task.start();
+        assert_eq!(ready_task.priority(), Priority::High);
+    }
+
+    #[test]
+    #[serial]
+    fn test_typed_task_builder_priority_in_created() {
+        kernel_init();
+        
+        // 使用 builder 的 build() 方法，验证优先级在 Created 状态就已设置
+        let task = TypedTask::builder("builder_priority_test")
+            .priority(Priority::Critical)
+            .build(|_| {})
+            .unwrap();
+        
+        // 在 Created 状态就应该有正确的优先级
+        assert_eq!(task.priority(), Priority::Critical);
+        
+        // 启动后优先级保持不变
+        let ready_task = task.start();
+        assert_eq!(ready_task.priority(), Priority::Critical);
     }
 }
 

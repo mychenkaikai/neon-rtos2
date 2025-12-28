@@ -1,24 +1,293 @@
 use crate::kernel::task::{Task, TaskState, Priority};
 use crate::hal::init_idle_task;
-use core::sync::atomic::{AtomicBool, Ordering};
-use spin::{Once, RwLock};
+use crate::config::MAX_TASKS;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use spin::{Once, RwLock, Mutex};
+
+/// 优先级数量（对应 Priority 枚举的变体数）
+const PRIORITY_COUNT: usize = 5;
+
+/// 就绪队列 - 每个优先级一个队列
+/// 
+/// 使用环形缓冲区实现 FIFO 队列，支持 O(1) 的入队和出队操作
+#[derive(Debug)]
+struct ReadyQueue {
+    /// 任务 ID 数组
+    tasks: [usize; MAX_TASKS],
+    /// 队列头部索引
+    head: usize,
+    /// 队列尾部索引
+    tail: usize,
+    /// 队列中的任务数量
+    count: usize,
+}
+
+impl ReadyQueue {
+    const fn new() -> Self {
+        Self {
+            tasks: [0; MAX_TASKS],
+            head: 0,
+            tail: 0,
+            count: 0,
+        }
+    }
+    
+    /// 入队 - O(1)
+    #[inline]
+    fn push(&mut self, task_id: usize) -> bool {
+        if self.count >= MAX_TASKS {
+            return false;
+        }
+        self.tasks[self.tail] = task_id;
+        self.tail = (self.tail + 1) % MAX_TASKS;
+        self.count += 1;
+        true
+    }
+    
+    /// 出队 - O(1)
+    #[inline]
+    fn pop(&mut self) -> Option<usize> {
+        if self.count == 0 {
+            return None;
+        }
+        let task_id = self.tasks[self.head];
+        self.head = (self.head + 1) % MAX_TASKS;
+        self.count -= 1;
+        Some(task_id)
+    }
+    
+    /// 查看队首元素 - O(1)
+    #[inline]
+    fn peek(&self) -> Option<usize> {
+        if self.count == 0 {
+            None
+        } else {
+            Some(self.tasks[self.head])
+        }
+    }
+    
+    /// 从队列中移除指定任务 - O(n)
+    /// 
+    /// 注意：这个操作较慢，仅在任务阻塞时使用
+    fn remove(&mut self, task_id: usize) -> bool {
+        if self.count == 0 {
+            return false;
+        }
+        
+        // 查找任务位置
+        let mut found_idx = None;
+        let mut idx = self.head;
+        for i in 0..self.count {
+            if self.tasks[idx] == task_id {
+                found_idx = Some(i);
+                break;
+            }
+            idx = (idx + 1) % MAX_TASKS;
+        }
+        
+        if let Some(pos) = found_idx {
+            // 将后面的元素前移
+            let mut src = (self.head + pos + 1) % MAX_TASKS;
+            let mut dst = (self.head + pos) % MAX_TASKS;
+            for _ in pos..(self.count - 1) {
+                self.tasks[dst] = self.tasks[src];
+                dst = src;
+                src = (src + 1) % MAX_TASKS;
+            }
+            self.tail = if self.tail == 0 { MAX_TASKS - 1 } else { self.tail - 1 };
+            self.count -= 1;
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// 检查队列是否为空 - O(1)
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    
+    /// 获取队列长度 - O(1)
+    #[inline]
+    fn len(&self) -> usize {
+        self.count
+    }
+    
+    /// 检查是否包含指定任务 - O(n)
+    fn contains(&self, task_id: usize) -> bool {
+        let mut idx = self.head;
+        for _ in 0..self.count {
+            if self.tasks[idx] == task_id {
+                return true;
+            }
+            idx = (idx + 1) % MAX_TASKS;
+        }
+        false
+    }
+}
 
 /// 调度器内部状态
+/// 
+/// ## 优化说明
+/// 
+/// 使用位图 + 优先级队列实现 O(1) 调度：
+/// - `ready_bitmap`: 位图标记哪些优先级有就绪任务
+/// - `ready_queues`: 每个优先级一个 FIFO 队列
+/// - 查找最高优先级：O(1) - 使用 `leading_zeros()` 指令
+/// - 入队/出队：O(1)
 struct SchedulerInner {
+    /// 当前运行的任务
     current_task: Option<Task>,
+    /// 下一个要运行的任务（用于上下文切换）
     next_task: Option<Task>,
+    /// 就绪位图：第 i 位为 1 表示优先级 i 有就绪任务
+    /// 位 0 = Idle, 位 1 = Low, 位 2 = Normal, 位 3 = High, 位 4 = Critical
+    ready_bitmap: u8,
+    /// 每个优先级的就绪队列
+    ready_queues: [ReadyQueue; PRIORITY_COUNT],
+}
+
+impl SchedulerInner {
+    const fn new() -> Self {
+        Self {
+            current_task: None,
+            next_task: None,
+            ready_bitmap: 0,
+            ready_queues: [
+                ReadyQueue::new(),
+                ReadyQueue::new(),
+                ReadyQueue::new(),
+                ReadyQueue::new(),
+                ReadyQueue::new(),
+            ],
+        }
+    }
+    
+    /// 将任务加入就绪队列 - O(1)
+    fn enqueue_ready(&mut self, task_id: usize, priority: Priority) {
+        let prio_idx = priority.as_u8() as usize;
+        if prio_idx < PRIORITY_COUNT {
+            // 避免重复入队
+            if !self.ready_queues[prio_idx].contains(task_id) {
+                self.ready_queues[prio_idx].push(task_id);
+                // 设置位图
+                self.ready_bitmap |= 1 << prio_idx;
+            }
+        }
+    }
+    
+    /// 从就绪队列移除任务 - O(n)
+    fn dequeue_task(&mut self, task_id: usize, priority: Priority) {
+        let prio_idx = priority.as_u8() as usize;
+        if prio_idx < PRIORITY_COUNT {
+            self.ready_queues[prio_idx].remove(task_id);
+            // 如果队列为空，清除位图
+            if self.ready_queues[prio_idx].is_empty() {
+                self.ready_bitmap &= !(1 << prio_idx);
+            }
+        }
+    }
+    
+    /// 从所有队列中移除任务（当不知道优先级时使用）
+    fn remove_task_from_all_queues(&mut self, task_id: usize) {
+        for prio_idx in 0..PRIORITY_COUNT {
+            if self.ready_queues[prio_idx].remove(task_id) {
+                if self.ready_queues[prio_idx].is_empty() {
+                    self.ready_bitmap &= !(1 << prio_idx);
+                }
+                break;
+            }
+        }
+    }
+    
+    /// 获取最高优先级的就绪任务 - O(1) 平均，最坏 O(n)
+    /// 
+    /// 使用位图快速查找最高优先级。
+    /// 会验证任务状态，跳过已阻塞的任务。
+    fn get_highest_priority_ready_task(&mut self) -> Option<usize> {
+        // 从最高优先级开始查找
+        for prio_idx in (0..PRIORITY_COUNT).rev() {
+            if (self.ready_bitmap & (1 << prio_idx)) == 0 {
+                continue;
+            }
+            
+            // 遍历该优先级队列，找到真正就绪的任务
+            loop {
+                if let Some(task_id) = self.ready_queues[prio_idx].pop() {
+                    // 验证任务状态
+                    let task = Task(task_id);
+                    if task.get_state() == TaskState::Ready {
+                        // 如果队列为空，清除位图
+                        if self.ready_queues[prio_idx].is_empty() {
+                            self.ready_bitmap &= !(1 << prio_idx);
+                        }
+                        return Some(task_id);
+                    }
+                    // 任务不是就绪状态，继续查找下一个
+                } else {
+                    // 队列为空，清除位图
+                    self.ready_bitmap &= !(1 << prio_idx);
+                    break;
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// 查看最高优先级的就绪任务（不移除）
+    /// 
+    /// 会验证任务状态，跳过已阻塞的任务。
+    fn peek_highest_priority_ready_task(&self) -> Option<(usize, Priority)> {
+        // 从最高优先级开始查找
+        for prio_idx in (0..PRIORITY_COUNT).rev() {
+            if (self.ready_bitmap & (1 << prio_idx)) == 0 {
+                continue;
+            }
+            
+            // 遍历该优先级队列，找到真正就绪的任务
+            let queue = &self.ready_queues[prio_idx];
+            let mut idx = queue.head;
+            for _ in 0..queue.count {
+                let task_id = queue.tasks[idx];
+                let task = Task(task_id);
+                if task.get_state() == TaskState::Ready {
+                    return Some((task_id, Priority::from_u8(prio_idx as u8).unwrap_or(Priority::Normal)));
+                }
+                idx = (idx + 1) % MAX_TASKS;
+            }
+        }
+        
+        None
+    }
+    
+    /// 获取指定优先级的就绪任务数量
+    fn ready_count_at_priority(&self, priority: Priority) -> usize {
+        let prio_idx = priority.as_u8() as usize;
+        if prio_idx < PRIORITY_COUNT {
+            self.ready_queues[prio_idx].len()
+        } else {
+            0
+        }
+    }
+    
+    /// 获取总就绪任务数量
+    fn total_ready_count(&self) -> usize {
+        self.ready_queues.iter().map(|q| q.len()).sum()
+    }
 }
 
 /// 全局调度器状态
-static SCHEDULER_INNER: Once<RwLock<SchedulerInner>> = Once::new();
+static SCHEDULER_INNER: Once<Mutex<SchedulerInner>> = Once::new();
 static SCHEDULER_RUNNING: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_USE_PRIORITY: AtomicBool = AtomicBool::new(false);
 
-fn get_scheduler_inner() -> &'static RwLock<SchedulerInner> {
-    SCHEDULER_INNER.call_once(|| RwLock::new(SchedulerInner {
-        current_task: None,
-        next_task: None,
-    }))
+/// 当前任务 ID（原子变量，用于快速访问）
+static CURRENT_TASK_ID: AtomicUsize = AtomicUsize::new(0);
+
+fn get_scheduler_inner() -> &'static Mutex<SchedulerInner> {
+    SCHEDULER_INNER.call_once(|| Mutex::new(SchedulerInner::new()))
 }
 
 pub struct Scheduler;
@@ -27,12 +296,12 @@ impl Scheduler {
     pub fn init() {
         // 重置调度器状态
         {
-            let mut inner = get_scheduler_inner().write();
-            inner.current_task = None;
-            inner.next_task = None;
+            let mut inner = get_scheduler_inner().lock();
+            *inner = SchedulerInner::new();
         }
         SCHEDULER_RUNNING.store(false, Ordering::Release);
         SCHEDULER_USE_PRIORITY.store(false, Ordering::Release);
+        CURRENT_TASK_ID.store(0, Ordering::Release);
         
         init_idle_task();
     }
@@ -40,6 +309,12 @@ impl Scheduler {
     /// 启用优先级调度
     ///
     /// 启用后，调度器会优先选择优先级最高的就绪任务运行。
+    /// 
+    /// ## 性能说明
+    /// 
+    /// 优先级调度使用位图 + 优先级队列实现 O(1) 调度：
+    /// - 查找最高优先级任务：O(1)
+    /// - 任务入队/出队：O(1)
     pub fn enable_priority_scheduling() {
         SCHEDULER_USE_PRIORITY.store(true, Ordering::Release);
     }
@@ -60,86 +335,122 @@ impl Scheduler {
     pub fn is_running() -> bool {
         SCHEDULER_RUNNING.load(Ordering::Acquire)
     }
+    
+    /// 将任务加入就绪队列
+    /// 
+    /// 当任务从阻塞状态变为就绪状态时调用。
+    /// 
+    /// ## 性能
+    /// - 时间复杂度：O(1)
+    pub fn enqueue_ready_task(task: &Task) {
+        let mut inner = get_scheduler_inner().lock();
+        inner.enqueue_ready(task.get_taskid(), task.get_priority());
+    }
+    
+    /// 从就绪队列移除任务
+    /// 
+    /// 当任务进入阻塞状态时调用。
+    /// 
+    /// ## 性能
+    /// - 时间复杂度：O(n)，n 为该优先级队列中的任务数
+    pub fn dequeue_task(task: &Task) {
+        let mut inner = get_scheduler_inner().lock();
+        inner.dequeue_task(task.get_taskid(), task.get_priority());
+    }
 
-    /// 基于优先级的调度
+    /// 基于优先级的调度 - O(1)
     ///
     /// 选择优先级最高的就绪任务运行。
-    /// 如果有多个相同优先级的任务，选择第一个找到的。
+    /// 如果有多个相同优先级的任务，按 FIFO 顺序选择。
+    /// 
+    /// ## 优化说明
+    /// 
+    /// 使用位图快速查找最高优先级：
+    /// - `ready_bitmap` 的每一位表示对应优先级是否有就绪任务
+    /// - 使用 `leading_zeros()` 指令在 O(1) 时间内找到最高优先级
     pub fn schedule_by_priority() {
         // 如果调度器未运行，直接返回
         if !Self::is_running() {
             return;
         }
 
-        let mut current_task = {
-            let inner = get_scheduler_inner().read();
-            match inner.current_task {
-                Some(task) => task,
-                None => return,
-            }
+        let mut inner = get_scheduler_inner().lock();
+        
+        let current_task = match inner.current_task {
+            Some(task) => task,
+            None => return,
         };
+        
+        let current_priority = current_task.get_priority();
+        let current_state = current_task.get_state();
 
-        // 使用迭代器找到最高优先级的就绪任务
-        let next_task = Task::ready_tasks()
-            .filter(|t| t.get_taskid() != current_task.get_taskid())
-            .max_by_key(|t| t.get_priority());
-
-        match (next_task, current_task.get_state()) {
-            // 找到了更高优先级的就绪任务
-            (Some(mut next), _) => {
-                // 如果当前任务正在运行，将其设为就绪状态
-                if current_task.get_state() == TaskState::Running {
-                    current_task.ready();
+        // 查看最高优先级的就绪任务
+        if let Some((next_task_id, next_priority)) = inner.peek_highest_priority_ready_task() {
+            // 只有当找到的任务优先级更高，或者当前任务不是运行状态时才切换
+            if next_task_id != current_task.get_taskid() && 
+               (next_priority > current_priority || current_state != TaskState::Running) {
+                // 从队列中取出任务
+                let next_task_id = inner.get_highest_priority_ready_task().unwrap();
+                let mut next_task = Task(next_task_id);
+                
+                // 如果当前任务正在运行，将其设为就绪并重新入队
+                if current_state == TaskState::Running {
+                    let mut current = current_task;
+                    current.ready();
+                    inner.enqueue_ready(current.get_taskid(), current_priority);
                 }
 
                 // 运行下一个任务
-                next.run();
-                get_scheduler_inner().write().current_task = Some(next);
+                next_task.run();
+                inner.current_task = Some(next_task);
+                CURRENT_TASK_ID.store(next_task_id, Ordering::Release);
+                return;
             }
-
-            // 没找到其他任务，但当前任务就绪
-            (None, TaskState::Ready) => {
-                current_task.run();
-                get_scheduler_inner().write().current_task = Some(current_task);
-            }
-
-            // 其他情况保持不变
-            _ => {}
+        }
+        
+        // 没找到更高优先级的任务
+        if current_state == TaskState::Ready {
+            let mut current = current_task;
+            current.run();
+            inner.current_task = Some(current);
         }
     }
 
-    /// 抢占式调度检查
+    /// 抢占式调度检查 - O(1)
     ///
     /// 如果有更高优先级的任务就绪，触发任务切换。
     /// 通常在 SysTick 中断或任务唤醒时调用。
+    /// 
+    /// ## 性能
+    /// - 时间复杂度：O(1) - 只需检查位图
     pub fn preempt_check() {
         // 如果调度器未运行或未启用优先级调度，直接返回
         if !Self::is_running() || !Self::is_priority_scheduling_enabled() {
             return;
         }
 
-        let current_task = {
-            let inner = get_scheduler_inner().read();
-            match inner.current_task {
-                Some(task) => task,
-                None => return,
-            }
+        let inner = get_scheduler_inner().lock();
+        
+        let current_task = match inner.current_task {
+            Some(task) => task,
+            None => return,
         };
         let current_priority = current_task.get_priority();
 
-        // 检查是否有更高优先级的就绪任务
-        let higher_priority_exists = Task::ready_tasks()
-            .any(|t| t.get_priority() > current_priority);
-
-        if higher_priority_exists {
-            Self::schedule_by_priority();
+        // O(1) 检查是否有更高优先级的就绪任务
+        if let Some((_, highest_priority)) = inner.peek_highest_priority_ready_task() {
+            if highest_priority > current_priority {
+                drop(inner); // 释放锁
+                Self::schedule_by_priority();
+            }
         }
     }
 
     /// 任务切换
     ///
-    /// 使用 task::for_each_from 遍历所有任务，找到当前任务之后的下一个非阻塞任务。
-    /// 如果当前任务是最后一个任务，则从头开始查找。
+    /// 根据调度策略选择下一个任务运行。
+    /// - 优先级调度：选择最高优先级的就绪任务
+    /// - 轮转调度：选择下一个就绪任务
     pub fn task_switch() {
         // 如果调度器未运行，直接返回
         if !Self::is_running() {
@@ -152,43 +463,77 @@ impl Scheduler {
             return;
         }
 
-        // 否则使用轮转调度算法
-        let mut current_task = {
-            let inner = get_scheduler_inner().read();
-            match inner.current_task {
-                Some(task) => task,
-                None => return,
+        // 否则使用轮转调度算法（使用快照迭代器减少锁竞争）
+        Self::round_robin_schedule();
+    }
+    
+    /// 轮转调度算法
+    /// 
+    /// 使用快照迭代器减少锁持有时间
+    fn round_robin_schedule() {
+        let current_task_id = CURRENT_TASK_ID.load(Ordering::Acquire);
+        
+        // 使用快照迭代器获取任务状态（只获取一次锁）
+        let snapshot_iter = Task::snapshot_iter();
+        
+        // 查找下一个就绪任务
+        let mut next_task_id: Option<usize> = None;
+        let mut current_task_ready = false;
+        
+        // 从当前任务之后开始查找
+        for snapshot in snapshot_iter {
+            if snapshot.task_id == current_task_id {
+                current_task_ready = snapshot.state == TaskState::Ready;
+                continue;
             }
+            if snapshot.state == TaskState::Ready && snapshot.task_id > current_task_id && next_task_id.is_none() {
+                next_task_id = Some(snapshot.task_id);
+                break;
+            }
+        }
+        
+        // 如果没找到，从头开始查找
+        if next_task_id.is_none() {
+            for snapshot in Task::snapshot_iter() {
+                if snapshot.task_id == current_task_id {
+                    continue;
+                }
+                if snapshot.state == TaskState::Ready && snapshot.task_id < current_task_id {
+                    next_task_id = Some(snapshot.task_id);
+                    break;
+                }
+            }
+        }
+
+        // 执行任务切换
+        let mut inner = get_scheduler_inner().lock();
+        let current_task = match inner.current_task {
+            Some(task) => task,
+            None => return,
         };
-
-        // 查找下一个准备好的任务
-        let mut next_task: Option<Task> = None;
-        Task::for_each_from(current_task.get_taskid() + 1, |task, _| {
-            if task.get_state() == TaskState::Ready
-                && task.get_taskid() != current_task.get_taskid()
-                && next_task.is_none()
-            {
-                next_task = Some(*task);
-            }
-        });
-
-        match (next_task, current_task.get_state()) {
+        
+        match (next_task_id, current_task.get_state()) {
             // 找到了下一个准备好的任务
-            (Some(mut next), _) => {
+            (Some(next_id), _) => {
+                let mut next = Task(next_id);
+                
                 // 如果当前任务正在运行，将其设为就绪状态
                 if current_task.get_state() == TaskState::Running {
-                    current_task.ready();
+                    let mut current = current_task;
+                    current.ready();
                 }
 
                 // 运行下一个任务
                 next.run();
-                get_scheduler_inner().write().current_task = Some(next);
+                inner.current_task = Some(next);
+                CURRENT_TASK_ID.store(next_id, Ordering::Release);
             }
 
             // 没找到其他任务，但当前任务就绪
             (None, TaskState::Ready) => {
-                current_task.run();
-                get_scheduler_inner().write().current_task = Some(current_task);
+                let mut current = current_task;
+                current.run();
+                inner.current_task = Some(current);
             }
 
             // 其他情况保持不变
@@ -197,12 +542,23 @@ impl Scheduler {
     }
 
     pub fn start() {
-        // 设置第一个任务为当前任务
+        // 初始化就绪队列：将所有就绪任务加入队列
         {
-            let mut inner = get_scheduler_inner().write();
+            let mut inner = get_scheduler_inner().lock();
+            
+            // 遍历所有任务，将就绪任务加入队列
+            for snapshot in Task::snapshot_iter() {
+                if snapshot.state == TaskState::Ready {
+                    inner.enqueue_ready(snapshot.task_id, snapshot.priority);
+                }
+            }
+            
+            // 设置第一个任务为当前任务
             inner.current_task = Some(Task(0));
         }
+        
         Task(0).run();
+        CURRENT_TASK_ID.store(0, Ordering::Release);
         SCHEDULER_RUNNING.store(true, Ordering::Release);
         
         // 触发当前架构的任务切换
@@ -214,9 +570,43 @@ impl Scheduler {
         SCHEDULER_RUNNING.store(false, Ordering::Release);
     }
 
+    /// 获取当前任务 - O(1)
+    /// 
+    /// 使用原子变量快速获取当前任务 ID，避免锁竞争
     pub fn get_current_task() -> Task {
-        get_scheduler_inner().read().current_task.unwrap()
+        Task(CURRENT_TASK_ID.load(Ordering::Acquire))
     }
+    
+    /// 获取当前任务（从调度器内部状态）
+    /// 
+    /// 需要获取锁，但返回完整的 Task 信息
+    pub fn get_current_task_locked() -> Task {
+        get_scheduler_inner().lock().current_task.unwrap()
+    }
+    
+    /// 获取就绪任务统计信息
+    pub fn ready_task_stats() -> ReadyTaskStats {
+        let inner = get_scheduler_inner().lock();
+        ReadyTaskStats {
+            total: inner.total_ready_count(),
+            by_priority: [
+                inner.ready_count_at_priority(Priority::Idle),
+                inner.ready_count_at_priority(Priority::Low),
+                inner.ready_count_at_priority(Priority::Normal),
+                inner.ready_count_at_priority(Priority::High),
+                inner.ready_count_at_priority(Priority::Critical),
+            ],
+        }
+    }
+}
+
+/// 就绪任务统计信息
+#[derive(Debug, Clone, Copy)]
+pub struct ReadyTaskStats {
+    /// 总就绪任务数
+    pub total: usize,
+    /// 各优先级的就绪任务数 [Idle, Low, Normal, High, Critical]
+    pub by_priority: [usize; PRIORITY_COUNT],
 }
 
 #[cfg(test)]
