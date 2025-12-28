@@ -1,4 +1,4 @@
-//! # CondVar V2 - 支持闭包传递的条件变量
+//! # CondVar - 支持闭包传递的条件变量
 //!
 //! 基于 Arc 的条件变量实现，无需全局变量，可以通过闭包传递。
 //! 条件变量用于在满足特定条件时唤醒等待的任务。
@@ -12,12 +12,12 @@
 //! ## 使用示例
 //!
 //! ```rust,no_run
-//! use neon_rtos2::sync::{MutexV2, CondVarV2};
+//! use neon_rtos2::sync::{Mutex, CondVar};
 //! use neon_rtos2::kernel::task::Task;
 //!
 //! fn main() {
-//!     let mutex = MutexV2::new(false); // 条件：数据是否准备好
-//!     let condvar = CondVarV2::new();
+//!     let mutex = Mutex::new(false); // 条件：数据是否准备好
+//!     let condvar = CondVar::new();
 //!     
 //!     let mutex_clone = mutex.clone();
 //!     let condvar_clone = condvar.clone();
@@ -51,8 +51,8 @@ use crate::kernel::task::{Task, TaskState};
 use crate::kernel::time::systick::Systick;
 use crate::hal::trigger_schedule;
 use crate::error::{Result, RtosError};
-use crate::sync::signal_v2::WaiterList;
-use crate::sync::mutex_v2::{MutexV2, MutexGuardV2};
+use crate::sync::signal::WaiterList;
+use crate::sync::mutex::{Mutex, MutexGuard};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 use spin::Mutex as SpinMutex;
@@ -80,14 +80,14 @@ impl CondVarInner {
 /// 可克隆、可传递的条件变量
 ///
 /// 条件变量用于在满足特定条件时唤醒等待的任务。
-/// 通常与 `MutexV2` 配合使用。
+/// 通常与 `Mutex` 配合使用。
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::{MutexV2, CondVarV2};
+/// use neon_rtos2::sync::{Mutex, CondVar};
 ///
-/// let mutex = MutexV2::new(0);
-/// let condvar = CondVarV2::new();
+/// let mutex = Mutex::new(0);
+/// let condvar = CondVar::new();
 ///
 /// // 等待条件
 /// let mut guard = mutex.lock().unwrap();
@@ -96,18 +96,18 @@ impl CondVarInner {
 /// }
 /// ```
 #[derive(Clone)]
-pub struct CondVarV2 {
+pub struct CondVar {
     inner: Arc<CondVarInner>,
 }
 
-impl CondVarV2 {
+impl CondVar {
     /// 创建新的条件变量
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::CondVarV2;
+    /// use neon_rtos2::sync::CondVar;
     ///
-    /// let condvar = CondVarV2::new();
+    /// let condvar = CondVar::new();
     /// ```
     pub fn new() -> Self {
         Self {
@@ -124,22 +124,22 @@ impl CondVarV2 {
     /// - `guard`: 互斥锁守卫
     ///
     /// # 返回值
-    /// - `Ok(MutexGuardV2)`: 成功等待并重新获取锁
+    /// - `Ok(MutexGuard)`: 成功等待并重新获取锁
     /// - `Err(RtosError::CondVarClosed)`: 条件变量已关闭
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::{MutexV2, CondVarV2};
+    /// use neon_rtos2::sync::{Mutex, CondVar};
     ///
-    /// let mutex = MutexV2::new(false);
-    /// let condvar = CondVarV2::new();
+    /// let mutex = Mutex::new(false);
+    /// let condvar = CondVar::new();
     ///
     /// let mut guard = mutex.lock().unwrap();
     /// while !*guard {
     ///     guard = condvar.wait(guard).unwrap();
     /// }
     /// ```
-    pub fn wait<'a, T>(&self, guard: MutexGuardV2<'a, T>) -> Result<MutexGuardV2<'a, T>> {
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> Result<MutexGuard<'a, T>> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(RtosError::CondVarClosed);
         }
@@ -159,7 +159,7 @@ impl CondVarV2 {
         }
 
         // 释放互斥锁（通过 unlock 方法，避免 drop 后无法访问 mutex）
-        let mutex = MutexGuardV2::unlock(guard);
+        let mutex = MutexGuard::unlock(guard);
 
         // 阻塞当前任务
         let condvar_id = Arc::as_ptr(&self.inner) as usize;
@@ -184,16 +184,16 @@ impl CondVarV2 {
     /// - `timeout_ms`: 超时时间（毫秒）
     ///
     /// # 返回值
-    /// - `Ok((MutexGuardV2, false))`: 成功等待并重新获取锁
-    /// - `Ok((MutexGuardV2, true))`: 超时，但仍重新获取了锁
+    /// - `Ok((MutexGuard, false))`: 成功等待并重新获取锁
+    /// - `Ok((MutexGuard, true))`: 超时，但仍重新获取了锁
     /// - `Err(RtosError)`: 错误
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::{MutexV2, CondVarV2};
+    /// use neon_rtos2::sync::{Mutex, CondVar};
     ///
-    /// let mutex = MutexV2::new(false);
-    /// let condvar = CondVarV2::new();
+    /// let mutex = Mutex::new(false);
+    /// let condvar = CondVar::new();
     ///
     /// let mut guard = mutex.lock().unwrap();
     /// let (new_guard, timed_out) = condvar.wait_timeout(guard, 1000).unwrap();
@@ -204,9 +204,9 @@ impl CondVarV2 {
     /// ```
     pub fn wait_timeout<'a, T>(
         &self,
-        guard: MutexGuardV2<'a, T>,
+        guard: MutexGuard<'a, T>,
         timeout_ms: usize,
-    ) -> Result<(MutexGuardV2<'a, T>, bool)> {
+    ) -> Result<(MutexGuard<'a, T>, bool)> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(RtosError::CondVarClosed);
         }
@@ -223,7 +223,7 @@ impl CondVarV2 {
         }
 
         // 释放互斥锁
-        let mutex = MutexGuardV2::unlock(guard);
+        let mutex = MutexGuard::unlock(guard);
 
         // 阻塞当前任务
         let condvar_id = Arc::as_ptr(&self.inner) as usize;
@@ -259,15 +259,15 @@ impl CondVarV2 {
     /// - `condition`: 条件检查函数
     ///
     /// # 返回值
-    /// - `Ok(MutexGuardV2)`: 条件满足，返回锁守卫
+    /// - `Ok(MutexGuard)`: 条件满足，返回锁守卫
     /// - `Err(RtosError)`: 错误
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::{MutexV2, CondVarV2};
+    /// use neon_rtos2::sync::{Mutex, CondVar};
     ///
-    /// let mutex = MutexV2::new(0i32);
-    /// let condvar = CondVarV2::new();
+    /// let mutex = Mutex::new(0i32);
+    /// let condvar = CondVar::new();
     ///
     /// let guard = mutex.lock().unwrap();
     /// let guard = condvar.wait_while(guard, |value| *value < 10).unwrap();
@@ -275,9 +275,9 @@ impl CondVarV2 {
     /// ```
     pub fn wait_while<'a, T, F>(
         &self,
-        mut guard: MutexGuardV2<'a, T>,
+        mut guard: MutexGuard<'a, T>,
         mut condition: F,
-    ) -> Result<MutexGuardV2<'a, T>>
+    ) -> Result<MutexGuard<'a, T>>
     where
         F: FnMut(&T) -> bool,
     {
@@ -295,15 +295,15 @@ impl CondVarV2 {
     /// - `condition`: 条件检查函数
     ///
     /// # 返回值
-    /// - `Ok((MutexGuardV2, false))`: 条件满足
-    /// - `Ok((MutexGuardV2, true))`: 超时
+    /// - `Ok((MutexGuard, false))`: 条件满足
+    /// - `Ok((MutexGuard, true))`: 超时
     /// - `Err(RtosError)`: 错误
     pub fn wait_while_timeout<'a, T, F>(
         &self,
-        mut guard: MutexGuardV2<'a, T>,
+        mut guard: MutexGuard<'a, T>,
         timeout_ms: usize,
         mut condition: F,
-    ) -> Result<(MutexGuardV2<'a, T>, bool)>
+    ) -> Result<(MutexGuard<'a, T>, bool)>
     where
         F: FnMut(&T) -> bool,
     {
@@ -332,9 +332,9 @@ impl CondVarV2 {
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::CondVarV2;
+    /// use neon_rtos2::sync::CondVar;
     ///
-    /// let condvar = CondVarV2::new();
+    /// let condvar = CondVar::new();
     /// condvar.notify_one();
     /// ```
     pub fn notify_one(&self) {
@@ -374,9 +374,9 @@ impl CondVarV2 {
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::CondVarV2;
+    /// use neon_rtos2::sync::CondVar;
     ///
-    /// let condvar = CondVarV2::new();
+    /// let condvar = CondVar::new();
     /// condvar.notify_all();
     /// ```
     pub fn notify_all(&self) {
@@ -437,15 +437,15 @@ impl CondVarV2 {
     }
 }
 
-impl Default for CondVarV2 {
+impl Default for CondVar {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl core::fmt::Debug for CondVarV2 {
+impl core::fmt::Debug for CondVar {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CondVarV2")
+        f.debug_struct("CondVar")
             .field("id", &self.id())
             .field("waiters", &self.waiter_count())
             .field("closed", &self.is_closed())
@@ -459,13 +459,13 @@ impl core::fmt::Debug for CondVarV2 {
 
 /// 条件变量的异步等待 Future
 pub struct CondVarFuture<'a, T> {
-    condvar: &'a CondVarV2,
-    mutex: &'a MutexV2<T>,
+    condvar: &'a CondVar,
+    mutex: &'a Mutex<T>,
     registered: bool,
 }
 
 impl<'a, T> CondVarFuture<'a, T> {
-    fn new(condvar: &'a CondVarV2, mutex: &'a MutexV2<T>) -> Self {
+    fn new(condvar: &'a CondVar, mutex: &'a Mutex<T>) -> Self {
         Self {
             condvar,
             mutex,
@@ -497,12 +497,12 @@ impl<'a, T> core::future::Future for CondVarFuture<'a, T> {
     }
 }
 
-impl CondVarV2 {
+impl CondVar {
     /// 异步等待条件变量
     ///
     /// 注意：这个方法需要手动管理锁的释放和重新获取。
     /// 建议使用 `wait()` 方法进行同步等待。
-    pub fn wait_async<'a, T>(&'a self, mutex: &'a MutexV2<T>) -> CondVarFuture<'a, T> {
+    pub fn wait_async<'a, T>(&'a self, mutex: &'a Mutex<T>) -> CondVarFuture<'a, T> {
         CondVarFuture::new(self, mutex)
     }
 }
@@ -515,12 +515,12 @@ impl CondVarV2 {
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::condvar_v2::condvar;
+/// use neon_rtos2::sync::condvar::condvar;
 ///
 /// let cv = condvar();
 /// ```
-pub fn condvar() -> CondVarV2 {
-    CondVarV2::new()
+pub fn condvar() -> CondVar {
+    CondVar::new()
 }
 
 /// 创建配对的互斥锁和条件变量
@@ -531,11 +531,11 @@ pub fn condvar() -> CondVarV2 {
 /// - `data`: 互斥锁保护的数据
 ///
 /// # 返回值
-/// 返回 `(MutexV2<T>, CondVarV2)` 元组
+/// 返回 `(Mutex<T>, CondVar)` 元组
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::condvar_v2::mutex_condvar_pair;
+/// use neon_rtos2::sync::condvar::mutex_condvar_pair;
 ///
 /// let (mutex, condvar) = mutex_condvar_pair(0i32);
 ///
@@ -545,8 +545,8 @@ pub fn condvar() -> CondVarV2 {
 ///     guard = condvar.wait(guard).unwrap();
 /// }
 /// ```
-pub fn mutex_condvar_pair<T>(data: T) -> (MutexV2<T>, CondVarV2) {
-    (MutexV2::new(data), CondVarV2::new())
+pub fn mutex_condvar_pair<T>(data: T) -> (Mutex<T>, CondVar) {
+    (Mutex::new(data), CondVar::new())
 }
 
 #[cfg(test)]
@@ -562,7 +562,7 @@ mod tests {
         crate::kernel::task::Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let condvar = CondVarV2::new();
+        let condvar = CondVar::new();
         
         assert!(!condvar.is_closed());
         assert_eq!(condvar.waiter_count(), 0);
@@ -575,7 +575,7 @@ mod tests {
         crate::kernel::task::Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let condvar1 = CondVarV2::new();
+        let condvar1 = CondVar::new();
         let condvar2 = condvar1.clone();
         
         assert_eq!(condvar1.id(), condvar2.id());
@@ -588,7 +588,7 @@ mod tests {
         crate::kernel::task::Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let condvar = CondVarV2::new();
+        let condvar = CondVar::new();
         
         // 没有��待者时 notify 不应该出错
         condvar.notify_one();
@@ -602,7 +602,7 @@ mod tests {
         crate::kernel::task::Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let condvar = CondVarV2::new();
+        let condvar = CondVar::new();
         
         assert!(!condvar.is_closed());
         condvar.close();
@@ -616,10 +616,10 @@ mod tests {
         crate::kernel::task::Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let condvar = CondVarV2::new();
+        let condvar = CondVar::new();
         
         let debug_str = format!("{:?}", condvar);
-        assert!(debug_str.contains("CondVarV2"));
+        assert!(debug_str.contains("CondVar"));
         assert!(debug_str.contains("waiters"));
         assert!(debug_str.contains("closed"));
     }

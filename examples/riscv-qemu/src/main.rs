@@ -8,10 +8,23 @@
 //! - 内核初始化
 //! - Builder 模式创建任务
 //! - 任务优先级设置
-//! - 信号量同步
+//! - **同步原语**（支持闭包传递，无需全局变量）
+//!   - Signal: 信号量
+//!   - Mutex: 互斥锁（RAII 风格）
 //! - 任务迭代器
 //! - 延时功能
 //! - 日志系统（使用 `info!`, `debug!` 等宏）
+//!
+//! # 同步原语的优势
+//!
+//! 基于 Arc 的设计，可以在局部创建并通过闭包传递：
+//! ```rust,ignore
+//! let signal = Signal::new();  // 局部创建
+//! let signal_clone = signal.clone();
+//! Task::builder("task").spawn(move |_| {
+//!     signal_clone.wait().unwrap();  // 通过闭包捕获
+//! });
+//! ```
 //!
 //! # 运行方式
 //!
@@ -36,7 +49,9 @@ use core::panic::PanicInfo;
 
 // 导入 RTOS 功能
 use neon_rtos2::prelude::*;
-use neon_rtos2::{info, debug, warn, error, trace, define_signal};
+// 导入同步原语（支持闭包传递）
+use neon_rtos2::sync::{Signal, Mutex};
+use neon_rtos2::{info, debug, error, trace};
 
 // ============================================================================
 // 用户配置：日志输出
@@ -54,138 +69,6 @@ const UART_BASE_ADDR: usize = 0x1000_0000;
 static UART_OUTPUT: UartOutput<UART_BASE_ADDR> = UartOutput::new();
 
 // ============================================================================
-// 信号量定义
-// ============================================================================
-
-/// 任务同步信号量
-define_signal!(TASK_SYNC);
-
-/// 数据就绪信号量
-define_signal!(DATA_READY);
-
-// ============================================================================
-// 任务函数
-// ============================================================================
-
-/// 传感器任务 - 高优先级
-/// 
-/// 模拟传感器数据采集，周期性发送数据就绪信号
-fn sensor_task(_: usize) {
-    info!("Sensor task started (High Priority)");
-    let mut reading = 0u32;
-    
-    loop {
-        // 模拟传感器读取
-        reading = reading.wrapping_add(1);
-        
-        debug!("Sensor: Reading #{} - sending DATA_READY signal", reading);
-        
-        // 发送数据就绪信号
-        DATA_READY().send();
-        
-        // 延时 2 秒
-        Delay::delay(2000).unwrap();
-    }
-}
-
-/// 处理器任务 - 普通优先级
-/// 
-/// 等待传感器数据，处理后发送同步信号
-fn processor_task(_: usize) {
-    info!("Processor task started (Normal Priority)");
-    let mut processed = 0u32;
-    
-    loop {
-        // 等待数据就绪
-        debug!("Processor: Waiting for data...");
-        DATA_READY().wait();
-        
-        processed = processed.wrapping_add(1);
-        info!("Processor: Got data! Processed count: {}", processed);
-        
-        // 处理完成，发送同步信号
-        TASK_SYNC().send();
-    }
-}
-
-/// 日志任务 - 普通优先级
-/// 
-/// 等待处理完成信号，记录日志
-fn logger_task(_: usize) {
-    info!("Logger task started (Normal Priority)");
-    let mut log_count = 0u32;
-    
-    loop {
-        // 等待同步信号
-        TASK_SYNC().wait();
-        
-        log_count = log_count.wrapping_add(1);
-        info!("Logger: Log entry #{} - Data processing completed", log_count);
-    }
-}
-
-/// 监控任务 - 低优先级
-/// 
-/// 周期性监控系统状态，展示任务迭代器的使用
-fn monitor_task(_: usize) {
-    info!("Monitor task started (Low Priority)");
-    let mut tick = 0u32;
-    
-    loop {
-        tick = tick.wrapping_add(1);
-        
-        info!("");
-        info!("========== System Monitor (tick {}) ==========", tick);
-        
-        // 使用迭代器统计任务状态
-        let total = Task::iter().count();
-        let ready = Task::ready_tasks().count();
-        let blocked = Task::blocked_tasks().count();
-        
-        info!("Total tasks: {}", total);
-        info!("Ready tasks: {}", ready);
-        info!("Blocked tasks: {}", blocked);
-        
-        // 遍历所有任务并显示状态
-        info!("Task list:");
-        Task::iter().for_each(|task| {
-            let state_str = match task.get_state() {
-                TaskState::Uninit => "Uninit",
-                TaskState::Ready => "Ready",
-                TaskState::Running => "Running",
-                TaskState::Blocked(_) => "Blocked",
-            };
-            debug!("  - {} (ID: {}, State: {})", 
-                   task.get_name(), 
-                   task.get_taskid(),
-                   state_str);
-        });
-        
-        info!("==========================================");
-        info!("");
-        
-        // 延时 5 秒
-        Delay::delay(5000).unwrap();
-    }
-}
-
-/// 心跳任务 - 最低优先级
-/// 
-/// 简单的心跳指示，证明系统在运行
-fn heartbeat_task(_: usize) {
-    info!("Heartbeat task started (Idle Priority)");
-    let mut beat = 0u32;
-    
-    loop {
-        beat = beat.wrapping_add(1);
-        trace!("Heartbeat: {}", beat);
-        
-        // 延时 3 秒
-        Delay::delay(3000).unwrap();
-    }
-}
-
-// ============================================================================
 // 主函数
 // ============================================================================
 
@@ -194,11 +77,7 @@ fn main() -> ! {
     // ========================================
     // 1. 配置日志输出（必须最先执行！）
     // ========================================
-    // 用户在这里指定日志输出方式
-    // 可以是 UART、RTT、或其他���定义实现
     set_log_output(&UART_OUTPUT);
-    
-    // 设置日志级别
     set_log_level(LogLevel::Debug);
     
     // ========================================
@@ -216,7 +95,8 @@ fn main() -> ! {
     info!("  - Kernel initialization");
     info!("  - Task creation with Builder pattern");
     info!("  - Task priorities");
-    info!("  - Signal synchronization");
+    info!("  - Signal synchronization (Arc-based, no globals!)");
+    info!("  - Mutex for shared data protection");
     info!("  - Task iterators");
     info!("  - Delay functionality");
     info!("  - Log system (info!, debug!, etc.)");
@@ -225,46 +105,164 @@ fn main() -> ! {
     info!("Kernel initialized successfully!");
     info!("");
     
-    // 创建任务 - 使用 Builder 模式（推荐方式）
-    info!("Creating tasks with Builder pattern...");
+    // ========================================
+    // 3. 创建同步原语（局部变量，无需全局！）
+    // ========================================
+    info!("Creating sync primitives (local, no globals!)...");
     
-    // 高优先级传感器任务
+    // Signal: 数据就绪信号
+    let data_ready = Signal::new();
+    info!("  Created: Signal for data ready notification");
+    
+    // Signal: 任务同步信号
+    let task_sync = Signal::new();
+    info!("  Created: Signal for task synchronization");
+    
+    // Mutex: 保护共享计数器
+    let counter = Mutex::new(0u32);
+    info!("  Created: Mutex<u32> for shared counter");
+    
+    info!("");
+    
+    // ========================================
+    // 4. 创建任务 - 使用闭包捕获同步原语
+    // ========================================
+    info!("Creating tasks with sync primitives...");
+    
+    // ----- 传感器任务 - 高优先级 -----
+    let data_ready_sender = data_ready.clone();
+    let counter_sensor = counter.clone();
     Task::builder("sensor")
         .priority(Priority::High)
-        .spawn(sensor_task)
+        .spawn(move |_| {
+            info!("[Sensor] Started (High Priority) with Signal + Mutex");
+            
+            loop {
+                // 使用 Mutex 保护共享数据
+                {
+                    let mut guard = counter_sensor.lock().unwrap();
+                    *guard += 1;
+                    debug!("[Sensor] Reading #{} - sending data ready signal", *guard);
+                } // guard 离开作用域，自动释放锁
+                
+                // 发送数据就绪信号
+                data_ready_sender.send();
+                
+                // 延时 2 秒
+                Delay::delay(2000).unwrap();
+            }
+        })
         .expect("Failed to create sensor task");
-    info!("  Created: sensor (High Priority)");
+    info!("  Created: sensor (High Priority) - uses Signal + Mutex");
     
-    // 普通优先级处理器任务
+    // ----- 处理器任务 - 普通优先级 -----
+    let data_ready_receiver = data_ready.clone();
+    let task_sync_sender = task_sync.clone();
+    let counter_processor = counter.clone();
     Task::builder("processor")
         .priority(Priority::Normal)
-        .spawn(processor_task)
+        .spawn(move |_| {
+            info!("[Processor] Started (Normal Priority)");
+            
+            loop {
+                // 等待数据就绪
+                debug!("[Processor] Waiting for data...");
+                if data_ready_receiver.wait().is_ok() {
+                    // 读取共享数据
+                    let value = {
+                        let guard = counter_processor.lock().unwrap();
+                        *guard
+                    };
+                    info!("[Processor] Got data! Processed reading #{}", value);
+                    
+                    // 处理完成，发送同步信号
+                    task_sync_sender.send();
+                }
+            }
+        })
         .expect("Failed to create processor task");
-    info!("  Created: processor (Normal Priority)");
+    info!("  Created: processor (Normal Priority) - waits on Signal");
     
-    // 普通优先级日志任务
+    // ----- 日志任务 - 普通优先级 -----
+    let task_sync_receiver = task_sync.clone();
     Task::builder("logger")
         .priority(Priority::Normal)
-        .spawn(logger_task)
+        .spawn(move |_| {
+            info!("[Logger] Started (Normal Priority)");
+            let mut log_count = 0u32;
+            
+            loop {
+                // 等待同步信号
+                if task_sync_receiver.wait().is_ok() {
+                    log_count += 1;
+                    info!("[Logger] Log entry #{} - Data processing completed", log_count);
+                }
+            }
+        })
         .expect("Failed to create logger task");
-    info!("  Created: logger (Normal Priority)");
+    info!("  Created: logger (Normal Priority) - waits on Signal");
     
-    // 低优先级监控任务
+    // ----- 监控任务 - 低优先级 -----
     Task::builder("monitor")
         .priority(Priority::Low)
-        .spawn(monitor_task)
+        .spawn(|_| {
+            info!("[Monitor] Started (Low Priority)");
+            let mut tick = 0u32;
+            
+            loop {
+                tick += 1;
+                
+                info!("");
+                info!("========== System Monitor (tick {}) ==========", tick);
+                
+                // 使用迭代器统计任务状态
+                let total = Task::iter().count();
+                let ready = Task::ready_tasks().count();
+                let blocked = Task::blocked_tasks().count();
+                
+                info!("Tasks: total={}, ready={}, blocked={}", total, ready, blocked);
+                
+                // 遍历所有任务并显示状态
+                Task::iter().for_each(|task| {
+                    let state_str = match task.get_state() {
+                        TaskState::Uninit => "Uninit",
+                        TaskState::Ready => "Ready",
+                        TaskState::Running => "Running",
+                        TaskState::Blocked(_) => "Blocked",
+                    };
+                    debug!("  {} [{}]", task.get_name(), state_str);
+                });
+                
+                info!("==========================================");
+                info!("");
+                
+                // 延时 5 秒
+                Delay::delay(5000).unwrap();
+            }
+        })
         .expect("Failed to create monitor task");
     info!("  Created: monitor (Low Priority)");
     
-    // 空闲优先级心跳任务
+    // ----- 心跳任务 - 最低优先级 -----
     Task::builder("heartbeat")
         .priority(Priority::Idle)
-        .spawn(heartbeat_task)
+        .spawn(|_| {
+            info!("[Heartbeat] Started (Idle Priority)");
+            let mut beat = 0u32;
+            
+            loop {
+                beat += 1;
+                trace!("Heartbeat: {}", beat);
+                
+                // 延时 3 秒
+                Delay::delay(3000).unwrap();
+            }
+        })
         .expect("Failed to create heartbeat task");
     info!("  Created: heartbeat (Idle Priority)");
     
     info!("");
-    info!("All tasks created successfully!");
+    info!("All {} tasks created successfully!", Task::iter().count());
     info!("Starting scheduler...");
     info!("");
     info!("================================================");

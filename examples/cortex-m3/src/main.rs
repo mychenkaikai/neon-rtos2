@@ -4,24 +4,19 @@
 //! - **用户配置日志输出**（可选半主机或 UART）
 //! - Builder 模式创建任务
 //! - 任务优先级设置
-//! - **V2 同步原语**（支持闭包传递，无需全局变量）
-//!   - SignalV2: 信号量
-//!   - MutexV2: 互斥锁（RAII 风格）
-//!   - SemaphoreV2: 计数信号量
+//! - **同步原语**（支持闭包传递，无需全局变量）
+//!   - Signal: 信号量
+//!   - Mutex: 互斥锁（RAII 风格）
+//!   - Semaphore: 计数信号量
 //! - 定时器
 //! - 任务迭代器
 //! - 错误处理最佳实践
 //!
-//! # V2 同步原语的优势
+//! # 同步原语的优势
 //!
-//! 传统方式需要使用全局变量或宏：
+//! 基于 Arc 的设计，可以在局部创建并通过闭包传递：
 //! ```rust,ignore
-//! define_signal!(MY_SIGNAL);  // 必须是全局的
-//! ```
-//!
-//! V2 版本可以在局部创建并通过闭包传递：
-//! ```rust,ignore
-//! let signal = SignalV2::new();  // 局部创建
+//! let signal = Signal::new();  // 局部创建
 //! let signal_clone = signal.clone();
 //! Task::builder("task").spawn(move |_| {
 //!     signal_clone.wait().unwrap();  // 通过闭包捕获
@@ -52,8 +47,8 @@ use cortex_m_rt::entry;
 
 // 导入 RTOS prelude - 包含所有常用类型
 use neon_rtos2::prelude::*;
-// 导入 V2 同步原语（支持闭包传递）
-use neon_rtos2::sync::{SignalV2, MutexV2, SemaphoreV2, signal_pair};
+// 导入同步原语（支持闭包传递）
+use neon_rtos2::sync::{Signal, Mutex, Semaphore, signal_pair};
 use neon_rtos2::{debug, error, info, trace};
 
 // ============================================================================
@@ -115,13 +110,13 @@ fn main() -> ! {
     kernel_init();
     
     info!("================================================");
-    info!("    Neon-RTOS2 V2 Sync Primitives Example");
+    info!("    Neon-RTOS2 Sync Primitives Example");
     info!("================================================");
     info!("");
-    info!("This example demonstrates V2 sync primitives:");
-    info!("  - SignalV2: closures can capture and pass");
-    info!("  - MutexV2: RAII style mutex with guards");
-    info!("  - SemaphoreV2: counting semaphore");
+    info!("This example demonstrates sync primitives:");
+    info!("  - Signal: closures can capture and pass");
+    info!("  - Mutex: RAII style mutex with guards");
+    info!("  - Semaphore: counting semaphore");
     info!("  - signal_pair(): sender/receiver pattern");
     info!("");
     
@@ -139,48 +134,48 @@ fn main() -> ! {
     info!("");
     
     // ========================================
-    // 4. 创建 V2 同步原语（局部变量，无需全局！）
+    // 4. 创建同步原语（局部变量，无需全局！）
     // ========================================
-    info!("Creating V2 sync primitives (local, no globals!)...");
+    info!("Creating sync primitives (local, no globals!)...");
     
-    // SignalV2: 生产者-消费者信号
-    let producer_signal = SignalV2::new();
+    // Signal: 生产者-消费者信号
+    let producer_signal = Signal::new();
     let consumer_signal = producer_signal.clone();  // clone 共享同一个信号
-    info!("  Created: SignalV2 for producer-consumer");
+    info!("  Created: Signal for producer-consumer");
     
-    // MutexV2: 保护共享计数器
-    let counter_mutex = MutexV2::new(0u32);
+    // Mutex: 保护共享计数器
+    let counter_mutex = Mutex::new(0u32);
     let counter_mutex_clone = counter_mutex.clone();
-    info!("  Created: MutexV2<u32> for shared counter");
+    info!("  Created: Mutex<u32> for shared counter");
     
     // signal_pair(): 更清晰的发送/接收语义
     let (pair_sender, pair_receiver) = signal_pair();
     info!("  Created: signal_pair() for sender/receiver pattern");
     
-    // SemaphoreV2: 限制并发访问（最多 2 个任务同时工作）
-    let work_semaphore = SemaphoreV2::new(2);
+    // Semaphore: 限制并发访问（最多 2 个任务同时工作）
+    let work_semaphore = Semaphore::new(2);
     let work_sem_1 = work_semaphore.clone();
     let work_sem_2 = work_semaphore.clone();
     let work_sem_3 = work_semaphore.clone();
-    info!("  Created: SemaphoreV2(2) for resource pool");
+    info!("  Created: Semaphore(2) for resource pool");
     
     info!("");
     
     // ========================================
-    // 5. 创建任务 - 使用闭包捕获 V2 同步原语
+    // 5. 创建任务 - 使用闭包捕获同步原语
     // ========================================
-    info!("Creating tasks with V2 sync primitives...");
+    info!("Creating tasks with sync primitives...");
     
     // ----- 生产者任务 -----
-    // 使用 SignalV2 和 MutexV2，通过 move 闭包捕获
+    // 使用 Signal 和 Mutex，通过 move 闭包捕获
     let producer_counter = counter_mutex.clone();
     Task::builder("producer")
         .priority(Priority::High)
         .spawn(move |_| {
-            info!("[Producer] Started with SignalV2 + MutexV2");
+            info!("[Producer] Started with Signal + Mutex");
             
             loop {
-                // 使用 MutexV2 保护共享数据
+                // 使用 Mutex 保护共享数据
                 {
                     let mut guard = producer_counter.lock().unwrap();
                     *guard += 1;
@@ -194,13 +189,13 @@ fn main() -> ! {
             }
         })
         .expect("Failed to create producer task");
-    info!("  Created: producer (High Priority) - uses SignalV2 + MutexV2");
+    info!("  Created: producer (High Priority) - uses Signal + Mutex");
     
     // ----- 消费者任务 -----
     Task::builder("consumer")
         .priority(Priority::Normal)
         .spawn(move |_| {
-            info!("[Consumer] Started, waiting for SignalV2...");
+            info!("[Consumer] Started, waiting for Signal...");
             
             loop {
                 // 等待生产者信号
@@ -215,7 +210,7 @@ fn main() -> ! {
             }
         })
         .expect("Failed to create consumer task");
-    info!("  Created: consumer (Normal Priority) - waits on SignalV2");
+    info!("  Created: consumer (Normal Priority) - waits on Signal");
     
     // ----- signal_pair 发送者任务 -----
     Task::builder("pair_tx")
@@ -251,11 +246,11 @@ fn main() -> ! {
         .expect("Failed to create pair_rx task");
     info!("  Created: pair_rx (Normal Priority) - uses SignalReceiver");
     
-    // ----- SemaphoreV2 工作者任务 1 -----
+    // ----- Semaphore 工作者任务 1 -----
     Task::builder("worker1")
         .priority(Priority::Low)
         .spawn(move |_| {
-            info!("[Worker1] Started, using SemaphoreV2");
+            info!("[Worker1] Started, using Semaphore");
             
             loop {
                 debug!("[Worker1] Waiting for permit...");
@@ -269,13 +264,13 @@ fn main() -> ! {
             }
         })
         .expect("Failed to create worker1 task");
-    info!("  Created: worker1 (Low Priority) - uses SemaphoreV2");
+    info!("  Created: worker1 (Low Priority) - uses Semaphore");
     
-    // ----- SemaphoreV2 工作者任务 2 -----
+    // ----- Semaphore 工作者任务 2 -----
     Task::builder("worker2")
         .priority(Priority::Low)
         .spawn(move |_| {
-            info!("[Worker2] Started, using SemaphoreV2");
+            info!("[Worker2] Started, using Semaphore");
             
             loop {
                 debug!("[Worker2] Waiting for permit...");
@@ -289,13 +284,13 @@ fn main() -> ! {
             }
         })
         .expect("Failed to create worker2 task");
-    info!("  Created: worker2 (Low Priority) - uses SemaphoreV2");
+    info!("  Created: worker2 (Low Priority) - uses Semaphore");
     
-    // ----- SemaphoreV2 工作者任务 3 -----
+    // ----- Semaphore 工作者任务 3 -----
     Task::builder("worker3")
         .priority(Priority::Low)
         .spawn(move |_| {
-            info!("[Worker3] Started, using SemaphoreV2");
+            info!("[Worker3] Started, using Semaphore");
             
             loop {
                 debug!("[Worker3] Waiting for permit...");
@@ -318,7 +313,7 @@ fn main() -> ! {
             }
         })
         .expect("Failed to create worker3 task");
-    info!("  Created: worker3 (Low Priority) - uses SemaphoreV2::try_acquire");
+    info!("  Created: worker3 (Low Priority) - uses Semaphore::try_acquire");
     
     // ----- 监控任务 -----
     Task::builder("monitor")

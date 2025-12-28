@@ -1,7 +1,7 @@
-//! # Semaphore V2 - 支持闭包传递的计数信号量
+//! # Semaphore - 支持闭包传递的计数信号量
 //!
 //! 基于 Arc 的计数信号量实现，无需全局变量，可以通过闭包传递。
-//! 与 SignalV2 不同，SemaphoreV2 支持设置最大计数限制。
+//! 与 Signal 不同，Semaphore 支持设置最大计数限制。
 //!
 //! ## 设计思路
 //!
@@ -11,12 +11,12 @@
 //! ## 使用示例
 //!
 //! ```rust,no_run
-//! use neon_rtos2::sync::SemaphoreV2;
+//! use neon_rtos2::sync::Semaphore;
 //! use neon_rtos2::kernel::task::Task;
 //!
 //! fn main() {
 //!     // 创建一个最多允许 3 个任务同时访问的信号量
-//!     let sem = SemaphoreV2::new(3);
+//!     let sem = Semaphore::new(3);
 //!     
 //!     for i in 0..5 {
 //!         let sem_clone = sem.clone();
@@ -38,7 +38,7 @@ use crate::kernel::task::{Task, TaskState};
 use crate::kernel::time::systick::Systick;
 use crate::hal::trigger_schedule;
 use crate::error::{Result, RtosError};
-use crate::sync::signal_v2::WaiterList;
+use crate::sync::signal::WaiterList;
 use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use core::task::Waker;
 use spin::Mutex;
@@ -76,10 +76,10 @@ impl SemaphoreInner {
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::SemaphoreV2;
+/// use neon_rtos2::sync::Semaphore;
 ///
 /// // 创建一个有 3 个许可的信号量
-/// let sem = SemaphoreV2::new(3);
+/// let sem = Semaphore::new(3);
 ///
 /// // 获取许可
 /// sem.acquire().unwrap();
@@ -88,11 +88,11 @@ impl SemaphoreInner {
 /// sem.release();
 /// ```
 #[derive(Clone)]
-pub struct SemaphoreV2 {
+pub struct Semaphore {
     inner: Arc<SemaphoreInner>,
 }
 
-impl SemaphoreV2 {
+impl Semaphore {
     /// 创建新的计数信号量
     ///
     /// # 参数
@@ -100,9 +100,9 @@ impl SemaphoreV2 {
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::SemaphoreV2;
+    /// use neon_rtos2::sync::Semaphore;
     ///
-    /// let sem = SemaphoreV2::new(5); // 5 个初始许可
+    /// let sem = Semaphore::new(5); // 5 个初始许可
     /// ```
     pub fn new(initial_permits: usize) -> Self {
         Self {
@@ -118,10 +118,10 @@ impl SemaphoreV2 {
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::SemaphoreV2;
+    /// use neon_rtos2::sync::Semaphore;
     ///
     /// // 初始 3 个许可，最多 5 个
-    /// let sem = SemaphoreV2::with_max(3, 5);
+    /// let sem = Semaphore::with_max(3, 5);
     /// ```
     pub fn with_max(initial_permits: usize, max_permits: usize) -> Self {
         let permits = initial_permits.min(max_permits);
@@ -140,8 +140,8 @@ impl SemaphoreV2 {
     ///
     /// # 示例
     /// ```rust,no_run
-    /// # use neon_rtos2::sync::SemaphoreV2;
-    /// let sem = SemaphoreV2::new(1);
+    /// # use neon_rtos2::sync::Semaphore;
+    /// let sem = Semaphore::new(1);
     /// sem.acquire().unwrap();
     /// // 使用资源...
     /// sem.release();
@@ -421,15 +421,15 @@ impl SemaphoreV2 {
     }
 }
 
-impl Default for SemaphoreV2 {
+impl Default for Semaphore {
     fn default() -> Self {
         Self::new(1)
     }
 }
 
-impl core::fmt::Debug for SemaphoreV2 {
+impl core::fmt::Debug for Semaphore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SemaphoreV2")
+        f.debug_struct("Semaphore")
             .field("id", &self.id())
             .field("permits", &self.available_permits())
             .field("max_permits", &self.max_permits())
@@ -450,16 +450,16 @@ impl core::fmt::Debug for SemaphoreV2 {
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::SemaphoreV2;
+/// use neon_rtos2::sync::Semaphore;
 ///
-/// let sem = SemaphoreV2::new(1);
+/// let sem = Semaphore::new(1);
 /// {
 ///     let _permit = sem.acquire_permit().unwrap();
 ///     // 使用资源...
 /// } // 自动释放许可
 /// ```
 pub struct SemaphorePermit<'a> {
-    semaphore: &'a SemaphoreV2,
+    semaphore: &'a Semaphore,
     permits: usize,
 }
 
@@ -497,9 +497,9 @@ impl core::fmt::Debug for SemaphorePermit<'_> {
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::SemaphoreV2;
+/// use neon_rtos2::sync::Semaphore;
 ///
-/// let sem = SemaphoreV2::new(3);
+/// let sem = Semaphore::new(3);
 /// let permit = sem.acquire_owned().unwrap();
 /// 
 /// // permit 可以被存储或移动
@@ -603,7 +603,7 @@ impl core::fmt::Debug for OwnedSemaphorePermit {
     }
 }
 
-impl SemaphoreV2 {
+impl Semaphore {
     /// 获取一个拥有所有权的许可
     ///
     /// 返回的 `OwnedSemaphorePermit` 可以被 move 到其他地方。
@@ -677,8 +677,8 @@ impl SemaphoreV2 {
 ///
 /// let sem = semaphore(5);
 /// ```
-pub fn semaphore(permits: usize) -> SemaphoreV2 {
-    SemaphoreV2::new(permits)
+pub fn semaphore(permits: usize) -> Semaphore {
+    Semaphore::new(permits)
 }
 
 /// 创建一个带最大限制的计数信号量
@@ -693,8 +693,8 @@ pub fn semaphore(permits: usize) -> SemaphoreV2 {
 ///
 /// let sem = semaphore_with_max(3, 5);
 /// ```
-pub fn semaphore_with_max(initial: usize, max: usize) -> SemaphoreV2 {
-    SemaphoreV2::with_max(initial, max)
+pub fn semaphore_with_max(initial: usize, max: usize) -> Semaphore {
+    Semaphore::with_max(initial, max)
 }
 
 /// 创建一个二值信号量（互斥信号量）
@@ -713,11 +713,11 @@ pub fn semaphore_with_max(initial: usize, max: usize) -> SemaphoreV2 {
 /// // 现在不可用
 /// sem.release().unwrap();
 /// ```
-pub fn binary_semaphore(available: bool) -> SemaphoreV2 {
-    SemaphoreV2::with_max(if available { 1 } else { 0 }, 1)
+pub fn binary_semaphore(available: bool) -> Semaphore {
+    Semaphore::with_max(if available { 1 } else { 0 }, 1)
 }
 
-impl SemaphoreV2 {
+impl Semaphore {
     /// 获取一个 RAII 风格的许可
     ///
     /// 返回的 `SemaphorePermit` 在 drop 时会自动释放许可。
@@ -770,13 +770,13 @@ impl SemaphoreV2 {
 
 /// 异步获取许可的 Future
 pub struct SemaphoreAcquireFuture<'a> {
-    semaphore: &'a SemaphoreV2,
+    semaphore: &'a Semaphore,
     permits: usize,
     registered: bool,
 }
 
 impl<'a> SemaphoreAcquireFuture<'a> {
-    fn new(semaphore: &'a SemaphoreV2, permits: usize) -> Self {
+    fn new(semaphore: &'a Semaphore, permits: usize) -> Self {
         Self {
             semaphore,
             permits,
@@ -819,7 +819,7 @@ impl<'a> core::future::Future for SemaphoreAcquireFuture<'a> {
     }
 }
 
-impl SemaphoreV2 {
+impl Semaphore {
     /// 异步获取一个许可
     pub fn acquire_async(&self) -> SemaphoreAcquireFuture<'_> {
         SemaphoreAcquireFuture::new(self, 1)
@@ -845,7 +845,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(3);
+        let sem = Semaphore::new(3);
         
         assert_eq!(sem.available_permits(), 3);
         
@@ -877,7 +877,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::with_max(2, 3);
+        let sem = Semaphore::with_max(2, 3);
         
         assert_eq!(sem.available_permits(), 2);
         assert_eq!(sem.max_permits(), 3);
@@ -897,7 +897,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem1 = SemaphoreV2::new(2);
+        let sem1 = Semaphore::new(2);
         let sem2 = sem1.clone();
         
         assert_eq!(sem1.id(), sem2.id());
@@ -916,7 +916,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(1);
+        let sem = Semaphore::new(1);
         
         {
             let _permit = sem.acquire_permit().unwrap();
@@ -933,7 +933,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(1);
+        let sem = Semaphore::new(1);
         
         sem.close();
         assert!(sem.is_closed());
@@ -948,7 +948,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(5);
+        let sem = Semaphore::new(5);
         
         assert!(sem.try_acquire_many(3).unwrap());
         assert_eq!(sem.available_permits(), 2);
@@ -966,7 +966,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(3);
+        let sem = Semaphore::new(3);
         
         // 获取 owned permit
         let permit = sem.acquire_owned().unwrap();
@@ -984,7 +984,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(5);
+        let sem = Semaphore::new(5);
         
         let permit = sem.acquire_many_owned(3).unwrap();
         assert_eq!(sem.available_permits(), 2);
@@ -1001,7 +1001,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(5);
+        let sem = Semaphore::new(5);
         
         let mut permit1 = sem.acquire_many_owned(2).unwrap();
         let permit2 = sem.acquire_many_owned(2).unwrap();
@@ -1025,7 +1025,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(5);
+        let sem = Semaphore::new(5);
         
         let mut permit = sem.acquire_many_owned(4).unwrap();
         assert_eq!(sem.available_permits(), 1);
@@ -1051,7 +1051,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(3);
+        let sem = Semaphore::new(3);
         
         let permit = sem.acquire_owned().unwrap();
         assert_eq!(sem.available_permits(), 2);
@@ -1068,7 +1068,7 @@ mod tests {
         Task::new("test", |_| {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
         
-        let sem = SemaphoreV2::new(1);
+        let sem = Semaphore::new(1);
         
         // 第一次应该成功
         let permit = sem.try_acquire_owned().unwrap();
