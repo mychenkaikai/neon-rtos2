@@ -484,11 +484,6 @@ impl<T> MutexV2<T> {
         self.inner.poisoned.load(Ordering::Acquire)
     }
 
-    /// 获取等待者数量
-    pub fn waiter_count(&self) -> usize {
-        self.inner.waiters.lock().len()
-    }
-
     /// 获取互斥锁的唯一标识（用于调试）
     pub fn id(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize
@@ -815,16 +810,9 @@ impl<T> MutexV2<T> {
     /// use neon_rtos2::sync::MutexV2;
     ///
     /// let mutex = MutexV2::new(42);
-    /// let guard = mutex.lock_owned().unwrap();
+    /// let guard = mutex.lock_owned_guard().unwrap();
     /// // guard 可以被存储在结构体中
     /// ```
-    pub fn lock_owned(self: &Arc<MutexInner<T>>) -> Result<OwnedMutexGuard<T>> 
-    where
-        T: Send,
-    {
-        // 这个方法需要通过 Arc 调用，我们提供一个便捷方法
-        unimplemented!("Use MutexV2::lock_owned_from instead")
-    }
 
     /// 从 MutexV2 获取拥有所有权的锁守卫
     pub fn lock_owned_guard(&self) -> Result<OwnedMutexGuard<T>> {

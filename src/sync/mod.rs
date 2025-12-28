@@ -94,18 +94,6 @@ pub use condvar_v2::{
     CondVarFuture,
 };
 
-// Barrier V2
-pub use barrier_v2::{
-    BarrierV2,
-    BarrierWaitResult,
-};
-
-// Once V2
-pub use once_v2::{
-    OnceV2,
-    OnceState,
-};
-
 // ============================================================================
 // 便捷函数导出
 // ============================================================================
@@ -133,8 +121,6 @@ pub mod prelude {
     pub use super::MutexGuardV2;
     pub use super::SemaphoreV2;
     pub use super::CondVarV2;
-    pub use super::BarrierV2;
-    pub use super::OnceV2;
     pub use super::RwLockV2;
     
     // 便捷函数

@@ -954,8 +954,10 @@ impl core::future::Future for OwnedSignalFuture {
 
         // 没有信号，注册 waker
         if !self.registered {
-            let mut async_waiters = self.inner.async_waiters.lock();
-            async_waiters.push_back(cx.waker().clone());
+            {
+                let mut async_waiters = self.inner.async_waiters.lock();
+                async_waiters.push_back(cx.waker().clone());
+            }
             self.registered = true;
         }
 
@@ -1013,8 +1015,10 @@ impl core::future::Future for OwnedSignalTimeoutFuture {
 
         // 没有信号，注册 waker
         if !self.registered {
-            let mut async_waiters = self.inner.async_waiters.lock();
-            async_waiters.push_back(cx.waker().clone());
+            {
+                let mut async_waiters = self.inner.async_waiters.lock();
+                async_waiters.push_back(cx.waker().clone());
+            }
             self.registered = true;
         }
 
