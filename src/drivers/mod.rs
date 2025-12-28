@@ -110,6 +110,7 @@
 
 pub mod traits;
 pub mod macros;
+pub mod examples;
 
 // 重新导出常用类型
 pub use traits::{
