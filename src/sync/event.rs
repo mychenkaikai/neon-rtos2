@@ -10,6 +10,9 @@ pub enum Event {
     Network(usize),
     Mutex(usize),
     Mq(usize),
+    CondVar(usize),
+    Barrier(usize),
+    Once(usize),
 }
 
 impl Event {
