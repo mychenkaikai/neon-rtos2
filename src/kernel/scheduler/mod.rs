@@ -9,37 +9,47 @@ const PRIORITY_COUNT: usize = 5;
 
 /// 就绪队列 - 每个优先级一个队列
 /// 
-/// 使用环形缓冲区实现 FIFO 队列，支持 O(1) 的入队和出队操作
+/// 使用双向链表实现 FIFO 队列，支持 O(1) 的入队、出队和任意节点删除操作
 #[derive(Debug)]
 struct ReadyQueue {
-    /// 任务 ID 数组
-    tasks: [usize; MAX_TASKS],
-    /// 队列头部索引
     head: usize,
-    /// 队列尾部索引
     tail: usize,
-    /// 队列中的任务数量
     count: usize,
+    prev: [usize; MAX_TASKS],
+    next: [usize; MAX_TASKS],
+    in_queue: [bool; MAX_TASKS],
 }
 
 impl ReadyQueue {
     const fn new() -> Self {
         Self {
-            tasks: [0; MAX_TASKS],
-            head: 0,
-            tail: 0,
+            head: usize::MAX,
+            tail: usize::MAX,
             count: 0,
+            prev: [usize::MAX; MAX_TASKS],
+            next: [usize::MAX; MAX_TASKS],
+            in_queue: [false; MAX_TASKS],
         }
     }
     
     /// 入队 - O(1)
     #[inline]
     fn push(&mut self, task_id: usize) -> bool {
-        if self.count >= MAX_TASKS {
+        if task_id >= MAX_TASKS || self.in_queue[task_id] {
             return false;
         }
-        self.tasks[self.tail] = task_id;
-        self.tail = (self.tail + 1) % MAX_TASKS;
+        
+        self.in_queue[task_id] = true;
+        self.next[task_id] = usize::MAX;
+        
+        if self.head == usize::MAX {
+            self.head = task_id;
+            self.prev[task_id] = usize::MAX;
+        } else {
+            self.next[self.tail] = task_id;
+            self.prev[task_id] = self.tail;
+        }
+        self.tail = task_id;
         self.count += 1;
         true
     }
@@ -47,11 +57,20 @@ impl ReadyQueue {
     /// 出队 - O(1)
     #[inline]
     fn pop(&mut self) -> Option<usize> {
-        if self.count == 0 {
+        if self.head == usize::MAX {
             return None;
         }
-        let task_id = self.tasks[self.head];
-        self.head = (self.head + 1) % MAX_TASKS;
+        
+        let task_id = self.head;
+        self.in_queue[task_id] = false;
+        
+        self.head = self.next[task_id];
+        if self.head == usize::MAX {
+            self.tail = usize::MAX;
+        } else {
+            self.prev[self.head] = usize::MAX;
+        }
+        
         self.count -= 1;
         Some(task_id)
     }
@@ -59,47 +78,38 @@ impl ReadyQueue {
     /// 查看队首元素 - O(1)
     #[inline]
     fn peek(&self) -> Option<usize> {
-        if self.count == 0 {
+        if self.head == usize::MAX {
             None
         } else {
-            Some(self.tasks[self.head])
+            Some(self.head)
         }
     }
     
-    /// 从队列中移除指定任务 - O(n)
-    /// 
-    /// 注意：这个操作较慢，仅在任务阻塞时使用
+    /// 从队列中移除指定任务 - O(1)
     fn remove(&mut self, task_id: usize) -> bool {
-        if self.count == 0 {
+        if task_id >= MAX_TASKS || !self.in_queue[task_id] {
             return false;
         }
         
-        // 查找任务位置
-        let mut found_idx = None;
-        let mut idx = self.head;
-        for i in 0..self.count {
-            if self.tasks[idx] == task_id {
-                found_idx = Some(i);
-                break;
-            }
-            idx = (idx + 1) % MAX_TASKS;
+        self.in_queue[task_id] = false;
+        
+        let p = self.prev[task_id];
+        let n = self.next[task_id];
+        
+        if p != usize::MAX {
+            self.next[p] = n;
+        } else {
+            self.head = n;
         }
         
-        if let Some(pos) = found_idx {
-            // 将后面的元素前移
-            let mut src = (self.head + pos + 1) % MAX_TASKS;
-            let mut dst = (self.head + pos) % MAX_TASKS;
-            for _ in pos..(self.count - 1) {
-                self.tasks[dst] = self.tasks[src];
-                dst = src;
-                src = (src + 1) % MAX_TASKS;
-            }
-            self.tail = if self.tail == 0 { MAX_TASKS - 1 } else { self.tail - 1 };
-            self.count -= 1;
-            true
+        if n != usize::MAX {
+            self.prev[n] = p;
         } else {
-            false
+            self.tail = p;
         }
+        
+        self.count -= 1;
+        true
     }
     
     /// 检查队列是否为空 - O(1)
@@ -114,16 +124,14 @@ impl ReadyQueue {
         self.count
     }
     
-    /// 检查是否包含指定任务 - O(n)
+    /// 检查是否包含指定任务 - O(1)
+    #[inline]
     fn contains(&self, task_id: usize) -> bool {
-        let mut idx = self.head;
-        for _ in 0..self.count {
-            if self.tasks[idx] == task_id {
-                return true;
-            }
-            idx = (idx + 1) % MAX_TASKS;
+        if task_id < MAX_TASKS {
+            self.in_queue[task_id]
+        } else {
+            false
         }
-        false
     }
 }
 
@@ -248,14 +256,14 @@ impl SchedulerInner {
             
             // 遍历该优先级队列，找到真正就绪的任务
             let queue = &self.ready_queues[prio_idx];
-            let mut idx = queue.head;
-            for _ in 0..queue.count {
-                let task_id = queue.tasks[idx];
+            let mut curr = queue.head;
+            while curr != usize::MAX {
+                let task_id = curr;
                 let task = Task(task_id);
                 if task.get_state() == TaskState::Ready {
                     return Some((task_id, Priority::from_u8(prio_idx as u8).unwrap_or(Priority::Normal)));
                 }
-                idx = (idx + 1) % MAX_TASKS;
+                curr = queue.next[curr];
             }
         }
         
@@ -285,6 +293,11 @@ static SCHEDULER_USE_PRIORITY: AtomicBool = AtomicBool::new(false);
 
 /// 当前任务 ID（原子变量，用于快速访问）
 static CURRENT_TASK_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_current_task_id_for_test(id: usize) {
+    CURRENT_TASK_ID.store(id, Ordering::Release);
+}
 
 fn get_scheduler_inner() -> &'static Mutex<SchedulerInner> {
     SCHEDULER_INNER.call_once(|| Mutex::new(SchedulerInner::new()))
@@ -639,6 +652,60 @@ mod tests {
     }
 
     #[test]
+    fn test_ready_queue_operations() {
+        let mut q = ReadyQueue::new();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+
+        // push elements
+        assert!(q.push(1));
+        assert!(q.push(2));
+        assert!(q.push(3));
+        assert_eq!(q.len(), 3);
+        assert!(!q.is_empty());
+        
+        // contains
+        assert!(q.contains(1));
+        assert!(q.contains(2));
+        assert!(q.contains(3));
+        assert!(!q.contains(4));
+        
+        // peek
+        assert_eq!(q.peek(), Some(1));
+        
+        // duplicate push should fail
+        assert!(!q.push(2));
+        assert_eq!(q.len(), 3);
+        
+        // remove middle
+        assert!(q.remove(2));
+        assert_eq!(q.len(), 2);
+        assert!(!q.contains(2));
+        
+        // pop
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.len(), 1);
+        
+        // remove tail
+        assert!(q.remove(3));
+        assert_eq!(q.len(), 0);
+        assert!(q.is_empty());
+        
+        // pop from empty
+        assert_eq!(q.pop(), None);
+        
+        // out of bounds remove
+        assert!(!q.remove(MAX_TASKS));
+        
+        // push after empty
+        assert!(q.push(4));
+        assert_eq!(q.peek(), Some(4));
+        assert_eq!(q.len(), 1);
+        assert!(q.remove(4));
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
     #[serial]
     fn test_schedule() {
         kernel_init();
@@ -662,7 +729,7 @@ mod tests {
             }
         });
         assert_eq!(running_count, 1);
-        assert_eq!(ready_count, 4);
+        assert_eq!(ready_count, 5); // idle + 4 remaining tasks
         Scheduler::task_switch();
         running_count = 0;
         ready_count = 0;
@@ -675,7 +742,7 @@ mod tests {
             }
         });
         assert_eq!(running_count, 1);
-        assert_eq!(ready_count, 4);
+        assert_eq!(ready_count, 5);
         Scheduler::task_switch();
         running_count = 0;
         ready_count = 0;
@@ -688,7 +755,7 @@ mod tests {
             }
         });
         assert_eq!(running_count, 1);
-        assert_eq!(ready_count, 4);
+        assert_eq!(ready_count, 5);
     }
 
     #[test]
@@ -778,6 +845,9 @@ mod tests {
         // 获取当前任务（应该是 task1，因为它是第一个创建的）
         let current_task = Scheduler::get_current_task();
         
+        println!("current_task is {}, task1 is {}, task2 is {}", current_task.get_taskid(), task1.get_taskid(), task2.get_taskid());
+        println!("before blocking: idle state {:?}, task1 state {:?}, task2 state {:?}", Task(0).get_state(), task1.get_state(), task2.get_state());
+        
         // 阻塞非当前任务
         if current_task.get_taskid() == task1.get_taskid() {
             task2.block(Event::Signal(2));
@@ -795,8 +865,12 @@ mod tests {
             task2.block(Event::Signal(2));
         }
         
+        println!("after blocking: idle state {:?}, task1 state {:?}, task2 state {:?}", Task(0).get_state(), task1.get_state(), task2.get_state());
+        
         // 尝试调度 - 此时所有任务都被阻塞
         Scheduler::task_switch();
+        
+        println!("after switch: current_task is {}", Scheduler::get_current_task().get_taskid());
         
         // 当前任务 ID 应该保持不变（因为没有可调度的任务）
         assert_eq!(Scheduler::get_current_task().get_taskid(), current_id);
@@ -812,6 +886,9 @@ mod tests {
         
         Scheduler::start();
         
+        // idle runs first. switch to task1.
+        Scheduler::task_switch();
+        
         // 获取当前任务（应该是 task1）
         let current = Scheduler::get_current_task();
         assert_eq!(current.get_taskid(), task1.get_taskid());
@@ -826,10 +903,8 @@ mod tests {
         // 唤醒被阻塞的任务
         task1.ready();
         
-        // 再次调度 - 应该切换回 task1（轮转调度）
+        // 再次调度 - 应该切换回 idle (由于轮转)
         Scheduler::task_switch();
-        // 注意：轮转调度下，可能切换到 task1 或保持 task2
-        // 这里只验证当前任务是运行状态
         assert_eq!(Scheduler::get_current_task().get_state(), TaskState::Running);
     }
     
@@ -879,7 +954,7 @@ mod tests {
         kernel_init();
         
         // 创建不同优先级的任务
-        let low_task = Task::builder("low_priority")
+        let _low_task = Task::builder("low_priority")
             .priority(Priority::Low)
             .spawn(|_| {})
             .unwrap();
@@ -898,8 +973,8 @@ mod tests {
         Scheduler::enable_priority_scheduling();
         Scheduler::start();
         
-        // 第一个任务开始运行（task id 0）
-        assert_eq!(Scheduler::get_current_task().get_taskid(), low_task.get_taskid());
+        // 第一个任务开始运行（task id 0, idle_task）
+        assert_eq!(Scheduler::get_current_task().get_taskid(), 0);
         
         // 调度后应该切换到最高优先级的任务
         Scheduler::task_switch();
@@ -1026,6 +1101,10 @@ mod tests {
         Scheduler::disable_priority_scheduling();
         Scheduler::start();
         
+        // idle runs first
+        assert_eq!(Scheduler::get_current_task().get_taskid(), 0);
+        
+        Scheduler::task_switch();
         // 轮转调度应该按顺序切换，而不是按优先级
         assert_eq!(Scheduler::get_current_task().get_taskid(), task1.get_taskid());
         

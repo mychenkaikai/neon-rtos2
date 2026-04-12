@@ -15,6 +15,7 @@ pub enum Event {
     CondVar(usize),
     Barrier(usize),
     Once(usize),
+    Async(usize),
 }
 
 impl Event {
@@ -105,7 +106,7 @@ mod tests {
             }
         });
         
-        assert_eq!(ready_count, 2);
+        assert_eq!(ready_count, 3); // idle + 2 tasks
     }
     
     #[test]

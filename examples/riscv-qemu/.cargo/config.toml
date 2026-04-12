@@ -1,15 +1,22 @@
+# RISC-V QEMU 编译配置
+# 设置默认编译目标和 QEMU runner
+
 [build]
+# 默认编译目标：RISC-V 32-bit IMC
 target = "riscv32imac-unknown-none-elf"
 
 [target.riscv32imac-unknown-none-elf]
-runner = "qemu-system-riscv32 -machine virt -nographic -semihosting-config enable=on,target=native -kernel"
+# 使用 QEMU 作为 runner，支持 cargo run
+# -bios none: 禁用默认的 OpenSBI 固件，避免与内核地址冲突
+# -m 128M: 设置内存大小为 128MB
+runner = "qemu-system-riscv32 -machine virt -cpu rv32 -m 128M -bios none -nographic -semihosting-config enable=on,target=native -kernel"
+
+# 链接器配置
 rustflags = [
-    "-C", "link-arg=-Tmemory.x",
-    "-C", "link-arg=-Tlink.x",
-    "-C", "link-arg=--nmagic",
+  "-C", "link-arg=-Tmemory.x",
+  "-C", "link-arg=-Tlink.x",
 ]
 
-[unstable]
-build-std = ["core", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
-
+[env]
+# 设置 DEFMT_LOG 级别（如果使用 defmt）
+# DEFMT_LOG = "debug"

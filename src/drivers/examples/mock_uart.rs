@@ -21,7 +21,7 @@
 //! uart.init().unwrap();
 //!
 //! // 配置
-//! uart.set_baudrate(9600).unwrap();
+//! Uart::set_baudrate(&mut uart, 9600).unwrap();
 //!
 //! // 写入数据
 //! uart.write(b"Hello, World!").unwrap();
@@ -36,6 +36,7 @@
 
 use crate::drivers::{
     Device, Read, Write, Uart,
+    AsyncRead, AsyncWrite, AsyncUart,
     SerialConfig, DataBits, StopBits, Parity,
     DeviceError,
 };
@@ -362,6 +363,66 @@ impl Uart for MockUart {
     }
 }
 
+impl AsyncRead for MockUart {
+    async fn read_async(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if !self.initialized {
+            return Err(DeviceError::NotInitialized);
+        }
+        
+        // 如果没有数据，返回0而不是阻塞，这只是一个简单的模拟
+        let mut count = 0;
+        while count < buf.len() && self.rx_tail != self.rx_head {
+            buf[count] = self.rx_buffer[self.rx_tail];
+            self.rx_tail = (self.rx_tail + 1) % BUFFER_SIZE;
+            count += 1;
+        }
+        self.rx_count += count;
+        Ok(count)
+    }
+}
+
+impl AsyncWrite for MockUart {
+    async fn write_async(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        if !self.initialized {
+            return Err(DeviceError::NotInitialized);
+        }
+
+        let mut count = 0;
+        for &byte in buf {
+            let next = (self.tx_head + 1) % BUFFER_SIZE;
+            if next == self.tx_tail {
+                break; // 缓冲区满
+            }
+            self.tx_buffer[self.tx_head] = byte;
+            self.tx_head = next;
+            count += 1;
+        }
+        self.tx_count += count;
+        Ok(count)
+    }
+
+    async fn flush_async(&mut self) -> Result<(), Self::Error> {
+        if !self.initialized {
+            return Err(DeviceError::NotInitialized);
+        }
+        Ok(())
+    }
+}
+
+impl AsyncUart for MockUart {
+    fn configure(&mut self, config: SerialConfig) -> Result<(), Self::Error> {
+        <Self as Uart>::configure(self, config)
+    }
+
+    fn set_baudrate(&mut self, baudrate: u32) -> Result<(), Self::Error> {
+        <Self as Uart>::set_baudrate(self, baudrate)
+    }
+
+    fn baudrate(&self) -> u32 {
+        <Self as Uart>::baudrate(self)
+    }
+}
+
 // ============================================================================
 // 单元测试
 // ============================================================================
@@ -374,7 +435,7 @@ mod tests {
     fn test_mock_uart_new() {
         let uart = MockUart::new();
         assert!(!uart.is_ready());
-        assert_eq!(uart.baudrate(), 115200);
+        assert_eq!(Uart::baudrate(&uart), 115200);
     }
 
     #[test]
@@ -428,12 +489,12 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_uart_configure() {
+    fn test_uart_configure() {
         let mut uart = MockUart::new();
         uart.init().unwrap();
 
-        uart.set_baudrate(9600).unwrap();
-        assert_eq!(uart.baudrate(), 9600);
+        Uart::set_baudrate(&mut uart, 9600).unwrap();
+        assert_eq!(Uart::baudrate(&uart), 9600);
 
         let config = SerialConfig {
             baudrate: 19200,
@@ -441,8 +502,8 @@ mod tests {
             stop_bits: StopBits::Two,
             parity: Parity::Even,
         };
-        uart.configure(config).unwrap();
-        assert_eq!(uart.baudrate(), 19200);
+        Uart::configure(&mut uart, config).unwrap();
+        assert_eq!(Uart::baudrate(&uart), 19200);
     }
 
     #[test]
@@ -483,6 +544,65 @@ mod tests {
         assert!(uart.is_ready());
         assert_eq!(uart.tx_pending(), 0);
         assert_eq!(uart.tx_count(), 0);
+    }
+
+    #[test]
+    fn test_uart_flush() {
+        let mut uart = MockUart::new();
+        uart.init().unwrap();
+        
+        uart.write(b"Test").unwrap();
+        assert!(uart.flush().is_ok());
+    }
+
+    #[test]
+    fn test_async_uart() {
+        // 使用一个简单的宏或 runtime 模拟 block_on 来测试 async fn
+        let mut uart = MockUart::new();
+        uart.init().unwrap();
+
+        // 简单创建一个能够运行 future 的本地环境
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker, RawWaker, RawWakerVTable};
+        
+        fn dummy_raw_waker() -> RawWaker {
+            fn no_op(_: *const ()) {}
+            fn clone(_: *const ()) -> RawWaker { dummy_raw_waker() }
+            let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
+            RawWaker::new(core::ptr::null(), vtable)
+        }
+        
+        fn dummy_waker() -> Waker {
+            unsafe { Waker::from_raw(dummy_raw_waker()) }
+        }
+
+        let waker = dummy_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // 测试 async write
+        {
+            let mut write_fut = core::pin::pin!(uart.write_async(b"Async Hello"));
+            if let Poll::Ready(res) = write_fut.as_mut().poll(&mut cx) {
+                assert_eq!(res.unwrap(), 11);
+            } else {
+                panic!("Expected Ready");
+            }
+        }
+
+        // 测试 async read
+        uart.mock_receive(b"Async Response");
+        {
+            let mut buf = [0u8; 14];
+            {
+                let mut read_fut = core::pin::pin!(uart.read_async(&mut buf));
+                if let Poll::Ready(res) = read_fut.as_mut().poll(&mut cx) {
+                    assert_eq!(res.unwrap(), 14);
+                } else {
+                    panic!("Expected Ready");
+                }
+            }
+            assert_eq!(&buf, b"Async Response");
+        }
     }
 }
 

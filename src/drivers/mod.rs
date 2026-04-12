@@ -111,6 +111,7 @@
 pub mod traits;
 pub mod macros;
 pub mod examples;
+pub mod stm32f1_uart_dma;
 
 // 重新导出常用类型
 pub use traits::{
@@ -119,6 +120,9 @@ pub use traits::{
     Read,
     Write,
     ReadWrite,
+    AsyncRead,
+    AsyncWrite,
+    AsyncReadWrite,
     
     // GPIO
     GpioPin,
@@ -131,6 +135,7 @@ pub use traits::{
     
     // 串行通信
     Uart,
+    AsyncUart,
     SerialConfig,
     DataBits,
     StopBits,
@@ -138,11 +143,13 @@ pub use traits::{
     
     // SPI
     Spi,
+    AsyncSpi,
     SpiConfig,
     SpiMode,
     
     // I2C
     I2c,
+    AsyncI2c,
     I2cConfig,
     
     // 定时器

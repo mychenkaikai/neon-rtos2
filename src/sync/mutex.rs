@@ -51,25 +51,56 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::Waker;
 use spin::Mutex as SpinMutex;
+use crate::kernel::task::Priority;
+
+/// 提取出的非泛型 Mutex 状态，用于类型擦除的优先级继承传播
+#[repr(C)]
+pub(crate) struct MutexState {
+    pub(crate) owner: AtomicUsize,
+    pub(crate) owner_original_priority: SpinMutex<Option<Priority>>,
+    pub(crate) priority_inheritance: bool,
+}
+
+impl MutexState {
+    pub(crate) fn propagate_priority(&self, new_priority: Priority, depth: usize) {
+        if !self.priority_inheritance || depth > 10 {
+            return;
+        }
+
+        let owner_id = self.owner.load(Ordering::Acquire);
+        if owner_id == usize::MAX {
+            return;
+        }
+
+        let mut owner_task = crate::kernel::task::Task(owner_id);
+        let owner_priority = owner_task.get_priority();
+
+        if new_priority > owner_priority {
+            owner_task.set_priority(new_priority);
+
+            if let TaskState::Blocked(crate::sync::event::Event::Mutex(next_mutex_id)) = owner_task.get_state() {
+                let next_state = unsafe { &*(next_mutex_id as *const MutexState) };
+                next_state.propagate_priority(new_priority, depth + 1);
+            }
+        }
+    }
+}
 
 /// 互斥锁内部状态
+#[repr(C)]
 struct MutexInner<T> {
-    /// 被保护的数据
-    data: UnsafeCell<T>,
+    /// 非泛型状态（必须是第一个字段，以支持指针强转进行类型擦除）
+    state: MutexState,
     /// 锁状态
     locked: AtomicBool,
-    /// 当前持有者的任务 ID（usize::MAX 表示无持有者）
-    owner: AtomicUsize,
-    /// 持有者的原始优先级（用于优先级继承恢复）
-    owner_original_priority: SpinMutex<Option<crate::kernel::task::Priority>>,
     /// 同步等待者列表
     waiters: SpinMutex<WaiterList>,
     /// 异步等待者列表
     async_waiters: SpinMutex<VecDeque<Waker>>,
     /// 是否已被毒化（持有锁的任务 panic 了）
     poisoned: AtomicBool,
-    /// 是否启用优先级继承
-    priority_inheritance: bool,
+    /// 被保护的数据
+    data: UnsafeCell<T>,
 }
 
 // Safety: MutexInner 通过锁机制保证线程安全
@@ -79,27 +110,31 @@ unsafe impl<T: Send> Sync for MutexInner<T> {}
 impl<T> MutexInner<T> {
     fn new(data: T) -> Self {
         Self {
-            data: UnsafeCell::new(data),
+            state: MutexState {
+                owner: AtomicUsize::new(usize::MAX),
+                owner_original_priority: SpinMutex::new(None),
+                priority_inheritance: false,
+            },
             locked: AtomicBool::new(false),
-            owner: AtomicUsize::new(usize::MAX),
-            owner_original_priority: SpinMutex::new(None),
             waiters: SpinMutex::new(WaiterList::new()),
             async_waiters: SpinMutex::new(VecDeque::new()),
             poisoned: AtomicBool::new(false),
-            priority_inheritance: false,
+            data: UnsafeCell::new(data),
         }
     }
 
     fn new_with_priority_inheritance(data: T) -> Self {
         Self {
-            data: UnsafeCell::new(data),
+            state: MutexState {
+                owner: AtomicUsize::new(usize::MAX),
+                owner_original_priority: SpinMutex::new(None),
+                priority_inheritance: true,
+            },
             locked: AtomicBool::new(false),
-            owner: AtomicUsize::new(usize::MAX),
-            owner_original_priority: SpinMutex::new(None),
             waiters: SpinMutex::new(WaiterList::new()),
             async_waiters: SpinMutex::new(VecDeque::new()),
             poisoned: AtomicBool::new(false),
-            priority_inheritance: true,
+            data: UnsafeCell::new(data),
         }
     }
 }
@@ -184,7 +219,7 @@ impl<T> Mutex<T> {
 
     /// 检查是否启用了优先级继承
     pub fn has_priority_inheritance(&self) -> bool {
-        self.inner.priority_inheritance
+        self.inner.state.priority_inheritance
     }
 
     /// 获取锁
@@ -226,11 +261,11 @@ impl<T> Mutex<T> {
                 // 成功获取锁
                 let mut current = Scheduler::get_current_task();
                 let task_id = current.get_taskid();
-                self.inner.owner.store(task_id, Ordering::Release);
+                self.inner.state.owner.store(task_id, Ordering::Release);
                 
                 // 如果启用优先级继承，保存原始优先级
-                if self.inner.priority_inheritance {
-                    let mut orig_priority = self.inner.owner_original_priority.lock();
+                if self.inner.state.priority_inheritance {
+                    let mut orig_priority = self.inner.state.owner_original_priority.lock();
                     *orig_priority = Some(current.get_priority());
                 }
                 
@@ -250,20 +285,7 @@ impl<T> Mutex<T> {
             }
 
             // 优先级继承：提升持有者的优先级
-            if self.inner.priority_inheritance {
-                let owner_id = self.inner.owner.load(Ordering::Acquire);
-                if owner_id != usize::MAX {
-                    crate::kernel::task::Task::for_each(|mut task, id| {
-                        if id == owner_id {
-                            let owner_priority = task.get_priority();
-                            // 如果等待者优先级更高，提升持有者优先级
-                            if current_priority > owner_priority {
-                                task.set_priority(current_priority);
-                            }
-                        }
-                    });
-                }
-            }
+            self.inner.state.propagate_priority(current_priority, 0);
 
             // 使用 Arc 的地址作为唯一标识
             let mutex_id = Arc::as_ptr(&self.inner) as usize;
@@ -315,7 +337,7 @@ impl<T> Mutex<T> {
             Ordering::Relaxed,
         ).is_ok() {
             let task_id = Scheduler::get_current_task().get_taskid();
-            self.inner.owner.store(task_id, Ordering::Release);
+            self.inner.state.owner.store(task_id, Ordering::Release);
             Ok(MutexGuard { mutex: self, _marker: PhantomData })
         } else {
             Err(RtosError::WouldBlock)
@@ -364,7 +386,7 @@ impl<T> Mutex<T> {
             ).is_ok() {
                 // 成功获取锁
                 let task_id = Scheduler::get_current_task().get_taskid();
-                self.inner.owner.store(task_id, Ordering::Release);
+                self.inner.state.owner.store(task_id, Ordering::Release);
                 return Ok(MutexGuard { mutex: self, _marker: PhantomData });
             }
 
@@ -430,7 +452,13 @@ impl<T> Mutex<T> {
                     if Systick::get_current_time() >= deadline {
                         return Err(RtosError::Timeout);
                     }
-                    // 继续轮询
+                    // 避免纯忙等导致饿死同优先级任务，让出 1 tick 或执行权
+                    let remaining = deadline - Systick::get_current_time();
+                    if remaining > 1 {
+                        let _ = crate::kernel::time::timer::Delay::delay(1);
+                    } else {
+                        crate::hal::trigger_schedule();
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -470,7 +498,7 @@ impl<T> Mutex<T> {
     pub fn is_locked_by_current(&self) -> bool {
         let current_id = Scheduler::get_current_task().get_taskid();
         self.inner.locked.load(Ordering::Acquire) 
-            && self.inner.owner.load(Ordering::Acquire) == current_id
+            && self.inner.state.owner.load(Ordering::Acquire) == current_id
     }
 
     /// 检查锁是否被占用
@@ -491,26 +519,23 @@ impl<T> Mutex<T> {
     /// 内部方法：释放锁
     fn unlock(&self) {
         // 优先级继承：恢复原始优先级
-        if self.inner.priority_inheritance {
-            let owner_id = self.inner.owner.load(Ordering::Acquire);
+        if self.inner.state.priority_inheritance {
+            let owner_id = self.inner.state.owner.load(Ordering::Acquire);
             if owner_id != usize::MAX {
                 let original_priority = {
-                    let mut orig = self.inner.owner_original_priority.lock();
+                    let mut orig = self.inner.state.owner_original_priority.lock();
                     orig.take()
                 };
                 
                 if let Some(priority) = original_priority {
-                    crate::kernel::task::Task::for_each(|mut task, id| {
-                        if id == owner_id {
-                            task.set_priority(priority);
-                        }
-                    });
+                    let mut task = crate::kernel::task::Task(owner_id);
+                    task.set_priority(priority);
                 }
             }
         }
 
         // 清除持有者
-        self.inner.owner.store(usize::MAX, Ordering::Release);
+        self.inner.state.owner.store(usize::MAX, Ordering::Release);
         
         // 释放锁
         self.inner.locked.store(false, Ordering::Release);
@@ -522,13 +547,11 @@ impl<T> Mutex<T> {
         };
 
         if let Some(task_id) = task_id {
-            crate::kernel::task::Task::for_each(|task, id| {
-                if id == task_id {
-                    if let TaskState::Blocked(_) = task.get_state() {
-                        task.ready();
-                    }
-                }
-            });
+            // O(1) 唤醒，不再使用 O(N) 的 Task::for_each
+            let mut task = crate::kernel::task::Task(task_id);
+            if let crate::kernel::task::TaskState::Blocked(_) = task.get_state() {
+                task.ready();
+            }
             return;
         }
 
@@ -728,26 +751,23 @@ impl<T> DerefMut for OwnedMutexGuard<T> {
 impl<T> Drop for OwnedMutexGuard<T> {
     fn drop(&mut self) {
         // 优先级继承：恢复原始优先级
-        if self.mutex.priority_inheritance {
-            let owner_id = self.mutex.owner.load(Ordering::Acquire);
+        if self.mutex.state.priority_inheritance {
+            let owner_id = self.mutex.state.owner.load(Ordering::Acquire);
             if owner_id != usize::MAX {
                 let original_priority = {
-                    let mut orig = self.mutex.owner_original_priority.lock();
+                    let mut orig = self.mutex.state.owner_original_priority.lock();
                     orig.take()
                 };
                 
                 if let Some(priority) = original_priority {
-                    crate::kernel::task::Task::for_each(|mut task, id| {
-                        if id == owner_id {
-                            task.set_priority(priority);
-                        }
-                    });
+                    let mut task = crate::kernel::task::Task(owner_id);
+                    task.set_priority(priority);
                 }
             }
         }
 
         // 清除持有者
-        self.mutex.owner.store(usize::MAX, Ordering::Release);
+        self.mutex.state.owner.store(usize::MAX, Ordering::Release);
         
         // 释放锁
         self.mutex.locked.store(false, Ordering::Release);
@@ -831,11 +851,11 @@ impl<T> Mutex<T> {
                 // 成功获取锁
                 let current = Scheduler::get_current_task();
                 let task_id = current.get_taskid();
-                self.inner.owner.store(task_id, Ordering::Release);
+                self.inner.state.owner.store(task_id, Ordering::Release);
                 
                 // 如果启用优先级继承，保存原始优先级
-                if self.inner.priority_inheritance {
-                    let mut orig_priority = self.inner.owner_original_priority.lock();
+                if self.inner.state.priority_inheritance {
+                    let mut orig_priority = self.inner.state.owner_original_priority.lock();
                     *orig_priority = Some(current.get_priority());
                 }
                 
@@ -857,19 +877,7 @@ impl<T> Mutex<T> {
             }
 
             // 优先级继承
-            if self.inner.priority_inheritance {
-                let owner_id = self.inner.owner.load(Ordering::Acquire);
-                if owner_id != usize::MAX {
-                    crate::kernel::task::Task::for_each(|mut task, id| {
-                        if id == owner_id {
-                            let owner_priority = task.get_priority();
-                            if current_priority > owner_priority {
-                                task.set_priority(current_priority);
-                            }
-                        }
-                    });
-                }
-            }
+            self.inner.state.propagate_priority(current_priority, 0);
 
             let mutex_id = Arc::as_ptr(&self.inner) as usize;
             Scheduler::get_current_task().block(crate::sync::event::Event::Mutex(mutex_id));
@@ -894,7 +902,7 @@ impl<T> Mutex<T> {
             Ordering::Relaxed,
         ).is_ok() {
             let task_id = Scheduler::get_current_task().get_taskid();
-            self.inner.owner.store(task_id, Ordering::Release);
+            self.inner.state.owner.store(task_id, Ordering::Release);
             Ok(OwnedMutexGuard { 
                 mutex: Arc::clone(&self.inner),
             })
@@ -1049,7 +1057,7 @@ impl<'a, T> core::future::Future for MutexLockFuture<'a, T> {
         ).is_ok() {
             // 成功获取锁
             let task_id = Scheduler::get_current_task().get_taskid();
-            self.mutex.inner.owner.store(task_id, Ordering::Release);
+            self.mutex.inner.state.owner.store(task_id, Ordering::Release);
             return core::task::Poll::Ready(Ok(MutexGuard { 
                 mutex: self.mutex, 
                 _marker: PhantomData 
@@ -1961,6 +1969,52 @@ mod tests {
             let guard = mutex.lock().unwrap();
             assert_eq!(*guard, 42);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_nested_priority_inheritance() {
+        use crate::kernel::task::{Task, Priority};
+        use crate::kernel::scheduler::Scheduler;
+        use crate::compat::Arc;
+        use core::sync::atomic::Ordering;
+
+        kernel_init();
+        Scheduler::enable_priority_scheduling();
+
+        let mut task_l = Task::builder("L").priority(Priority::Low).spawn(|_| {}).unwrap();
+        let mut task_m = Task::builder("M").priority(Priority::Normal).spawn(|_| {}).unwrap();
+        let mut task_h = Task::builder("H").priority(Priority::High).spawn(|_| {}).unwrap();
+
+        let m1 = Arc::new(Mutex::with_priority_inheritance(1));
+        let m2 = Arc::new(Mutex::with_priority_inheritance(2));
+
+        // 模拟任务 L 获取 M1
+        crate::kernel::scheduler::set_current_task_id_for_test(task_l.get_taskid());
+        let _guard1 = m1.try_lock().unwrap();
+
+        // 验证 L 的优先级是 Low
+        assert_eq!(task_l.get_priority(), Priority::Low);
+
+        // 模拟任务 M 获取 M2
+        crate::kernel::scheduler::set_current_task_id_for_test(task_m.get_taskid());
+        let _guard2 = m2.try_lock().unwrap();
+
+        // 模拟任务 M 尝试获取 M1，会失败并阻塞，触发优先级继承
+        m1.inner.state.propagate_priority(task_m.get_priority(), 0);
+        task_m.block(crate::sync::event::Event::Mutex(Arc::as_ptr(&m1.inner) as usize));
+
+        // M 被阻塞在 M1 上，L 继承了 Normal 优先级
+        assert_eq!(task_l.get_priority(), Priority::Normal);
+
+        // 模拟任务 H 尝试获取 M2
+        crate::kernel::scheduler::set_current_task_id_for_test(task_h.get_taskid());
+        m2.inner.state.propagate_priority(task_h.get_priority(), 0);
+        task_h.block(crate::sync::event::Event::Mutex(Arc::as_ptr(&m2.inner) as usize));
+
+        // H 被阻塞在 M2 上，M 继承了 High，同时 L 递归继承了 High！
+        assert_eq!(task_m.get_priority(), Priority::High);
+        assert_eq!(task_l.get_priority(), Priority::High);
     }
 }
 

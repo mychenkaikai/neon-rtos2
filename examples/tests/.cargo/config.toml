@@ -1,11 +1,9 @@
-# Cortex-M3 编译配置
+# Tests 编译配置（基于 Cortex-M3）
 # 设置默认编译目标和 QEMU runner
 
 [build]
 # 默认编译目标：Cortex-M3
 target = "thumbv7m-none-eabi"
-# 指定独立的 target 目录，避免与根 workspace 混淆
-target-dir = "target"
 
 [target.thumbv7m-none-eabi]
 # 使用 QEMU 作为 runner，支持 cargo run
@@ -20,3 +18,4 @@ runner = "qemu-system-arm -cpu cortex-m3 -machine lm3s6965evb -nographic -semiho
 [env]
 # 设置 DEFMT_LOG 级别（如果使用 defmt）
 # DEFMT_LOG = "debug"
+

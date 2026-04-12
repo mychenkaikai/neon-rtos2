@@ -4,15 +4,17 @@
 //!
 //! ## 设计原则
 //!
-//! - **简单**: 单线程执行，无需复杂的同步
+//! - **避免轮询**: 与 RTOS 调度器集成，在没有任务就绪时挂起，而不是死循环
 //! - **轻量**: 最小化内存占用
 //! - **可预测**: 确定性的执行顺序
 
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use crate::compat::{Box, VecDeque};
-use super::waker::TaskWaker;
+use crate::compat::{Box, Vec, Arc, VecDeque};
+use super::waker::{TaskWaker, WakerData, WokenState};
+use critical_section::Mutex;
+use core::cell::RefCell;
 
 /// 异步任务包装器
 ///
@@ -40,57 +42,32 @@ impl AsyncTask {
 /// 异步执行器
 ///
 /// 管理和执行异步任务的简单执行器。
-///
-/// # 示例
-///
-/// ```rust,no_run
-/// # use neon_rtos2::runtime::Executor;
-/// # fn main() {
-/// let mut executor = Executor::new();
-///
-/// executor.spawn(async {
-///     // 异步任务逻辑
-/// });
-///
-/// executor.run();
-/// # }
-/// ```
 pub struct Executor {
-    /// 就绪队列
-    ready_queue: VecDeque<AsyncTask>,
+    /// 所有的异步任务
+    tasks: Vec<Option<AsyncTask>>,
+    /// 被唤醒的任务队列
+    woken_state: Arc<Mutex<RefCell<WokenState>>>,
     /// 下一个任务 ID
     next_task_id: usize,
+    /// 活跃任务数
+    task_count: usize,
 }
 
 impl Executor {
     /// 创建新的执行器
     pub fn new() -> Self {
         Self {
-            ready_queue: VecDeque::new(),
+            tasks: Vec::new(),
+            woken_state: Arc::new(Mutex::new(RefCell::new(WokenState {
+                queue: VecDeque::new(),
+                in_queue: Vec::new(),
+            }))),
             next_task_id: 0,
+            task_count: 0,
         }
     }
 
     /// 添加异步任务
-    ///
-    /// # 参数
-    /// - `future`: 要执行的 Future
-    ///
-    /// # 返回值
-    /// 任务 ID
-    ///
-    /// # 示例
-    ///
-    /// ```rust,no_run
-    /// use neon_rtos2::runtime::Executor;
-    ///
-    /// fn main() {
-    ///     let mut executor = Executor::new();
-    ///     let task_id = executor.spawn(async {
-    ///         // 异步逻辑
-    ///     });
-    /// }
-    /// ```
     pub fn spawn<F>(&mut self, future: F) -> usize
     where
         F: Future<Output = ()> + Send + 'static,
@@ -99,70 +76,130 @@ impl Executor {
         self.next_task_id += 1;
         
         let task = AsyncTask::new(future, task_id);
-        self.ready_queue.push_back(task);
+        
+        if self.tasks.len() <= task_id {
+            self.tasks.resize_with(task_id + 1, || None);
+        }
+        self.tasks[task_id] = Some(task);
+        self.task_count += 1;
+        
+        // 初始时将任务加入唤醒队列，以便第一次被 poll
+        critical_section::with(|cs| {
+            let mut state = self.woken_state.borrow_ref_mut(cs);
+            if state.in_queue.len() <= task_id {
+                state.in_queue.resize(task_id + 1, false);
+            }
+            if !state.in_queue[task_id] {
+                state.in_queue[task_id] = true;
+                state.queue.push_back(task_id);
+            }
+        });
         
         task_id
     }
 
     /// 运行执行器
-    ///
-    /// 持续执行就绪队列中的任务，直到所有任务完成。
-    ///
-    /// # 注意
-    ///
-    /// 在嵌入式环境中，通常不会返回，而是在空闲时进入低功耗模式。
     pub fn run(&mut self) {
-        while let Some(mut task) = self.ready_queue.pop_front() {
-            let waker = TaskWaker::new(task.task_id);
-            let mut cx = Context::from_waker(&waker);
-            
-            match task.future.as_mut().poll(&mut cx) {
-                Poll::Ready(()) => {
-                    // 任务完成，不再重新入队
+        use crate::kernel::scheduler::Scheduler;
+        use crate::sync::event::Event;
+        use crate::hal::trigger_schedule;
+
+        loop {
+            let task_to_poll = critical_section::with(|cs| {
+                let mut state = self.woken_state.borrow_ref_mut(cs);
+                if let Some(id) = state.queue.pop_front() {
+                    state.in_queue[id] = false;
+                    Some(id)
+                } else {
+                    None
                 }
-                Poll::Pending => {
-                    // 任务未完成，重新入队等待下次调度
-                    self.ready_queue.push_back(task);
+            });
+
+            if let Some(id) = task_to_poll {
+                // 如果任务存在，进行 poll
+                if id < self.tasks.len() {
+                    let mut task_opt = self.tasks[id].take();
+                    if let Some(mut task) = task_opt.take() {
+                        let waker_data = Arc::new(WakerData {
+                            rtos_task_id: Scheduler::get_current_task().get_taskid(),
+                            future_id: id,
+                            woken_state: self.woken_state.clone(),
+                        });
+                        let waker = TaskWaker::new(waker_data);
+                        let mut cx = Context::from_waker(&waker);
+                        
+                        match task.future.as_mut().poll(&mut cx) {
+                            Poll::Ready(()) => {
+                                self.task_count -= 1;
+                            }
+                            Poll::Pending => {
+                                self.tasks[id] = Some(task);
+                            }
+                        }
+                    }
                 }
+            } else {
+                if self.is_empty() {
+                    break; 
+                }
+
+                // 没有新唤醒的任务，阻塞当前 RTOS 任务
+                let mut current_task = Scheduler::get_current_task();
+                current_task.block(Event::Async(current_task.get_taskid()));
+                trigger_schedule();
             }
         }
     }
 
     /// 执行一轮调度
-    ///
-    /// 只执行一次就绪队列中的任务，然后返回。
-    /// 适合与 RTOS 调度器集成使用。
-    ///
-    /// # 返回值
-    /// - `true`: 还有待执行的任务
-    /// - `false`: 所有任务已完成
     pub fn poll_once(&mut self) -> bool {
-        if let Some(mut task) = self.ready_queue.pop_front() {
-            let waker = TaskWaker::new(task.task_id);
-            let mut cx = Context::from_waker(&waker);
-            
-            match task.future.as_mut().poll(&mut cx) {
-                Poll::Ready(()) => {
-                    // 任务完成
-                }
-                Poll::Pending => {
-                    // 任务未完成，重新入队
-                    self.ready_queue.push_back(task);
+        use crate::kernel::scheduler::Scheduler;
+        
+        let task_to_poll = critical_section::with(|cs| {
+            let mut state = self.woken_state.borrow_ref_mut(cs);
+            if let Some(id) = state.queue.pop_front() {
+                state.in_queue[id] = false;
+                Some(id)
+            } else {
+                None
+            }
+        });
+
+        if let Some(id) = task_to_poll {
+            if id < self.tasks.len() {
+                let mut task_opt = self.tasks[id].take();
+                if let Some(mut task) = task_opt.take() {
+                    let waker_data = Arc::new(WakerData {
+                        rtos_task_id: Scheduler::get_current_task().get_taskid(),
+                        future_id: id,
+                        woken_state: self.woken_state.clone(),
+                    });
+                    let waker = TaskWaker::new(waker_data);
+                    let mut cx = Context::from_waker(&waker);
+                    
+                    match task.future.as_mut().poll(&mut cx) {
+                        Poll::Ready(()) => {
+                            self.task_count -= 1;
+                        }
+                        Poll::Pending => {
+                            self.tasks[id] = Some(task);
+                        }
+                    }
                 }
             }
         }
         
-        !self.ready_queue.is_empty()
+        !self.is_empty()
     }
 
-    /// 获取就绪队列中的任务数量
+    /// 获取未完成任务数量
     pub fn pending_count(&self) -> usize {
-        self.ready_queue.len()
+        self.task_count
     }
 
     /// 检查执行器是否为空
     pub fn is_empty(&self) -> bool {
-        self.ready_queue.is_empty()
+        self.task_count == 0
     }
 }
 
@@ -176,16 +213,22 @@ impl Default for Executor {
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
+    use serial_test::serial;
+    use crate::utils::kernel_init;
 
     #[test]
+    #[serial]
     fn test_executor_creation() {
+        kernel_init();
         let executor = Executor::new();
         assert!(executor.is_empty());
         assert_eq!(executor.pending_count(), 0);
     }
 
     #[test]
+    #[serial]
     fn test_executor_spawn() {
+        kernel_init();
         let mut executor = Executor::new();
         
         let task_id = executor.spawn(async {});
@@ -198,7 +241,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_executor_run_simple() {
+        kernel_init();
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         
         let mut executor = Executor::new();
@@ -211,35 +256,83 @@ mod tests {
             COUNTER.fetch_add(10, Ordering::SeqCst);
         });
         
-        executor.run();
+        // 由于测试环境中不支持阻塞RTOS任务，poll_once 会在测试中更适用
+        while !executor.is_empty() {
+            executor.poll_once();
+        }
         
         assert_eq!(COUNTER.load(Ordering::SeqCst), 11);
         assert!(executor.is_empty());
     }
 
     #[test]
-    fn test_executor_poll_once() {
+    #[serial]
+    fn test_executor_large_capacity() {
+        kernel_init();
+        // 测试任务数量超过原 64 位限制
+        let mut executor = Executor::new();
+        let num_tasks = 100;
+        
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        COUNTER.store(0, Ordering::SeqCst);
+        
+        for _ in 0..num_tasks {
+            executor.spawn(async {
+                COUNTER.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        
+        assert_eq!(executor.pending_count(), num_tasks);
+        
+        while !executor.is_empty() {
+            executor.poll_once();
+        }
+        
+        assert_eq!(COUNTER.load(Ordering::SeqCst), num_tasks);
+        assert!(executor.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_executor_waker_queue() {
+        kernel_init();
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::{Context, Poll, Waker};
+        
+        // 模拟一个需要多次 poll 才能完成的 future
+        struct StepFuture {
+            steps: usize,
+        }
+        
+        impl Future for StepFuture {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.steps == 0 {
+                    Poll::Ready(())
+                } else {
+                    self.steps -= 1;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
         
         let mut executor = Executor::new();
+        executor.spawn(StepFuture { steps: 3 });
         
-        executor.spawn(async {
-            COUNTER.fetch_add(1, Ordering::SeqCst);
-        });
+        // 第 1 次 poll (steps 变为 2, 并且 waker enqueue)
+        assert!(executor.poll_once());
+        assert_eq!(executor.pending_count(), 1);
         
-        executor.spawn(async {
-            COUNTER.fetch_add(1, Ordering::SeqCst);
-        });
+        // 第 2 次 poll (steps 变为 1, 并且 waker enqueue)
+        assert!(executor.poll_once());
         
-        // 第一次 poll
-        let has_more = executor.poll_once();
-        assert!(has_more); // 还有一个任务
+        // 第 3 次 poll (steps 变为 0, 并且 waker enqueue)
+        assert!(executor.poll_once());
         
-        // 第二次 poll
-        let has_more = executor.poll_once();
-        assert!(!has_more); // 所有任务完成
-        
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
+        // 第 4 次 poll (Ready)
+        assert!(!executor.poll_once());
+        assert!(executor.is_empty());
     }
 }
-

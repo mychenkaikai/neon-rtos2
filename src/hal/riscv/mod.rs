@@ -53,7 +53,14 @@
 //! ```
 
 use crate::hal::traits::*;
+use crate::kernel::scheduler::Scheduler;
+pub mod pmp;
+pub mod trap;
 use core::arch::asm;
+use core::arch::global_asm;
+
+// 引入汇编上下文切换代码
+global_asm!(include_str!("asm/context.s"));
 
 // ============================================================================
 // 常量定义
@@ -276,23 +283,37 @@ pub fn init_task_stack(stack_top: &mut usize, entry: fn(usize), arg: usize) {
     
     let frame = sp as *mut usize;
     
+    // 栈帧布局 (与 context.s ���持一致):
+    //   偏移 0:   保留
+    //   偏移 4:   x1 (ra)
+    //   偏移 8:   x3 (gp)
+    //   ...
+    //   偏移 36:  x10 (a0) - 参数
+    //   ...
+    //   偏移 120: x31 (t6)
+    //   偏移 124: mepc - 任务入口
+    //   偏移 128: mstatus
+    //   偏移 132: 保留/对齐
+    
     unsafe {
-        // 清零所有寄存器槽位
+        // 清零所有寄存器槽位 (34 个 32 位字 = 136 字节)
         for i in 0..34 {
             *frame.add(i) = 0;
         }
         
-        // 设置返回地址 (ra/x1) - 任务退出时的处理
+        // 设置返回地址 (ra/x1) - 偏移 4，即 frame[1]
         *frame.add(1) = task_exit as usize;
         
-        // 设置参数 (a0/x10)
-        *frame.add(10) = arg;
+        // 设置参数 (a0/x10) - 偏移 36，即 frame[9]
+        // 注意：x10 是第 10 个寄存器，但 x0 不保存，x2(sp) 不保存
+        // 实际布局：frame[1]=x1, frame[2]=x3, ..., frame[9]=x10
+        *frame.add(9) = arg;
         
-        // 设置 mepc（任务入口）
-        *frame.add(32) = entry as usize;
+        // 设置 mepc（任务入口）- 偏移 124，即 frame[31]
+        *frame.add(31) = entry as usize;
         
-        // 设置 mstatus（启用中断：MIE=1, MPIE=1, MPP=11 机器模式）
-        *frame.add(33) = MSTATUS_MPIE | (3 << 11); // MPP = Machine mode
+        // 设置 mstatus（启用中断：MPIE=1, MPP=11 机器模式）- 偏移 128，即 frame[32]
+        *frame.add(32) = MSTATUS_MPIE | (3 << 11); // MPP = Machine mode
     }
     
     *stack_top = sp;
@@ -323,19 +344,129 @@ pub fn trigger_schedule() {
 ///
 /// 此函数不会返回，它会直接跳转到第一个任务
 pub fn start_first_task() {
+    // 配置 mtvec，将异常和中断入口指向 trap_entry
+    unsafe {
+        unsafe extern "C" {
+            fn trap_entry();
+        }
+        // Direct mode
+        asm!("csrw mtvec, {}", in(reg) trap_entry as usize);
+    }
+
+    // 获取第一个任务的栈指针
+    let first_task = Scheduler::get_current_task();
+    let stack_ptr = first_task.get_stack_top();
+    
     // 启用定时器中断和软件中断
     set_mie(MIE_MTIE | MIE_MSIE);
     
     // 启用全局中断
     enable_interrupts();
     
-    // 触发第一次调度
-    trigger_schedule();
-    
-    // 等待中断（不应该到达这里）
-    loop {
-        wait_for_interrupt();
+    // 直接跳转到第一个任务（不会返回）
+    unsafe {
+        start_first_task_asm(stack_ptr);
     }
+}
+
+/// 启动第一个任务的汇编实现
+/// 
+/// 使用内联汇编实现，避免需要外部汇编器
+/// 
+/// 栈帧布局 (与 context.s 保持一致):
+///   偏移 0:   保留
+///   偏移 4:   x1 (ra)
+///   偏移 8:   x3 (gp)
+///   偏移 12:  x4 (tp)
+///   偏移 16:  x5 (t0)
+///   偏移 20:  x6 (t1)
+///   偏移 24:  x7 (t2)
+///   偏移 28:  x8 (s0)
+///   偏移 32:  x9 (s1)
+///   偏移 36:  x10 (a0)
+///   偏移 40:  x11 (a1)
+///   偏移 44:  x12 (a2)
+///   偏移 48:  x13 (a3)
+///   偏移 52:  x14 (a4)
+///   偏移 56:  x15 (a5)
+///   偏移 60:  x16 (a6)
+///   偏移 64:  x17 (a7)
+///   偏移 68:  x18 (s2)
+///   偏移 72:  x19 (s3)
+///   偏移 76:  x20 (s4)
+///   偏移 80:  x21 (s5)
+///   偏移 84:  x22 (s6)
+///   偏移 88:  x23 (s7)
+///   偏移 92:  x24 (s8)
+///   偏移 96:  x25 (s9)
+///   偏移 100: x26 (s10)
+///   偏移 104: x27 (s11)
+///   偏移 108: x28 (t3)
+///   偏移 112: x29 (t4)
+///   偏移 116: x30 (t5)
+///   偏移 120: x31 (t6)
+///   偏移 124: mepc
+///   偏移 128: mstatus
+#[cfg(target_arch = "riscv32")]
+#[inline(never)]
+unsafe fn start_first_task_asm(stack_ptr: usize) -> ! {
+    asm!(
+        // 设置栈指针
+        "mv      sp, {0}",
+        
+        // 恢复 mstatus (偏移 128) 和 mepc (偏移 124)
+        "lw      t0, 128(sp)",     // mstatus
+        "csrw    mstatus, t0",
+        "lw      t0, 124(sp)",     // mepc
+        "csrw    mepc, t0",
+        
+        // 恢复所有通用寄存器
+        "lw      x1,  4(sp)",      // ra
+        "lw      x3,  8(sp)",      // gp
+        "lw      x4,  12(sp)",     // tp
+        "lw      x5,  16(sp)",     // t0
+        "lw      x6,  20(sp)",     // t1
+        "lw      x7,  24(sp)",     // t2
+        "lw      x8,  28(sp)",     // s0
+        "lw      x9,  32(sp)",     // s1
+        "lw      x10, 36(sp)",     // a0
+        "lw      x11, 40(sp)",     // a1
+        "lw      x12, 44(sp)",     // a2
+        "lw      x13, 48(sp)",     // a3
+        "lw      x14, 52(sp)",     // a4
+        "lw      x15, 56(sp)",     // a5
+        "lw      x16, 60(sp)",     // a6
+        "lw      x17, 64(sp)",     // a7
+        "lw      x18, 68(sp)",     // s2
+        "lw      x19, 72(sp)",     // s3
+        "lw      x20, 76(sp)",     // s4
+        "lw      x21, 80(sp)",     // s5
+        "lw      x22, 84(sp)",     // s6
+        "lw      x23, 88(sp)",     // s7
+        "lw      x24, 92(sp)",     // s8
+        "lw      x25, 96(sp)",     // s9
+        "lw      x26, 100(sp)",    // s10
+        "lw      x27, 104(sp)",    // s11
+        "lw      x28, 108(sp)",    // t3
+        "lw      x29, 112(sp)",    // t4
+        "lw      x30, 116(sp)",    // t5
+        "lw      x31, 120(sp)",    // t6
+        
+        // 释放栈帧
+        "addi    sp, sp, 136",
+        
+        // 跳转到任务入口
+        "mret",
+        
+        in(reg) stack_ptr,
+        options(noreturn)
+    );
+}
+
+/// 非 RISC-V 平台的占位实现
+#[cfg(not(target_arch = "riscv32"))]
+unsafe fn start_first_task_asm(_stack_ptr: usize) -> ! {
+    loop {}
 }
 
 /// 初始化空闲任务
@@ -343,7 +474,17 @@ pub fn start_first_task() {
 /// 创建一个低优先级的空闲任务，在没有其他任务运行时执行
 pub fn init_idle_task() {
     // 空闲任务在 RISC-V 上使用 WFI 指令等待中断
-    // 具体实现由调度器处理
+    // 支持 Tickless
+    fn idle_task(_arg: usize) {
+        loop {
+            // 获取距离下一个定时器超时的预计时间
+            let next_timeout = crate::kernel::time::timer::Timer::get_next_timeout();
+            
+            // 进入空闲模式
+            crate::kernel::power::enter_idle(next_timeout);
+        }
+    }
+    let _task = crate::kernel::task::Task::new("idle", idle_task).unwrap();
 }
 
 /// 初始化系统定时器

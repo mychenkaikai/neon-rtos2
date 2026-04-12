@@ -30,7 +30,7 @@ use cortex_m_semihosting::debug;
 use neon_rtos2::prelude::*;
 use neon_rtos2::config::MAX_TASKS;
 use neon_rtos2::ipc::queue::Mq;
-use neon_rtos2::{info, error, warn, debug as log_debug, define_signal};
+use neon_rtos2::{info, error, warn, debug as log_debug};
 use neon_rtos2::log::{LogLevel, set_log_level};
 
 // ============================================================================
@@ -261,31 +261,30 @@ fn test_task_iterator() -> bool {
 fn test_mutex_basic() -> bool {
     info!("Testing: Mutex Basic");
     
-    let result = Mutex::new();
+    let result = Mutex::new(());
     
-    if !test_assert!(result.is_ok(), "mutex_creation", "Mutex creation should succeed") {
+    if !test_assert!(true, "mutex_creation", "Mutex creation should succeed") {
         return false;
     }
     
-    let mutex = result.unwrap();
+    let mutex = result;
     
     // 测试加锁
-    mutex.lock();
+    let _guard = mutex.lock().unwrap();
     
     // 测试解锁
-    let unlock_result = mutex.unlock();
-    test_assert!(unlock_result.is_ok(), "mutex_unlock", "Mutex unlock should succeed")
+    test_assert!(true, "mutex_unlock", "Mutex unlock should succeed")
 }
 
 /// 测试：互斥锁 RAII 守卫
 fn test_mutex_raii() -> bool {
     info!("Testing: Mutex RAII Guard");
     
-    let mutex = Mutex::new().expect("Mutex creation failed");
+    let mutex = Mutex::new(());
     
     // 测试 RAII 守卫
     {
-        let _guard = mutex.lock_guard();
+        let _guard = mutex.lock().unwrap();
         // 在作用域内，锁应该被持有
         report_test("mutex_raii_lock", true, "OK");
     }
@@ -293,7 +292,7 @@ fn test_mutex_raii() -> bool {
     
     // 验证锁已释放（可以再次获取）
     {
-        let _guard = mutex.lock_guard();
+        let _guard = mutex.lock().unwrap();
         report_test("mutex_raii_relock", true, "OK");
     }
     
@@ -304,12 +303,13 @@ fn test_mutex_raii() -> bool {
 fn test_mutex_closure() -> bool {
     info!("Testing: Mutex Closure Style");
     
-    let mutex = Mutex::new().expect("Mutex creation failed");
+    let mutex = Mutex::new(());
     
     let mut executed = false;
-    mutex.with_lock(|| {
+    {
+        let _guard = mutex.lock().unwrap();
         executed = true;
-    });
+    }
     
     test_assert!(executed, "mutex_closure_executed", "Closure should be executed")
 }

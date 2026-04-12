@@ -271,6 +271,7 @@ dependencies = [
  "embedded-alloc",
  "paste",
  "rand",
+ "riscv",
  "riscv-rt",
  "serial_test",
  "spin",

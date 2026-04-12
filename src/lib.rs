@@ -188,6 +188,7 @@ pub use paste;
 #[cfg(feature = "cortex_m3")]
 macro_rules! default_panic_handler {
     () => {
+        #[cfg(not(test))]
         #[panic_handler]
         fn panic(_info: &core::panic::PanicInfo) -> ! {
             loop {}
@@ -200,6 +201,7 @@ macro_rules! default_panic_handler {
 #[cfg(feature = "riscv")]
 macro_rules! default_panic_handler {
     () => {
+        #[cfg(not(test))]
         #[panic_handler]
         fn panic(info: &core::panic::PanicInfo) -> ! {
             $crate::error!("PANIC!");

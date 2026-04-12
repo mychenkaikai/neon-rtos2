@@ -22,7 +22,7 @@
 //!
 //! ## 时间管理
 //! - [`Timer`] - 软件定时器
-//! - [`Delay`] - 延时功能
+//! - [`Delay`] - 延时休眠功能
 //! - [`Systick`] - 系统滴答时钟
 //!
 //! ## 同步原语
@@ -90,7 +90,7 @@ pub use crate::kernel::scheduler::Scheduler;
 /// 软件定时器
 pub use crate::kernel::time::timer::Timer;
 
-/// 延时功能
+/// 延时休眠功能（以 tick 为单位阻塞当前任务）
 pub use crate::kernel::time::timer::Delay;
 
 /// 系统滴答时钟

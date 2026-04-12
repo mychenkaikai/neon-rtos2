@@ -21,6 +21,7 @@
 pub use alloc::{
     boxed::Box,
     collections::VecDeque,
+    collections::BinaryHeap,
     string::String,
     sync::Arc,
     vec,
@@ -31,6 +32,7 @@ pub use alloc::{
 pub use std::{
     boxed::Box,
     collections::VecDeque,
+    collections::BinaryHeap,
     string::String,
     sync::Arc,
     vec,

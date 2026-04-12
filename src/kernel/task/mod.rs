@@ -104,7 +104,7 @@ impl TaskState {
 }
 
 #[repr(C)]
-#[repr(align(8))]
+#[repr(align(32))]
 pub struct Stack {
     pub data: [u8; STACK_SIZE],
 }
@@ -389,6 +389,12 @@ impl Task {
     /// 设置栈顶指针 - O(1)，原子操作
     pub fn set_stack_top(&mut self, stack_top: usize) {
         get_task_list()[self.0].set_stack_top(stack_top);
+    }
+
+    /// 获取任务栈底部地址（最低地址，用于 MPU 保护）
+    /// O(1)，静态数组地址计算
+    pub fn get_stack_bottom(&self) -> usize {
+        unsafe { addr_of!(TASK_STACKS[self.0].data) as usize }
     }
 
     /// 获取任务优先级 - O(1)，原子操作
@@ -823,8 +829,8 @@ mod tests {
         assert_eq!(task2.get_state(), TaskState::Ready);
         assert_eq!(task1.get_name(), "task1");
         assert_eq!(task2.get_name(), "task2");
-        assert_eq!(task1.get_taskid(), 0);
-        assert_eq!(task2.get_taskid(), 1);
+        assert_eq!(task1.get_taskid(), 1);
+        assert_eq!(task2.get_taskid(), 2);
         //检测栈顶是否8字节对齐
         assert_eq!(task1.get_stack_top() & !(0x0007), task1.get_stack_top());
         assert_eq!(task2.get_stack_top() & !(0x0007), task2.get_stack_top());
@@ -835,7 +841,7 @@ mod tests {
     #[serial]
     fn test_task_overflow() {
         kernel_init();
-        for _ in 0..MAX_TASKS {
+        for _ in 1..MAX_TASKS {
             Task::new("task", task1).unwrap();
         }
         assert_eq!(Task::new("task", task1).err(), Some(RtosError::TaskSlotsFull));
@@ -859,30 +865,34 @@ mod tests {
     #[serial]
     fn test_task_for_each_from() {
         kernel_init();
-        //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
         let mut cnt = 0;
         Task::new("task1", task1).unwrap();
         Task::new("task2", task2).unwrap();
-        Task::for_each_from(0, |task, id| {
+        Task::for_each_from(1, |task, id| {
             if cnt == 0 {
                 assert_eq!(task.get_name(), "task1");
-                assert_eq!(id, 0);
+                assert_eq!(id, 1);
                 cnt += 1;
             } else if cnt == 1 {
                 assert_eq!(task.get_name(), "task2");
-                assert_eq!(id, 1);
+                assert_eq!(id, 2);
                 cnt += 1;
             }
         });
         cnt = 0;
-        Task::for_each_from(1, |task, id| {
+        Task::for_each_from(2, |task, id| {
             if cnt == 0 {
                 assert_eq!(task.get_name(), "task2");
-                assert_eq!(id, 1);
+                assert_eq!(id, 2);
                 cnt += 1;
             } else if cnt == 1 {
-                assert_eq!(task.get_name(), "task1");
+                // it wraps around and first encounters "idle"
+                assert_eq!(task.get_name(), "idle");
                 assert_eq!(id, 0);
+                cnt += 1;
+            } else if cnt == 2 {
+                assert_eq!(task.get_name(), "task1");
+                assert_eq!(id, 1);
                 cnt += 1;
             }
         });
@@ -891,19 +901,22 @@ mod tests {
     #[test]
     #[serial]
     fn test_task_for_each() {
-        //使用一个cnt来记录遍历的次数，cnt为0的时候，应该是task1，cnt为1的时候，应该是task2
         let mut cnt = 0;
         kernel_init();
         Task::new("task1", task1).unwrap();
         Task::new("task2", task2).unwrap();
         Task::for_each(|task, id| {
             if cnt == 0 {
-                assert_eq!(task.get_name(), "task1");
+                assert_eq!(task.get_name(), "idle");
                 assert_eq!(id, 0);
                 cnt += 1;
             } else if cnt == 1 {
-                assert_eq!(task.get_name(), "task2");
+                assert_eq!(task.get_name(), "task1");
                 assert_eq!(id, 1);
+                cnt += 1;
+            } else if cnt == 2 {
+                assert_eq!(task.get_name(), "task2");
+                assert_eq!(id, 2);
                 cnt += 1;
             }
         });
@@ -971,14 +984,14 @@ mod tests {
         let mut count = 0;
         let mut found_task3 = false;
 
-        Task::for_each_from(0, |task, _| {
+        Task::for_each_from(1, |task, _| {
             count += 1;
             if task.get_taskid() == task3.get_taskid() {
                 found_task3 = true;
             }
         });
 
-        assert_eq!(count, 2); // 只应遍历两个任务
+        assert_eq!(count, 3); // idle (if wrapped), task_1, task_3
         assert!(found_task3); // 应该找到task3
     }
 
@@ -1019,14 +1032,15 @@ mod tests {
         
         // 使用快照迭代器
         let snapshot_iter = Task::snapshot_iter();
-        assert_eq!(snapshot_iter.len(), 3);
+        assert_eq!(snapshot_iter.len(), 4); // idle + 3 tasks
         
         // 遍历快照
         let snapshots: Vec<_> = Task::snapshot_iter().collect();
-        assert_eq!(snapshots.len(), 3);
-        assert_eq!(snapshots[0].name, "task1");
-        assert_eq!(snapshots[1].name, "task2");
-        assert_eq!(snapshots[2].name, "task3");
+        assert_eq!(snapshots.len(), 4);
+        assert_eq!(snapshots[0].name, "idle");
+        assert_eq!(snapshots[1].name, "task1");
+        assert_eq!(snapshots[2].name, "task2");
+        assert_eq!(snapshots[3].name, "task3");
     }
 
     #[test]
@@ -1035,8 +1049,8 @@ mod tests {
         kernel_init();
         
         let snapshot_iter = Task::snapshot_iter();
-        assert!(snapshot_iter.is_empty());
-        assert_eq!(snapshot_iter.len(), 0);
+        assert!(!snapshot_iter.is_empty()); // idle task exists
+        assert_eq!(snapshot_iter.len(), 1);
     }
 
     #[test]
@@ -1057,9 +1071,10 @@ mod tests {
             .ready_snapshots()
             .collect();
         
-        assert_eq!(ready_snapshots.len(), 1);
-        assert_eq!(ready_snapshots[0].name, "ready_task");
-        assert_eq!(ready_snapshots[0].state, TaskState::Ready);
+        assert_eq!(ready_snapshots.len(), 2);
+        assert_eq!(ready_snapshots[0].name, "idle");
+        assert_eq!(ready_snapshots[1].name, "ready_task");
+        assert_eq!(ready_snapshots[1].state, TaskState::Ready);
     }
 
     #[test]
@@ -1119,11 +1134,14 @@ mod tests {
         Task::new("task2", |_| {}).unwrap();
         
         let mut iter = Task::snapshot_iter();
+        assert_eq!(iter.len(), 3);
+        
+        iter.next();
         assert_eq!(iter.len(), 2);
         
         iter.next();
         assert_eq!(iter.len(), 1);
-        
+
         iter.next();
         assert_eq!(iter.len(), 0);
     }

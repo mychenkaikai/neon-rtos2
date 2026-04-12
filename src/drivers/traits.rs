@@ -1,3 +1,5 @@
+#![allow(async_fn_in_trait)]
+
 //! # 设备驱动 Trait 定义
 //!
 //! 提供统一的设备驱动抽象接口，支持多种外设类型。
@@ -167,6 +169,39 @@ pub trait Read: Device {
     }
 }
 
+/// 异步可读设备 trait
+///
+/// 实现此 trait 的设备支持异步读取数据。
+pub trait AsyncRead: Device {
+    /// 异步读取数据到缓冲区
+    ///
+    /// # 参数
+    ///
+    /// - `buf`: 目标缓冲区
+    ///
+    /// # 返回值
+    ///
+    /// 成功返回实际读取的字节数，失败返回错误
+    async fn read_async(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error>;
+
+    /// 异步读取单个字节
+    async fn read_byte_async(&mut self) -> Result<u8, Self::Error> {
+        let mut buf = [0u8; 1];
+        self.read_async(&mut buf).await?;
+        Ok(buf[0])
+    }
+
+    /// 异步读取直到缓冲区满
+    async fn read_exact_async(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let n = self.read_async(&mut buf[offset..]).await?;
+            offset += n;
+        }
+        Ok(())
+    }
+}
+
 /// 可写设备 trait
 ///
 /// 实现此 trait 的设备支持写入数据。
@@ -208,6 +243,33 @@ pub trait Write: Device {
     }
 }
 
+/// 异步可写设备 trait
+///
+/// 实现此 trait 的设备支持异步写入数据。
+pub trait AsyncWrite: Device {
+    /// 异步写入数据
+    async fn write_async(&mut self, buf: &[u8]) -> Result<usize, Self::Error>;
+
+    /// 异步刷新缓冲区
+    async fn flush_async(&mut self) -> Result<(), Self::Error>;
+
+    /// 异步写入单个字节
+    async fn write_byte_async(&mut self, byte: u8) -> Result<(), Self::Error> {
+        self.write_async(&[byte]).await?;
+        Ok(())
+    }
+
+    /// 异步写入所有数据
+    async fn write_all_async(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let n = self.write_async(&buf[offset..]).await?;
+            offset += n;
+        }
+        self.flush_async().await
+    }
+}
+
 /// 可读写设备 trait
 ///
 /// 组合了 `Read` 和 `Write` trait
@@ -215,6 +277,11 @@ pub trait ReadWrite: Read + Write {}
 
 // 自动为同时实现 Read 和 Write 的类型实现 ReadWrite
 impl<T: Read + Write> ReadWrite for T {}
+
+/// 异步可读写设备 trait
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+
+impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
 // ============================================================================
 // GPIO Trait
@@ -389,6 +456,18 @@ pub trait Uart: Read + Write {
     fn is_tx_ready(&self) -> bool;
 }
 
+/// 异步 UART 设备 trait
+pub trait AsyncUart: AsyncRead + AsyncWrite {
+    /// 配置 UART
+    fn configure(&mut self, config: SerialConfig) -> Result<(), Self::Error>;
+
+    /// 设置波特率
+    fn set_baudrate(&mut self, baudrate: u32) -> Result<(), Self::Error>;
+
+    /// 获取当前波特率
+    fn baudrate(&self) -> u32;
+}
+
 // ============================================================================
 // SPI Trait
 // ============================================================================
@@ -456,6 +535,28 @@ pub trait Spi: Device {
     }
 }
 
+/// 异步 SPI 设备 trait
+pub trait AsyncSpi: Device {
+    /// 配置 SPI
+    fn configure(&mut self, config: SpiConfig) -> Result<(), Self::Error>;
+
+    /// 异步传输数据（同时读写）
+    async fn transfer_async(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error>;
+
+    /// 异步只写数据
+    async fn write_async(&mut self, data: &[u8]) -> Result<(), Self::Error>;
+
+    /// 异步只读数据
+    async fn read_async(&mut self, data: &mut [u8]) -> Result<(), Self::Error>;
+
+    /// 异步传输单个字节
+    async fn transfer_byte_async(&mut self, byte: u8) -> Result<u8, Self::Error> {
+        let mut read = [0u8; 1];
+        self.transfer_async(&mut read, &[byte]).await?;
+        Ok(read[0])
+    }
+}
+
 // ============================================================================
 // I2C Trait
 // ============================================================================
@@ -506,6 +607,21 @@ pub trait I2c: Device {
     /// - `write`: 要写入的数据
     /// - `read`: 读取缓冲区
     fn write_read(&mut self, addr: u8, write: &[u8], read: &mut [u8]) -> Result<(), Self::Error>;
+}
+
+/// 异步 I2C 设备 trait
+pub trait AsyncI2c: Device {
+    /// 配置 I2C
+    fn configure(&mut self, config: I2cConfig) -> Result<(), Self::Error>;
+
+    /// 异步写入数据到指定地址
+    async fn write_async(&mut self, addr: u8, data: &[u8]) -> Result<(), Self::Error>;
+
+    /// 异步从指定地址读取数据
+    async fn read_async(&mut self, addr: u8, data: &mut [u8]) -> Result<(), Self::Error>;
+
+    /// 异步写入后读取
+    async fn write_read_async(&mut self, addr: u8, write: &[u8], read: &mut [u8]) -> Result<(), Self::Error>;
 }
 
 // ============================================================================

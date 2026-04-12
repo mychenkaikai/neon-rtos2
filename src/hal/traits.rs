@@ -1,3 +1,5 @@
+#![allow(async_fn_in_trait)]
+
 //! 硬件抽象层 Trait 定义
 //!
 //! 这些 trait 定义了 RTOS 与底层硬件交互的接口，
@@ -56,6 +58,18 @@ pub trait SysTickTrait {
     ///
     /// 在 SysTick 中断中调用，处理定时器和任务调度
     fn tick_handler();
+
+    /// 暂停系统时钟（用于 Tickless Idle）
+    ///
+    /// # 参数
+    /// - `ticks`: 预计暂停的 tick 数量
+    fn suspend(ticks: usize);
+
+    /// 恢复系统时钟
+    ///
+    /// # 返回值
+    /// 实际经过的 tick 数量
+    fn resume() -> usize;
 }
 
 /// 空闲任务 trait
@@ -133,6 +147,66 @@ pub trait InterruptControl {
     /// # 参数
     /// - `irq`: 中断号
     fn disable_irq(irq: u32);
+
+    /// 注册中断处理函数
+    ///
+    /// # 参数
+    /// - `irq`: 中断号
+    /// - `handler`: 中断处理函数
+    fn register_handler(irq: u32, handler: fn());
+
+    /// 注销中断处理函数
+    ///
+    /// # 参数
+    /// - `irq`: 中断号
+    fn unregister_handler(irq: u32);
+}
+
+/// DMA 传输方向
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmaDirection {
+    /// 内存到外设
+    MemoryToPeripheral,
+    /// 外设到内存
+    PeripheralToMemory,
+    /// 内存到内存
+    MemoryToMemory,
+    /// 外设到外设
+    PeripheralToPeripheral,
+}
+
+/// DMA 传输配置
+#[derive(Debug, Clone)]
+pub struct DmaConfig {
+    /// 源地址
+    pub src_addr: usize,
+    /// 目标地址
+    pub dst_addr: usize,
+    /// 传输数据长度
+    pub length: usize,
+    /// 传输方向
+    pub direction: DmaDirection,
+}
+
+/// DMA 控制器 trait
+///
+/// 抽象平台底层的直接内存访问（DMA）引擎
+pub trait DmaController {
+    /// DMA 错误类型
+    type Error;
+
+    /// 启动异步 DMA 传输
+    ///
+    /// # 参数
+    /// - `channel`: DMA 通道号
+    /// - `config`: 传输配置
+    async fn start_transfer_async(&mut self, channel: u8, config: DmaConfig) -> Result<(), Self::Error>;
+
+    /// 停止 DMA 传输
+    fn stop_transfer(&mut self, channel: u8) -> Result<(), Self::Error>;
+
+    /// 获取 DMA 通道传输剩余长度
+    fn remaining_length(&self, channel: u8) -> usize;
 }
 
 /// 处理器控制 trait
@@ -191,5 +265,27 @@ pub trait ArchInfo {
     /// # 返回值
     /// 栈对齐字节数，通常为 4 或 8
     fn stack_alignment() -> usize;
+}
+
+/// 平台/SoC 抽象 trait
+///
+/// 定义了统一的平台生命周期和硬件资源管理接口。
+/// 具体开发板或芯片需要实现此 trait 来提供平台特定的初始化。
+pub trait Platform {
+    /// 平台特定的错误类型
+    type Error;
+
+    /// 获取平台名称
+    fn platform_name() -> &'static str;
+
+    /// 平台早期初始化
+    ///
+    /// 在内核和调度器启动前调用，用于初始化核心时钟、内存控制器等基础硬件。
+    fn early_init() -> Result<(), Self::Error>;
+
+    /// 平台设备初始化
+    ///
+    /// 在调度器初始化后调用，用于注册和初始化板载外设驱动（如 UART, SPI, 定时器）。
+    fn device_init() -> Result<(), Self::Error>;
 }
 

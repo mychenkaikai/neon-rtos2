@@ -23,8 +23,7 @@ impl Systick {
         }
     }
 
-    #[cfg(test)]
-    pub fn add_current_time(ms_time: usize) -> usize {
+    pub(crate) fn add_current_time(ms_time: usize) -> usize {
         unsafe {
             CURRENT_TIME += ms_time;
             return CURRENT_TIME;

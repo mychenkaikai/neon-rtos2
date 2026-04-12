@@ -250,7 +250,9 @@ pub struct SemihostOutput;
 #[cfg(feature = "cortex_m3")]
 impl LogOutput for SemihostOutput {
     fn write_str(&self, s: &str) {
-        cortex_m_semihosting::hprint!("{}", s);
+        // 使用 hprint! 宏直接输出，这是最可靠的方式
+        use cortex_m_semihosting::hprint;
+        let _ = hprint!("{}", s);
     }
 }
 

@@ -219,24 +219,15 @@ impl PowerManager {
         PowerState::from(self.current_state.load(Ordering::Acquire))
     }
 
-    /// 进入空闲状态
+    /// 进入空闲状态（支持 Tickless）
     ///
     /// CPU 进入 WFI 状态，等待中断唤醒。
-    /// 这是最轻量的低功耗模式，任何中断都可以唤醒。
-    ///
-    /// # 示例
-    ///
-    /// ```rust,ignore
-    /// // 在空闲任务中使用
-    /// loop {
-    ///     PowerManager::global().enter_idle();
-    /// }
-    /// ```
-    pub fn enter_idle(&self) {
+    /// 传入 expected_ticks 表示距离下一个定时器超时的预计时间。
+    pub fn enter_idle(&self, expected_ticks: Option<usize>) {
         self.current_state.store(PowerState::Idle as u8, Ordering::Release);
         
         // 架构相关的空闲实现
-        Self::arch_enter_idle();
+        Self::arch_enter_idle(expected_ticks);
         
         // 唤醒后恢复 Active 状态
         self.current_state.store(PowerState::Active as u8, Ordering::Release);
@@ -261,8 +252,8 @@ impl PowerManager {
     pub fn enter_sleep(&self) {
         // 检查是否有唤醒源
         if self.wakeup_sources.load(Ordering::Acquire) == 0 {
-            // 没有唤醒源，退化为 idle
-            self.enter_idle();
+            // 没有唤醒源，退化为 idle，没有超时限制
+            self.enter_idle(None);
             return;
         }
 
@@ -374,16 +365,95 @@ impl PowerManager {
 
     /// 架构相关：进入空闲模式
     #[inline]
-    fn arch_enter_idle() {
+    fn arch_enter_idle(expected_ticks: Option<usize>) {
         #[cfg(all(target_arch = "arm", feature = "cortex_m3"))]
         unsafe {
-            // Cortex-M: WFI 指令
+            let syst_csr = 0xE000_E010 as *mut u32;
+            let syst_rvr = 0xE000_E014 as *mut u32;
+            let syst_cvr = 0xE000_E018 as *mut u32;
+            
+            let mut systick_disabled = false;
+            let mut reprogrammed_ticks = 0;
+            let mut original_rvr = 0;
+
+            if let Some(ticks) = expected_ticks {
+                if ticks > 1 {
+                    // 读取当前的 RVR (代表 1ms 的时钟周期数)
+                    original_rvr = core::ptr::read_volatile(syst_rvr);
+                    let ticks_per_ms = original_rvr + 1;
+                    
+                    // 计算最大可睡眠的毫秒数 (SysTick 是 24 位计数器)
+                    let max_sleep_ms = 0x00FF_FFFF / ticks_per_ms;
+                    
+                    let sleep_ms = (ticks as u32).min(max_sleep_ms);
+                    
+                    if sleep_ms > 1 {
+                        // 重新编程 SysTick RVR 以实现 Tickless Idle
+                        let new_rvr = (sleep_ms * ticks_per_ms) - 1;
+                        core::ptr::write_volatile(syst_rvr, new_rvr);
+                        core::ptr::write_volatile(syst_cvr, 0); // 清除当前计数，立即加载新 RVR
+                        reprogrammed_ticks = sleep_ms as usize;
+                    }
+                }
+            } else {
+                // 没有活动定时器，完全关闭 SysTick 中断
+                let mut csr = core::ptr::read_volatile(syst_csr);
+                csr &= !(1 << 1); // 清除 TICKINT
+                core::ptr::write_volatile(syst_csr, csr);
+                systick_disabled = true;
+            }
+            
             cortex_m::asm::wfi();
+            
+            if systick_disabled {
+                // 唤醒后重新启用 SysTick 中断
+                let mut csr = core::ptr::read_volatile(syst_csr);
+                csr |= 1 << 1; // 设置 TICKINT
+                core::ptr::write_volatile(syst_csr, csr);
+            } else if reprogrammed_ticks > 1 {
+                let ticks_per_ms = original_rvr + 1;
+                // 读取醒来时的 CVR (倒计数器当前值)
+                let cvr = core::ptr::read_volatile(syst_cvr);
+                let rvr = core::ptr::read_volatile(syst_rvr);
+                
+                // 计算实际流逝的系统时钟周期数
+                let elapsed_cycles = rvr - cvr;
+                let mut elapsed_ms = elapsed_cycles / ticks_per_ms;
+                
+                // 检查是否是因为 SysTick 中断而唤醒的 (COUNTFLAG bit 16)
+                let csr = core::ptr::read_volatile(syst_csr);
+                let systick_fired = (csr & (1 << 16)) != 0;
+                
+                // 恢复原始的 1ms RVR
+                core::ptr::write_volatile(syst_rvr, original_rvr);
+                // 强制重载
+                core::ptr::write_volatile(syst_cvr, 0);
+                
+                if systick_fired {
+                    // SysTick 中断已经触发并加了 1，所以补偿要减 1
+                    elapsed_ms = reprogrammed_ticks as u32;
+                    if elapsed_ms > 0 {
+                        crate::kernel::time::systick::Systick::add_current_time((elapsed_ms - 1) as usize);
+                    }
+                } else {
+                    // 是被外部中断提前唤醒的，补偿实际经过的 ms
+                    crate::kernel::time::systick::Systick::add_current_time(elapsed_ms as usize);
+                }
+                
+                // 检查是否有超时的定时器并触发调度
+                crate::kernel::time::timer::Timer::timer_check_and_send_event();
+                crate::hal::trigger_schedule();
+            }
         }
         
         #[cfg(not(all(target_arch = "arm", feature = "cortex_m3")))]
         {
-            // 测试/其他平台：空操作
+            // 对于其他平台或测试环境，模拟时间流逝并自旋
+            if let Some(ticks) = expected_ticks {
+                if ticks > 1 {
+                    crate::kernel::time::systick::Systick::add_current_time(ticks);
+                }
+            }
             core::hint::spin_loop();
         }
     }
@@ -470,8 +540,8 @@ impl Default for PowerManager {
 ///     enter_idle();
 /// }
 /// ```
-pub fn enter_idle() {
-    PowerManager::global().enter_idle();
+pub fn enter_idle(expected_ticks: Option<usize>) {
+    PowerManager::global().enter_idle(expected_ticks);
 }
 
 /// 进入睡眠模式
@@ -555,7 +625,7 @@ mod tests {
         let pm = PowerManager::new();
         
         // 进入空闲模式（在测试环境中会立即返回）
-        pm.enter_idle();
+        pm.enter_idle(None);
         
         // 应该恢复到 Active 状态
         assert_eq!(pm.state(), PowerState::Active);

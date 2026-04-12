@@ -63,6 +63,7 @@ dependencies = [
  "critical-section",
  "embedded-alloc",
  "paste",
+ "riscv",
  "riscv-rt",
  "spin",
 ]

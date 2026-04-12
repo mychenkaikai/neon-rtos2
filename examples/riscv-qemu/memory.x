@@ -3,8 +3,11 @@
 
 MEMORY
 {
-    /* QEMU virt machine RAM starts at 0x80000000 */
-    RAM : ORIGIN = 0x80000000, LENGTH = 128M
+    /* QEMU virt machine RAM starts at 0x80000000 
+     * 我们只使用前 16MB，给 DTB 和其他固件留出空间
+     * QEMU 会把 DTB 放在内存的高地址区域
+     */
+    RAM : ORIGIN = 0x80000000, LENGTH = 16M
 }
 
 /* Region aliases for riscv-rt */
