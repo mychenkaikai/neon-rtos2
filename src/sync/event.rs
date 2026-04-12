@@ -27,6 +27,26 @@ impl Event {
             }
         });
     }
+
+    pub(crate) fn wake_task_by_id(task_id: usize) -> bool {
+        let mut task = Task(task_id);
+        if let TaskState::Blocked(_) = task.get_state() {
+            task.ready();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn wake_task_by_id_if(task_id: usize, event_type: Event) -> bool {
+        let mut task = Task(task_id);
+        if task.get_state() == TaskState::Blocked(event_type) {
+            task.ready();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +166,55 @@ mod tests {
         }
         if task3.get_taskid() != current_id {
             assert_eq!(task3.get_state(), TaskState::Ready);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_wake_task_by_id() {
+        kernel_init();
+
+        let mut task1 = Task::new("wake_by_id_1", |_| {}).unwrap();
+        let mut task2 = Task::new("wake_by_id_2", |_| {}).unwrap();
+
+        Scheduler::start();
+
+        let current_id = Scheduler::get_current_task().get_taskid();
+
+        if task1.get_taskid() != current_id {
+            task1.block(Event::Signal(11));
+        }
+        if task2.get_taskid() != current_id {
+            task2.block(Event::Signal(22));
+        }
+
+        if task1.get_taskid() != current_id {
+            assert!(Event::wake_task_by_id(task1.get_taskid()));
+            assert_eq!(task1.get_state(), TaskState::Ready);
+        }
+
+        if task2.get_taskid() != current_id {
+            assert_eq!(task2.get_state(), TaskState::Blocked(Event::Signal(22)));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_wake_task_by_id_if() {
+        kernel_init();
+
+        let mut task = Task::new("wake_by_id_if", |_| {}).unwrap();
+
+        Scheduler::start();
+
+        let current_id = Scheduler::get_current_task().get_taskid();
+
+        if task.get_taskid() != current_id {
+            task.block(Event::Timer(7));
+            assert!(!Event::wake_task_by_id_if(task.get_taskid(), Event::Signal(7)));
+            assert_eq!(task.get_state(), TaskState::Blocked(Event::Timer(7)));
+            assert!(Event::wake_task_by_id_if(task.get_taskid(), Event::Timer(7)));
+            assert_eq!(task.get_state(), TaskState::Ready);
         }
     }
     

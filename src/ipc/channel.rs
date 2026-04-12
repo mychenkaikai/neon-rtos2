@@ -106,7 +106,7 @@ impl IpcManager {
 
                     // 唤醒等待接收的任务
                     if let Some(waiting_task) = queue.waiting_receivers.pop() {
-                        Event::wake_task(Event::Mq(handle.0));
+                        Event::wake_task_by_id(waiting_task.get_taskid());
                     }
 
                     Ok(())
@@ -140,8 +140,8 @@ impl IpcManager {
                     let message = queue.queue.pop_front().unwrap();
 
                     // 唤醒等待发送的任务
-                    if let Some(_waiting_task) = queue.waiting_senders.pop() {
-                        Event::wake_task(Event::Mq(handle.0));
+                    if let Some(waiting_task) = queue.waiting_senders.pop() {
+                        Event::wake_task_by_id(waiting_task.get_taskid());
                     }
 
                     match message.try_into::<T>() {

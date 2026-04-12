@@ -336,13 +336,10 @@ impl Semaphore {
             };
 
             if let Some(task_id) = task_id {
-                Task::for_each(|task, id| {
-                    if id == task_id {
-                        if let TaskState::Blocked(_) = task.get_state() {
-                            task.ready();
-                        }
-                    }
-                });
+                let mut task = Task(task_id);
+                if let TaskState::Blocked(_) = task.get_state() {
+                    task.ready();
+                }
                 continue;
             }
 
@@ -374,13 +371,10 @@ impl Semaphore {
         }
 
         for task_id in task_ids.iter().filter_map(|&id| id) {
-            Task::for_each(|task, id| {
-                if id == task_id {
-                    if let TaskState::Blocked(_) = task.get_state() {
-                        task.ready();
-                    }
-                }
-            });
+            let mut task = Task(task_id);
+            if let TaskState::Blocked(_) = task.get_state() {
+                task.ready();
+            }
         }
 
         // 唤醒所有异步等待者
@@ -1128,4 +1122,3 @@ mod tests {
         assert_eq!(sem2.max_permits(), 5);
     }
 }
-

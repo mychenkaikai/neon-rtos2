@@ -77,7 +77,7 @@ unsafe fn wake(data: *const ()) {
             state.queue.push_back(arc.future_id);
         }
     });
-    Event::wake_task(Event::Async(arc.rtos_task_id));
+    Event::wake_task_by_id(arc.rtos_task_id);
     // arc 随离开作用域被 drop
 }
 
@@ -94,7 +94,7 @@ unsafe fn wake_by_ref(data: *const ()) {
             state.queue.push_back(arc.future_id);
         }
     });
-    Event::wake_task(Event::Async(arc.rtos_task_id));
+    Event::wake_task_by_id(arc.rtos_task_id);
     let _ = Arc::into_raw(arc);
 }
 

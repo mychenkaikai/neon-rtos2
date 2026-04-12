@@ -1,7 +1,9 @@
 use crate::config::MAX_MQS;
-use crate::sync::event::Event;
-use crate::kernel::task::Task;
 use crate::error::{Result, RtosError};
+use crate::hal::trigger_schedule;
+use crate::kernel::scheduler::Scheduler;
+use crate::sync::event::Event;
+use crate::sync::signal::WaiterList;
 use core::mem::MaybeUninit;
 
 // 全局变量数组，用于给 mq 分配 id
@@ -20,8 +22,8 @@ pub struct Mq<T, const N: usize> {
     head: usize,
     tail: usize,
     count: usize,
-    locked: bool,
-    owner: Option<Task>,
+    send_waiters: WaiterList,
+    recv_waiters: WaiterList,
     id: usize,
 }
 
@@ -53,8 +55,8 @@ where
             head: 0,
             tail: 0,
             count: 0,
-            locked: false,
-            owner: None,
+            send_waiters: WaiterList::new(),
+            recv_waiters: WaiterList::new(),
             id,
         })
     }
@@ -74,29 +76,11 @@ where
     /// - `true` - 成功推送
     /// - `false` - 队列已满或被锁定
     pub fn push(&mut self, data: T) -> bool {
-        if self.locked {
-            if let Some(mut owner) = self.owner {
-                owner.block(Event::Mq(self.id));
-            }
-            return false;
-        }
-
         if self.count == N {
             return false;
         }
 
-        unsafe {
-            // 直接写入 tail 位置
-            *self.buffer.get_unchecked_mut(self.tail) = MaybeUninit::new(data);
-
-            self.count += 1;
-            self.tail = (self.tail + 1) % N;
-        }
-        // 设置 owner 为空
-        self.owner = None;
-        self.locked = false;
-        // 唤醒被阻塞的 task
-        Event::wake_task(Event::Mq(self.id));
+        self.push_inner(data);
         true
     }
 
@@ -106,30 +90,32 @@ where
     /// - `Some(T)` - 成功弹出数据
     /// - `None` - 队列为空或被锁定
     pub fn pop(&mut self) -> Option<T> {
-        if self.locked {
-            if let Some(mut owner) = self.owner {
-                owner.block(Event::Mq(self.id));
-            }
-            return None;
-        }
-
         if self.count == 0 {
             return None;
         }
 
-        let ret;
-        unsafe {
-            // 直接从 head 位置读取
-            ret = Some(self.buffer.get_unchecked(self.head).assume_init());
+        Some(self.pop_inner())
+    }
 
-            self.count -= 1;
-            self.head = (self.head + 1) % N;
+    pub fn push_wait(&mut self, data: T) -> Result<()> {
+        loop {
+            if self.count < N {
+                self.push_inner(data);
+                return Ok(());
+            }
+
+            self.wait_as_sender()?;
         }
-        self.owner = None;
-        self.locked = false;
-        // 唤醒被阻塞的 task
-        Event::wake_task(Event::Mq(self.id));
-        ret
+    }
+
+    pub fn pop_wait(&mut self) -> Result<T> {
+        loop {
+            if self.count > 0 {
+                return Ok(self.pop_inner());
+            }
+
+            self.wait_as_receiver()?;
+        }
     }
 
     /// 获取队列当前元素数量
@@ -145,6 +131,84 @@ where
     /// 检查队列是否已满
     pub fn is_full(&self) -> bool {
         self.count == N
+    }
+
+    pub(crate) fn register_sender_waiter(&mut self, task_id: usize) -> Result<()> {
+        Self::register_waiter(&mut self.send_waiters, task_id)
+    }
+
+    pub(crate) fn register_receiver_waiter(&mut self, task_id: usize) -> Result<()> {
+        Self::register_waiter(&mut self.recv_waiters, task_id)
+    }
+
+    fn event(&self) -> Event {
+        Event::Mq(self.id)
+    }
+
+    fn push_inner(&mut self, data: T) {
+        unsafe {
+            *self.buffer.get_unchecked_mut(self.tail) = MaybeUninit::new(data);
+            self.count += 1;
+            self.tail = (self.tail + 1) % N;
+        }
+        self.wake_next_receiver();
+    }
+
+    fn pop_inner(&mut self) -> T {
+        let ret;
+        unsafe {
+            ret = self.buffer.get_unchecked(self.head).assume_init();
+            self.count -= 1;
+            self.head = (self.head + 1) % N;
+        }
+        self.wake_next_sender();
+        ret
+    }
+
+    fn wait_as_sender(&mut self) -> Result<()> {
+        let mut current = Scheduler::get_current_task();
+        self.register_sender_waiter(current.get_taskid())?;
+        current.block(self.event());
+        trigger_schedule();
+        Ok(())
+    }
+
+    fn wait_as_receiver(&mut self) -> Result<()> {
+        let mut current = Scheduler::get_current_task();
+        self.register_receiver_waiter(current.get_taskid())?;
+        current.block(self.event());
+        trigger_schedule();
+        Ok(())
+    }
+
+    fn register_waiter(waiters: &mut WaiterList, task_id: usize) -> Result<()> {
+        if waiters.contains(task_id) {
+            return Ok(());
+        }
+
+        if waiters.push(task_id) {
+            Ok(())
+        } else {
+            Err(RtosError::WaiterQueueFull)
+        }
+    }
+
+    fn wake_next_sender(&mut self) -> bool {
+        while let Some(task_id) = self.send_waiters.pop_front() {
+            if Event::wake_task_by_id_if(task_id, self.event()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn wake_next_receiver(&mut self) -> bool {
+        while let Some(task_id) = self.recv_waiters.pop_front() {
+            if Event::wake_task_by_id_if(task_id, self.event()) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -162,7 +226,7 @@ impl<T, const N: usize> Drop for Mq<T, N> {
 mod tests {
     use super::*;
     use crate::kernel::scheduler::Scheduler;
-    use crate::kernel::task::Task;
+    use crate::kernel::task::{Task, TaskState};
     use crate::utils::kernel_init;
     use serial_test::serial;
 
@@ -281,5 +345,47 @@ mod tests {
         // 再创建一个应该失败
         let result: Result<Mq<u32, 4>> = Mq::new();
         assert_eq!(result.err(), Some(RtosError::QueueFull));
+    }
+
+    #[test]
+    #[serial]
+    fn test_mq_push_wakes_one_waiting_receiver() {
+        kernel_init();
+
+        let mut mq: Mq<u32, 2> = Mq::new().unwrap();
+        let mut receiver1 = Task::new("receiver1", |_| {}).unwrap();
+        let mut receiver2 = Task::new("receiver2", |_| {}).unwrap();
+
+        mq.register_receiver_waiter(receiver1.get_taskid()).unwrap();
+        mq.register_receiver_waiter(receiver2.get_taskid()).unwrap();
+
+        receiver1.block(Event::Mq(mq.id));
+        receiver2.block(Event::Mq(mq.id));
+
+        assert!(mq.push(7));
+        assert_eq!(receiver1.get_state(), TaskState::Ready);
+        assert_eq!(receiver2.get_state(), TaskState::Blocked(Event::Mq(mq.id)));
+    }
+
+    #[test]
+    #[serial]
+    fn test_mq_pop_wakes_one_waiting_sender() {
+        kernel_init();
+
+        let mut mq: Mq<u32, 1> = Mq::new().unwrap();
+        let mut sender1 = Task::new("sender1", |_| {}).unwrap();
+        let mut sender2 = Task::new("sender2", |_| {}).unwrap();
+
+        assert!(mq.push(11));
+
+        mq.register_sender_waiter(sender1.get_taskid()).unwrap();
+        mq.register_sender_waiter(sender2.get_taskid()).unwrap();
+
+        sender1.block(Event::Mq(mq.id));
+        sender2.block(Event::Mq(mq.id));
+
+        assert_eq!(mq.pop(), Some(11));
+        assert_eq!(sender1.get_state(), TaskState::Ready);
+        assert_eq!(sender2.get_state(), TaskState::Blocked(Event::Mq(mq.id)));
     }
 }

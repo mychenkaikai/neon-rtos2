@@ -14,6 +14,7 @@ pub struct TimerInner {
     running: bool,
     timeout: usize,
     seq: usize,
+    waiter: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -69,6 +70,7 @@ impl Timer {
                         running: false,
                         timeout: expire_time,
                         seq: 0,
+                        waiter: None,
                     });
                     return Ok(Timer(i));
                 }
@@ -106,6 +108,7 @@ impl Timer {
             let (timeout, seq) = if let Some(ref mut timer) = manager.timers[self.0] {
                 timer.running = true;
                 timer.seq = timer.seq.wrapping_add(1);
+                timer.waiter = None;
                 (timer.timeout, timer.seq)
             } else {
                 return Err(RtosError::TimerNotFound);
@@ -127,6 +130,7 @@ impl Timer {
             if let Some(ref mut timer) = manager.timers[self.0] {
                 timer.running = false;
                 timer.seq = timer.seq.wrapping_add(1); // 使事件无效
+                timer.waiter = None;
                 Ok(())
             } else {
                 Err(RtosError::TimerNotFound)
@@ -174,11 +178,31 @@ impl Timer {
                 
                 if let Some(ref mut timer) = manager.timers[event.id] {
                     if timer.running && timer.seq == event.seq {
-                        Event::wake_task(Event::Timer(event.id));
+                        let timer_event = Event::Timer(event.id);
+                        let waiter = timer.waiter.take();
+                        if let Some(task_id) = waiter {
+                            if !Event::wake_task_by_id_if(task_id, timer_event) {
+                                Event::wake_task(timer_event);
+                            }
+                        } else {
+                            Event::wake_task(timer_event);
+                        }
                     }
                 }
             }
         });
+    }
+
+    pub(crate) fn set_waiter(&mut self, task_id: usize) -> Result<()> {
+        critical_section::with(|cs| {
+            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+            if let Some(ref mut timer) = manager.timers[self.0] {
+                timer.waiter = Some(task_id);
+                Ok(())
+            } else {
+                Err(RtosError::TimerNotFound)
+            }
+        })
     }
 
     /// 获取距离下一个定时器超时的剩余时间（毫秒/ticks）
@@ -245,6 +269,8 @@ impl Delay {
     pub fn delay(timeout: usize) -> Result<()> {
         let mut timer = Timer::new(timeout)?;
         timer.start()?;
+        let task_id = Scheduler::get_current_task().get_taskid();
+        timer.set_waiter(task_id)?;
         Scheduler::get_current_task().block(Event::Timer(timer.0));
         trigger_schedule();
         timer.delete();
@@ -255,6 +281,7 @@ impl Delay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::scheduler::Scheduler;
     use crate::sync::event::Event;
     use crate::kernel::time::systick::Systick;
     use crate::kernel::task::Task;
@@ -391,5 +418,26 @@ mod tests {
         
         // `get_next_timeout` 会惰性删除堆顶无效事件，下一个应该是 t2 (200)
         assert_eq!(Timer::get_next_timeout(), Some(200));
+    }
+
+    #[test]
+    #[serial]
+    fn test_timer_directed_wakeup() {
+        kernel_init();
+
+        let mut task = Task::new("timer_waiter", |_| {}).unwrap();
+        let mut timer = Timer::new(100).unwrap();
+        timer.start().unwrap();
+
+        Scheduler::start();
+
+        let current_id = Scheduler::get_current_task().get_taskid();
+        if task.get_taskid() != current_id {
+            timer.set_waiter(task.get_taskid()).unwrap();
+            task.block(Event::Timer(timer.get_id()));
+            Systick::add_current_time(100);
+            Timer::timer_check_and_send_event();
+            assert_eq!(task.get_state(), TaskState::Ready);
+        }
     }
 }

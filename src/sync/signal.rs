@@ -797,13 +797,7 @@ impl Signal {
 
     /// 内部辅助函数：根据任务 ID 唤醒任务
     fn wake_task_by_id(task_id: usize) {
-        Task::for_each(|task, id| {
-            if id == task_id {
-                if let TaskState::Blocked(_) = task.get_state() {
-                    task.ready();
-                }
-            }
-        });
+        crate::sync::event::Event::wake_task_by_id(task_id);
     }
 }
 
@@ -1836,4 +1830,3 @@ mod tests {
         assert_eq!(signal_v2_back.try_wait().unwrap(), true);
     }
 }
-
