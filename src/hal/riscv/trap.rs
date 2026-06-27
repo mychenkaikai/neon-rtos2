@@ -1,4 +1,5 @@
 use crate::kernel::scheduler::Scheduler;
+use crate::kernel::time::timer::Timer;
 use crate::kernel::time::systick::Systick;
 use super::{clear_software_interrupt, systick_handler};
 use super::pmp::PmpConfig;
@@ -29,6 +30,7 @@ pub extern "C" fn trap_handler(mcause: usize, mepc: usize, sp: usize) -> usize {
                 // 默认 10ms (假设 10Mhz clock -> 100_000 ticks)
                 systick_handler(100_000);
                 Systick::systick_inc();
+                Timer::timer_check_and_send_event();
                 Scheduler::task_switch();
             }
             _ => {}

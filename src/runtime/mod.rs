@@ -1,59 +1,57 @@
 //! # 异步运行时模块
 //!
-//! 提供基础的异步运行时支持，包括执行器、Waker 和 Future 辅助类型。
+//! 提供当前已落地的异步运行时支持，包括执行器、Waker、异步休眠和常用 Future
+//! 辅助类型。
 //!
-//! ## 特性
+//! ## 当前特性
 //!
-//! - 🚀 **轻量级执行器**: 适合嵌入式环境的简单执行器
-//! - ⚡ **零成本 Waker**: 基于任务 ID 的唤醒机制
-//! - 🔄 **异步原语**: 异步信号量、定时器、通道
-//! - 🎯 **Select 宏**: 同时等待多个异步操作
+//! - 轻量级执行器：只轮询被唤醒的 Future，适合嵌入式环境
+//! - 基于任务 ID 的 Waker：唤醒 Future 的同时唤醒承载执行器的 RTOS 任务
+//! - 异步原语：异步信号量、异步休眠、异步通道和 `yield_now()`
+//! - `select!` 宏：同时等待多个异步操作
+//!
+//! ## 当前范围
+//!
+//! - `Executor::run()` 与 `Executor::poll_once()` 共享同一条核心轮询路径
+//! - `sleep(duration_ms)` 在首次 `poll` 时注册一次异步休眠槽位，截止时间到达后由
+//!   定时器路径唤醒，下一次 `poll` 返回 `Ready`
+//! - `run()` 在没有新唤醒任务但仍有未完成任务时，会阻塞当前 RTOS 任务，保持现有
+//!   空闲阻塞语义
+//! - 本模块当前不承诺 `Duration` 风格接口、多核执行或公平性策略
 //!
 //! ## 使用示例
 //!
 //! ### 基本用法
 //!
 //! ```rust,no_run
-//! use neon_rtos2::runtime::{Executor, channel::channel};
+//! use neon_rtos2::runtime::{Executor, sleep};
+//!
+//! async fn worker() {
+//!     sleep(10).await;
+//! }
 //!
 //! fn main() {
-//!     // 创建执行器
 //!     let mut executor = Executor::new();
-//!
-//!     // 创建通道
-//!     let (tx, rx) = channel::<u32>(16);
-//!
-//!     // 添加异步任务
-//!     executor.spawn(async move {
-//!         loop {
-//!             // 模拟等待信号
-//!             // signal.wait().await;
-//!             // 处理信号
-//!             break; // 避免无限循环导致测试卡死
-//!         }
-//!     });
-//!
-//!     // 运行执行器
+//!     executor.spawn(worker());
 //!     executor.run();
 //! }
 //! ```
 //!
 //! ### 使用 Select
 //!
-/// ```rust,no_run
-/// # use neon_rtos2::select;
-/// # use neon_rtos2::kernel::time::timer::Timer;
-/// # struct Rx;
-/// # impl Rx { async fn recv(&self) -> i32 { 0 } }
-/// # let rx = Rx;
-/// # let timer = Timer;
-/// async fn handle_events() {
-///     select! {
-///         msg = rx.recv() => println!("Received: {:?}", msg),
-///         _ = Timer::sleep(1000) => println!("Timeout!"),
-///     }
-/// }
-/// ```
+//! ```rust,no_run
+//! # use neon_rtos2::runtime::sleep;
+//! # use neon_rtos2::select;
+//! # struct Rx;
+//! # impl Rx { async fn recv(&self) -> i32 { 0 } }
+//! # let rx = Rx;
+//! async fn handle_events() {
+//!     select! {
+//!         msg = rx.recv() => println!("Received: {:?}", msg),
+//!         _ = sleep(1000) => println!("Timeout!"),
+//!     }
+//! }
+//! ```
 
 mod waker;
 mod executor;
@@ -73,4 +71,3 @@ pub use select::{
     select2, select3, select4,
     Race, race2, race3,
 };
-

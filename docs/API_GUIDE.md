@@ -1,6 +1,6 @@
 # Neon-RTOS2 API 使用指南
 
-> 最后更新：2025年12月27日
+> 最后更新：2026年6月13日
 
 本文档提供 Neon-RTOS2 的 API 使用指南和最佳实践。
 
@@ -13,6 +13,7 @@
 - [同步原语](#同步原语)
 - [进程间通信](#进程间通信)
 - [定时器系统](#定时器系统)
+- [异步运行时](#异步运行时)
 - [日志系统](#日志系统)
 - [错误处理](#错误处理)
 - [最佳实践](#最佳实践)
@@ -325,6 +326,54 @@ Systick::init();
 
 ---
 
+## 异步运行时
+
+### 创建并驱动执行器
+
+```rust,no_run
+use neon_rtos2::runtime::{Executor, sleep, yield_now};
+
+async fn worker() {
+    sleep(10).await;
+    yield_now().await;
+}
+
+fn run_runtime() {
+    let mut executor = Executor::new();
+    executor.spawn(worker());
+
+    while executor.poll_once() {
+        // 在测试或外部驱动场景中推进执行器。
+    }
+}
+```
+
+### 异步休眠
+
+```rust,no_run
+use neon_rtos2::runtime::sleep;
+
+async fn periodic() {
+    loop {
+        // 处理周期性工作
+        sleep(100).await;
+    }
+}
+```
+
+- `sleep(duration_ms)` 在首次 `poll` 时向定时器子系统注册异步休眠槽位。
+- `Timer::timer_check_and_send_event()` 在截止时间到达时会唤醒对应 `Waker`，执行器下一次轮询该 Future 时返回完成。
+- 如果 Future 在完成前被丢弃，其 `Drop` 会注销已注册的休眠槽位，避免残留等待项。
+
+### 当前支持范围
+
+- 本轮优化范围仅覆盖异步休眠的注册、截止时间唤醒、重新轮询完成路径，以及执行器唤醒队列与 `run()`/`poll_once()` 的共享轮询逻辑。
+- `Executor::run()` 适用于 RTOS 任务上下文；当没有可运行异步任务但仍有未完成 Future 时，它会阻塞当前 RTOS 任务并保持现有空闲语义。
+- `Executor::poll_once()` 不阻塞当前 RTOS 任务，适合测试或手动驱动。
+- 当前 API 仍以毫秒或 tick 整数参数为主，不提供 `Duration` 风格异步休眠接口。
+
+---
+
 ## 日志系统
 
 ### 日志级别
@@ -557,5 +606,4 @@ fn sensor_task(_: usize) {
 ---
 
 *文档版本：v1.0*  
-*最后更新：2025年12月27日*
-
+*最后更新：2026年6月13日*

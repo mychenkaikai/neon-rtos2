@@ -12,20 +12,18 @@
 //! ## 使用示例
 //!
 //! ```rust,no_run
+//! use neon_rtos2::runtime::sleep;
 //! use neon_rtos2::select;
-//! use core::time::Duration;
 //!
 //! // 模拟异步接收
 //! async fn recv() -> i32 { 42 }
-//! // 模拟异步睡眠
-//! async fn sleep(_dur: Duration) {}
 //!
 //! async fn example() {
 //!     select! {
 //!         data = recv() => {
 //!             // println!("Received data: {:?}", data);
 //!         }
-//!         _ = sleep(Duration::from_secs(1)) => {
+//!         _ = sleep(1000) => {
 //!             // println!("Timeout!");
 //!         }
 //!     }
@@ -341,18 +339,17 @@ macro_rules! __select_match {
 /// ## 基本用法
 ///
 /// ```rust,no_run
+/// use neon_rtos2::runtime::sleep;
 /// use neon_rtos2::select;
-/// use core::time::Duration;
 ///
 /// async fn recv() -> i32 { 42 }
-/// async fn sleep(_: Duration) {}
 ///
 /// async fn example() {
 ///     select! {
 ///         msg = recv() => {
 ///             // println!("Received: {:?}", msg);
 ///         }
-///         _ = sleep(Duration::from_secs(1)) => {
+///         _ = sleep(1000) => {
 ///             // println!("Timeout!");
 ///         }
 ///     }
@@ -952,4 +949,3 @@ mod tests {
         }
     }
 }
-

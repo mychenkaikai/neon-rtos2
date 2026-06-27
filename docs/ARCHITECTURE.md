@@ -1,6 +1,6 @@
 # Neon-RTOS2 架构设计文档
 
-> 最后更新：2025年12月28日
+> 最后更新：2026年6月13日
 
 本文档详细介绍 Neon-RTOS2 的架构设计、模块组织和核心实现原理。
 
@@ -540,36 +540,44 @@ SysTick 中断
 
 ```rust
 pub struct Executor {
-    /// 任务队列
-    tasks: Vec<Pin<Box<dyn Future<Output = ()>>>>,
-    /// Waker 注册表
-    wakers: HashMap<usize, Waker>,
+    tasks: Vec<Option<AsyncTask>>,
+    woken_state: Arc<Mutex<RefCell<WokenState>>>,
+    next_task_id: usize,
+    task_count: usize,
 }
 
 impl Executor {
-    /// 运行所有任务
-    pub fn run(&mut self) {
-        loop {
-            for (id, task) in self.tasks.iter_mut().enumerate() {
-                let waker = self.create_waker(id);
-                let mut cx = Context::from_waker(&waker);
-                
-                match task.as_mut().poll(&mut cx) {
-                    Poll::Ready(()) => {
-                        // 任务完成
-                    }
-                    Poll::Pending => {
-                        // 任务等待
-                    }
-                }
-            }
-            
-            // 等待事件
-            self.wait_for_event();
-        }
-    }
+    pub fn run(&mut self) { /* 阻塞式驱动 */ }
+    pub fn poll_once(&mut self) -> bool { /* 非阻塞驱动 */ }
 }
 ```
+
+- `spawn()` 会把新 Future 包装为 `AsyncTask`，并立即把任务 ID 推入唤醒队列，保证至少被轮询一次。
+- `run()` 与 `poll_once()` 都复用 `poll_next_woken_task()` 这一核心路径，只处理被唤醒的 Future，而不是每轮遍历所有任务。
+- `run()` 在没有新唤醒任务但执行器仍有未完成任务时，会把当前 RTOS 任务阻塞在 `Event::Async(...)` 上，再交回 RTOS 调度器，保留当前空闲阻塞语义。
+- `poll_once()` 共享同一轮询逻辑，但不会阻塞当前 RTOS 任务，更适合测试或外部手动驱动。
+- `TaskWaker` 在唤醒 Future 时会同时把 Future ID 放回执行器队列，并通过 `Event::wake_task_by_id()` 唤醒承载执行器的 RTOS 任务。
+
+### 异步休眠 (Sleep)
+
+```rust
+pub struct Sleep {
+    deadline: usize,
+    registered: bool,
+    waiter_id: Option<usize>,
+}
+```
+
+- `runtime::sleep(duration_ms)` 返回 `Sleep` Future；首次 `poll` 时通过 `Timer::register_async_sleep()` 注册一个异步休眠槽位。
+- `registered` 和 `waiter_id` 保证同一个 `Sleep` 只注册一次，不再依赖占位式 TODO 或仅克隆 `Waker` 的临时实现。
+- `Timer::timer_check_and_send_event()` 会在截止时间到达时取出对应 `Waker`、清理槽位，并触发唤醒。
+- 被唤醒的任务再次进入执行器后，`Sleep::poll()` 检查当前时间达到 `deadline`，随后返回 `Poll::Ready(())`。
+- 如果 `Sleep` 在完成前被丢弃，`Drop` 会调用 `Timer::unregister_async_sleep()` 清理未使用的槽位。
+
+### 本轮优化范围
+
+- 本轮只覆盖异步休眠的注册、截止时间唤醒、重新轮询完成路径，以及执行器的唤醒队列与共享轮询逻辑。
+- 本轮没有扩展为 `Duration` 风格时间接口，也没有引入公平调度、多核执行或新的定时器后端。
 
 ### Select 宏
 
@@ -713,5 +721,4 @@ Neon-RTOS2 通过精心设计的分层架构，实现了：
 ---
 
 *文档版本：v1.0*  
-*最后更新：2025年12月28日*
-
+*最后更新：2026年6月13日*

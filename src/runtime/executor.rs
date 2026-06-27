@@ -105,42 +105,9 @@ impl Executor {
         use crate::hal::trigger_schedule;
 
         loop {
-            let task_to_poll = critical_section::with(|cs| {
-                let mut state = self.woken_state.borrow_ref_mut(cs);
-                if let Some(id) = state.queue.pop_front() {
-                    state.in_queue[id] = false;
-                    Some(id)
-                } else {
-                    None
-                }
-            });
-
-            if let Some(id) = task_to_poll {
-                // 如果任务存在，进行 poll
-                if id < self.tasks.len() {
-                    let mut task_opt = self.tasks[id].take();
-                    if let Some(mut task) = task_opt.take() {
-                        let waker_data = Arc::new(WakerData {
-                            rtos_task_id: Scheduler::get_current_task().get_taskid(),
-                            future_id: id,
-                            woken_state: self.woken_state.clone(),
-                        });
-                        let waker = TaskWaker::new(waker_data);
-                        let mut cx = Context::from_waker(&waker);
-                        
-                        match task.future.as_mut().poll(&mut cx) {
-                            Poll::Ready(()) => {
-                                self.task_count -= 1;
-                            }
-                            Poll::Pending => {
-                                self.tasks[id] = Some(task);
-                            }
-                        }
-                    }
-                }
-            } else {
+            if !self.poll_next_woken_task() {
                 if self.is_empty() {
-                    break; 
+                    break;
                 }
 
                 // 没有新唤醒的任务，阻塞当前 RTOS 任务
@@ -153,42 +120,7 @@ impl Executor {
 
     /// 执行一轮调度
     pub fn poll_once(&mut self) -> bool {
-        use crate::kernel::scheduler::Scheduler;
-        
-        let task_to_poll = critical_section::with(|cs| {
-            let mut state = self.woken_state.borrow_ref_mut(cs);
-            if let Some(id) = state.queue.pop_front() {
-                state.in_queue[id] = false;
-                Some(id)
-            } else {
-                None
-            }
-        });
-
-        if let Some(id) = task_to_poll {
-            if id < self.tasks.len() {
-                let mut task_opt = self.tasks[id].take();
-                if let Some(mut task) = task_opt.take() {
-                    let waker_data = Arc::new(WakerData {
-                        rtos_task_id: Scheduler::get_current_task().get_taskid(),
-                        future_id: id,
-                        woken_state: self.woken_state.clone(),
-                    });
-                    let waker = TaskWaker::new(waker_data);
-                    let mut cx = Context::from_waker(&waker);
-                    
-                    match task.future.as_mut().poll(&mut cx) {
-                        Poll::Ready(()) => {
-                            self.task_count -= 1;
-                        }
-                        Poll::Pending => {
-                            self.tasks[id] = Some(task);
-                        }
-                    }
-                }
-            }
-        }
-        
+        self.poll_next_woken_task();
         !self.is_empty()
     }
 
@@ -200,6 +132,56 @@ impl Executor {
     /// 检查执行器是否为空
     pub fn is_empty(&self) -> bool {
         self.task_count == 0
+    }
+
+    fn poll_next_woken_task(&mut self) -> bool {
+        let Some(id) = self.pop_woken_task() else {
+            return false;
+        };
+
+        self.poll_task(id);
+        true
+    }
+
+    fn pop_woken_task(&mut self) -> Option<usize> {
+        critical_section::with(|cs| {
+            let mut state = self.woken_state.borrow_ref_mut(cs);
+            if let Some(id) = state.queue.pop_front() {
+                state.in_queue[id] = false;
+                Some(id)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn poll_task(&mut self, id: usize) {
+        use crate::kernel::scheduler::Scheduler;
+
+        if id >= self.tasks.len() {
+            return;
+        }
+
+        let Some(mut task) = self.tasks[id].take() else {
+            return;
+        };
+
+        let waker_data = Arc::new(WakerData {
+            rtos_task_id: Scheduler::get_current_task().get_taskid(),
+            future_id: id,
+            woken_state: self.woken_state.clone(),
+        });
+        let waker = TaskWaker::new(waker_data);
+        let mut cx = Context::from_waker(&waker);
+
+        match task.future.as_mut().poll(&mut cx) {
+            Poll::Ready(()) => {
+                self.task_count -= 1;
+            }
+            Poll::Pending => {
+                self.tasks[id] = Some(task);
+            }
+        }
     }
 }
 
@@ -298,7 +280,7 @@ mod tests {
         kernel_init();
         use core::future::Future;
         use core::pin::Pin;
-        use core::task::{Context, Poll, Waker};
+        use core::task::{Context, Poll};
         
         // 模拟一个需要多次 poll 才能完成的 future
         struct StepFuture {
@@ -334,5 +316,41 @@ mod tests {
         // 第 4 次 poll (Ready)
         assert!(!executor.poll_once());
         assert!(executor.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_poll_once_keeps_pending_state_without_new_wake() {
+        kernel_init();
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+
+        struct PendingFuture(bool);
+
+        impl Future for PendingFuture {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.0 {
+                    Poll::Pending
+                } else {
+                    self.0 = true;
+                    Poll::Pending
+                }
+            }
+        }
+
+        let mut executor = Executor::new();
+        executor.spawn(PendingFuture(false));
+
+        // 首次 poll 会消费初始唤醒项，但 future 不会重新唤醒自己。
+        assert!(executor.poll_once());
+        assert_eq!(executor.pending_count(), 1);
+
+        // 没有新的唤醒任务时，不应误完成任务，返回值仍表示存在未完成任务。
+        assert!(executor.poll_once());
+        assert_eq!(executor.pending_count(), 1);
+        assert!(!executor.is_empty());
     }
 }

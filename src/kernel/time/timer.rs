@@ -4,9 +4,10 @@ use crate::sync::event::Event;
 use crate::kernel::scheduler::Scheduler;
 use crate::kernel::time::systick::Systick;
 use crate::error::{Result, RtosError};
-use crate::compat::BinaryHeap;
+use crate::compat::{BinaryHeap, Vec};
 use core::cmp::Ordering;
 use core::cell::RefCell;
+use core::task::Waker;
 use critical_section::Mutex;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -22,6 +23,11 @@ struct TimerEvent {
     timeout: usize,
     id: usize,
     seq: usize,
+}
+
+struct AsyncSleepEntry {
+    deadline: usize,
+    waker: Option<Waker>,
 }
 
 impl Ord for TimerEvent {
@@ -41,6 +47,7 @@ impl PartialOrd for TimerEvent {
 struct TimerManager {
     timers: [Option<TimerInner>; MAX_TIMERS],
     heap: BinaryHeap<TimerEvent>,
+    async_sleeps: Vec<Option<AsyncSleepEntry>>,
 }
 
 impl TimerManager {
@@ -48,6 +55,7 @@ impl TimerManager {
         Self {
             timers: [None; MAX_TIMERS],
             heap: BinaryHeap::new(),
+            async_sleeps: Vec::new(),
         }
     }
 }
@@ -86,6 +94,7 @@ impl Timer {
                 manager.timers[i] = None;
             }
             manager.heap.clear();
+            manager.async_sleeps.clear();
         })
     }
 
@@ -167,7 +176,7 @@ impl Timer {
     /// 使用 O(1)/O(log N) 的 Min-Heap 实现
     pub fn timer_check_and_send_event() {
         let current_time = Systick::get_current_time();
-        critical_section::with(|cs| {
+        let async_wakers = critical_section::with(|cs| {
             let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
             while let Some(event) = manager.heap.peek() {
                 if event.timeout > current_time {
@@ -190,7 +199,25 @@ impl Timer {
                     }
                 }
             }
+
+            let mut async_wakers = Vec::new();
+            for entry in manager.async_sleeps.iter_mut() {
+                if let Some(sleep) = entry {
+                    if sleep.deadline <= current_time {
+                        if let Some(waker) = sleep.waker.take() {
+                            async_wakers.push(waker);
+                        }
+                        *entry = None;
+                    }
+                }
+            }
+
+            async_wakers
         });
+
+        for waker in async_wakers {
+            waker.wake();
+        }
     }
 
     pub(crate) fn set_waiter(&mut self, task_id: usize) -> Result<()> {
@@ -202,6 +229,43 @@ impl Timer {
             } else {
                 Err(RtosError::TimerNotFound)
             }
+        })
+    }
+
+    pub(crate) fn register_async_sleep(deadline: usize, waker: Waker) -> usize {
+        critical_section::with(|cs| {
+            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+            let entry = AsyncSleepEntry {
+                deadline,
+                waker: Some(waker),
+            };
+
+            for (id, slot) in manager.async_sleeps.iter_mut().enumerate() {
+                if slot.is_none() {
+                    *slot = Some(entry);
+                    return id;
+                }
+            }
+
+            manager.async_sleeps.push(Some(entry));
+            manager.async_sleeps.len() - 1
+        })
+    }
+
+    pub(crate) fn unregister_async_sleep(id: usize) {
+        critical_section::with(|cs| {
+            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+            if let Some(slot) = manager.async_sleeps.get_mut(id) {
+                *slot = None;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn async_sleep_count() -> usize {
+        critical_section::with(|cs| {
+            let manager = TIMER_MANAGER.borrow_ref(cs);
+            manager.async_sleeps.iter().filter(|slot| slot.is_some()).count()
         })
     }
 

@@ -7,6 +7,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use alloc::collections::VecDeque;
 use spin::Mutex;
+use crate::kernel::time::timer::Timer;
 use crate::kernel::time::systick::Systick;
 
 // ============================================================================
@@ -20,8 +21,7 @@ use crate::kernel::time::systick::Systick;
 /// # 示例
 ///
 /// ```rust,no_run
-/// # use neon_rtos2::runtime::AsyncSignal;
-/// # use neon_rtos2::kernel::time::timer::Timer;
+/// # use neon_rtos2::runtime::{AsyncSignal, sleep};
 /// static SIGNAL: AsyncSignal = AsyncSignal::new();
 ///
 /// // 生产者
@@ -29,7 +29,7 @@ use crate::kernel::time::systick::Systick;
 ///     loop {
 ///         // 生产数据...
 ///         SIGNAL.signal();
-///         Timer::sleep(100).await;
+///         sleep(100).await;
 ///     }
 /// }
 ///
@@ -186,6 +186,8 @@ pub struct Sleep {
     deadline: usize,
     /// 是否已注册 waker
     registered: bool,
+    /// 异步睡眠等待槽位 ID
+    waiter_id: Option<usize>,
 }
 
 impl Sleep {
@@ -194,6 +196,7 @@ impl Sleep {
         Self {
             deadline: Systick::get_current_time() + duration_ms,
             registered: false,
+            waiter_id: None,
         }
     }
 
@@ -220,14 +223,20 @@ impl Future for Sleep {
         if Systick::get_current_time() >= self.deadline {
             Poll::Ready(())
         } else {
-            // 注册 waker（在实际实现中，需要将 waker 注册到定时器系统）
             if !self.registered {
-                // TODO: 将 waker 注册到定时器中断处理程序
-                // 这里简化处理，实际需要与 SysTick 中断集成
-                let _ = cx.waker().clone();
+                let waiter_id = Timer::register_async_sleep(self.deadline, cx.waker().clone());
+                self.waiter_id = Some(waiter_id);
                 self.registered = true;
             }
             Poll::Pending
+        }
+    }
+}
+
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        if let Some(waiter_id) = self.waiter_id.take() {
+            Timer::unregister_async_sleep(waiter_id);
         }
     }
 }
@@ -340,7 +349,41 @@ impl<T> Future for Pending<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::time::timer::Timer;
     use crate::utils::kernel_init;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use serial_test::serial;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn counting_waker(counter: Arc<AtomicUsize>) -> Waker {
+        unsafe fn clone(data: *const ()) -> RawWaker {
+            let arc = unsafe { Arc::<AtomicUsize>::from_raw(data as *const AtomicUsize) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
+        }
+
+        unsafe fn wake(data: *const ()) {
+            let arc = unsafe { Arc::<AtomicUsize>::from_raw(data as *const AtomicUsize) };
+            arc.fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe fn wake_by_ref(data: *const ()) {
+            let arc = unsafe { Arc::<AtomicUsize>::from_raw(data as *const AtomicUsize) };
+            arc.fetch_add(1, Ordering::SeqCst);
+            let _ = Arc::into_raw(arc);
+        }
+
+        unsafe fn drop(data: *const ()) {
+            let _ = unsafe { Arc::<AtomicUsize>::from_raw(data as *const AtomicUsize) };
+        }
+
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+
+        let raw_waker = RawWaker::new(Arc::into_raw(counter) as *const (), &VTABLE);
+        unsafe { Waker::from_raw(raw_waker) }
+    }
 
     #[test]
     fn test_async_signal_basic() {
@@ -369,6 +412,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_sleep_creation() {
         kernel_init();
         
@@ -378,6 +422,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_sleep_elapsed() {
         kernel_init();
         
@@ -386,6 +431,33 @@ mod tests {
         
         assert!(sleep.is_elapsed());
         assert_eq!(sleep.remaining(), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_sleep_register_once_and_wake() {
+        kernel_init();
+
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(wake_count.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let mut sleep = Sleep::new(10);
+        let mut pinned = Pin::new(&mut sleep);
+
+        assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(Timer::async_sleep_count(), 1);
+
+        // 二次 poll 不应重复注册新的等待槽位
+        assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(Timer::async_sleep_count(), 1);
+
+        Systick::add_current_time(10);
+        Timer::timer_check_and_send_event();
+
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        assert_eq!(Timer::async_sleep_count(), 0);
+        assert!(matches!(pinned.poll(&mut cx), Poll::Ready(())));
     }
 
     #[test]
@@ -442,4 +514,3 @@ mod tests {
         }
     }
 }
-
