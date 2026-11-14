@@ -1,74 +1,13 @@
 //! # 类型状态模式 (Type State Pattern)
 //!
-//! 使用 Rust 类型系统在编译期保证任务状态转换的正确性。
-//!
-//! ## 设计理念
-//!
-//! 传统的任务状态管理使用枚举表示状态，状态转换的正确性只能在运行时检查。
-//! 类型状态模式将状态编码到类型系统中，让编译器在编译期就能捕获非法的状态转换。
-//!
-//! ## 使用示例
-//!
-//! ```rust,no_run
-//! # use neon_rtos2::kernel::task::state::*;
-//! # use neon_rtos2::kernel::task::state::TypedTask;
-//! # use neon_rtos2::kernel::task::state::Created;
-//! # use neon_rtos2::kernel::task::state::Ready;
-//! # use neon_rtos2::kernel::task::state::Running;
-//! # use neon_rtos2::kernel::task::state::Blocked;
-//! # use neon_rtos2::kernel::task::state::TypedTaskAny;
-//! # use neon_rtos2::kernel::task::state::TaskStateMarker;
-//! # use neon_rtos2::kernel::task::Task;
-//! # use neon_rtos2::prelude::*;
-//! # fn main() -> Result<(), RtosError> {
-//! # kernel_init();
-//! // 创建任务（Created 状态）
-//! let task = TypedTask::<Created>::new("my_task", |_| {
-//!     loop { /* 任务逻辑 */ }
-//! })?;
-//!
-//! // 启动任务（Created -> Ready）
-//! let task = task.start();
-//!
-//! // 运行任务（Ready -> Running）
-//! let task = task.run();
-//!
-//! // 以下代码无法编译！
-//! // task.start(); // 错误：Running 状态没有 start 方法
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## 状态转换图
-//!
-//! ```text
-//!                    ┌─────────┐
-//!                    │ Created │
-//!                    └────┬────┘
-//!                         │ start()
-//!                         ▼
-//!     ┌──────────────►┌─────��─┐◄──────────────┐
-//!     │               │ Ready │               │
-//!     │               └───┬───┘               │
-//!     │                   │ run()             │
-//!     │                   ▼                   │
-//!     │  yield_now() ┌─────────┐  wake()      │
-//!     └──────────────│ Running │──────────────┘
-//!                    └────┬────┘
-//!                         │ block()
-//!                         ▼
-//!                    ┌─────────┐
-//!                    │ Blocked │
-//!                    └────┬────┘
-//!                         │ wake()
-//!                         ▼
-//!                      (Ready)
-//! ```
+//! 创建句柄占用任务槽。启动后，类型化句柄记录观察时的状态；
+//! 调度器切换、阻塞和事件唤醒均可使快照过期。
+//! 需要最新状态时使用 `Task::into_typed()`。
 
-use core::marker::PhantomData;
 use crate::error::{Result, RtosError};
+use super::TaskState;
 use crate::sync::event::Event;
-use super::{Task, TaskFunction, Priority};
+use super::{Task, Priority};
 
 // ============================================================================
 // 状态标记类型
@@ -80,8 +19,14 @@ use super::{Task, TaskFunction, Priority};
 pub trait TaskStateMarker: private::Sealed {}
 
 /// 已创建状态 - 任务已创建但尚未启动
-#[derive(Debug, Clone, Copy)]
-pub struct Created;
+#[derive(Debug)]
+pub struct Created(Task);
+
+impl Drop for Created {
+    fn drop(&mut self) {
+        self.0.cancel_unstarted();
+    }
+}
 
 /// 就绪状态 - 任务已准备好运行，等待调度
 #[derive(Debug, Clone, Copy)]
@@ -116,8 +61,7 @@ mod private {
 
 /// 类型安全的任务句柄
 ///
-/// 通过泛型参数 `S` 编码任务的当前状态，
-/// 编译器会在编译期检查状态转换的合法性。
+/// 泛型参数 `S` 表示创建或读取句柄时观察到的状态。
 ///
 /// # 类型参数
 ///
@@ -128,14 +72,14 @@ mod private {
 /// ```rust,no_run
 /// # use neon_rtos2::kernel::task::state::*;
 /// # use neon_rtos2::prelude::*;
-/// # fn main() -> Result<(), RtosError> {
+/// # fn main() -> core::result::Result<(), RtosError> {
 /// # kernel_init();
 /// // 创建任务
-/// let task = TypedTask::<Created>::new("task", |_| {})?;
+/// let task = TypedTask::<Created>::new("task", || {})?;
 ///
 /// // 状态转换
-/// let task = task.start();  // Created -> Ready
-/// let task = task.run();    // Ready -> Running
+/// let task = task.start()?;  // Created -> Ready
+/// let snapshot = task.into_inner().into_typed()?;
 ///
 /// // 编译错误示例：
 /// // let task = TypedTask::<Running>::new(...); // 错误：只能创建 Created 状态
@@ -150,7 +94,7 @@ pub struct TypedTask<S: TaskStateMarker> {
     /// 阻塞事件（仅 Blocked 状态使用）
     pub(crate) blocked_event: Option<Event>,
     /// 状态标记（零大小类型，不占用内存）
-    pub(crate) _state: PhantomData<S>,
+    pub(crate) _state: S,
 }
 
 // ============================================================================
@@ -162,15 +106,8 @@ impl TypedTask<Created> {
     ///
     /// 新创建的任务处于 `Created` 状态，需要调用 `start()` 启动。
     /// 
-    /// ## 状态同步说明
-    /// 
-    /// `TypedTask<Created>` 的类型状态与底层 `Task` 的实际状��是同步的：
-    /// - 创建时，底层任务被设置为 `Ready` 状态（因为 `Task::new` 的行为）
-    /// - 但从类型系统角度，任务处于 `Created` 状态，表示"已创建但未被调度器管理"
-    /// - 调用 `start()` 后，任务进入 `Ready` 状态，可以被调度器调度
-    /// 
-    /// 这种设计允许用户在 `start()` 之前进行额外配置（如设置优先级），
-    /// 而不会被调度器意外调度。
+    /// 创建会保留一个任务槽和入口闭包。调用 start 才会进入就绪队列，
+    /// 丢弃未启动的创建句柄会释放预留的槽。
     ///
     /// # 参数
     ///
@@ -186,28 +123,28 @@ impl TypedTask<Created> {
     /// ```rust,no_run
     /// # use neon_rtos2::kernel::task::state::*;
     /// # use neon_rtos2::prelude::*;
-    /// # fn main() -> Result<(), RtosError> {
+    /// # fn main() -> core::result::Result<(), RtosError> {
     /// # kernel_init();
-    /// let task = TypedTask::<Created>::new("my_task", |_| {
+    /// let task = TypedTask::<Created>::new("my_task", || {
     ///     loop {
     ///         // 任务逻辑
     ///     }
     /// })?;
     /// // 此时任务已创建，但类型系统标记为 Created
     /// // 可以在 start() 之前进行配置
-    /// let task = task.start(); // 现在类型变为 Ready
+    /// let task = task.start()?; // 现在类型变为 Ready
     /// # Ok(())
     /// # }
     /// ```
     pub fn new<F>(name: &'static str, func: F) -> Result<Self>
     where
-        F: TaskFunction,
+        F: FnOnce() + Send + 'static,
     {
-        let inner = Task::new(name, func)?;
+        let inner = Task::allocate(name, func, Priority::Normal, super::TaskState::Created)?;
         Ok(Self {
             inner,
             blocked_event: None,
-            _state: PhantomData,
+            _state: Created(inner),
         })
     }
     
@@ -227,11 +164,11 @@ impl TypedTask<Created> {
     /// ```rust,no_run
     /// # use neon_rtos2::kernel::task::state::*;
     /// # use neon_rtos2::prelude::*;
-    /// # fn main() -> Result<(), RtosError> {
+    /// # fn main() -> core::result::Result<(), RtosError> {
     /// # kernel_init();
-    /// let mut task = TypedTask::<Created>::new("high_priority_task", |_| {})?;
+    /// let mut task = TypedTask::<Created>::new("high_priority_task", || {})?;
     /// task.set_priority(Priority::High);
-    /// let task = task.start(); // 启动时已经是高优先级
+    /// let task = task.start()?; // 启动时已经是高优先级
     /// # Ok(())
     /// # }
     /// ```
@@ -266,20 +203,26 @@ impl TypedTask<Created> {
     /// ```rust,no_run
     /// # use neon_rtos2::kernel::task::state::*;
     /// # use neon_rtos2::prelude::*;
-    /// # fn main() -> Result<(), RtosError> {
+    /// # fn main() -> core::result::Result<(), RtosError> {
     /// # kernel_init();
-    /// let task = TypedTask::<Created>::new("task", |_| {})?;
-    /// let task = task.start(); // 现在是 Ready 状态
+    /// let task = TypedTask::<Created>::new("task", || {})?;
+    /// let task = task.start()?; // 现在是 Ready 状态
     /// # Ok(())
     /// # }
     /// ```
-    pub fn start(self) -> TypedTask<Ready> {
-        // 任务创建时已经是 Ready 状态，这里只是类型转换
-        TypedTask {
+    pub fn start(mut self) -> Result<TypedTask<Ready>> {
+        critical_section::with(|cs| {
+            if self.inner.state_in(cs) != TaskState::Created {
+                return Err(RtosError::InvalidTaskState);
+            }
+            self.inner.ready();
+            Ok(())
+        })?;
+        Ok(TypedTask {
             inner: self.inner,
             blocked_event: None,
-            _state: PhantomData,
-        }
+            _state: Ready,
+        })
     }
 
     /// 获取任务 ID
@@ -298,44 +241,6 @@ impl TypedTask<Created> {
 // ============================================================================
 
 impl TypedTask<Ready> {
-    /// 运行任务（Ready -> Running）
-    ///
-    /// 将任务从 `Ready` 状态转换为 `Running` 状态。
-    /// 通常由调度器调用。
-    ///
-    /// # 返回值
-    ///
-    /// 返回 `TypedTask<Running>`
-    pub fn run(mut self) -> TypedTask<Running> {
-        self.inner.run();
-        TypedTask {
-            inner: self.inner,
-            blocked_event: None,
-            _state: PhantomData,
-        }
-    }
-
-    /// 阻塞任务（Ready -> Blocked）
-    ///
-    /// 将任务从 `Ready` 状态转换为 `Blocked` 状态，
-    /// 等待指定的事件。
-    ///
-    /// # 参数
-    ///
-    /// - `event`: 等待的事件
-    ///
-    /// # 返回值
-    ///
-    /// 返回 `TypedTask<Blocked>`
-    pub fn block(mut self, event: Event) -> TypedTask<Blocked> {
-        self.inner.block(event);
-        TypedTask {
-            inner: self.inner,
-            blocked_event: Some(event),
-            _state: PhantomData,
-        }
-    }
-
     /// 获取任务 ID
     pub fn id(&self) -> usize {
         self.inner.get_taskid()
@@ -362,43 +267,6 @@ impl TypedTask<Ready> {
 // ============================================================================
 
 impl TypedTask<Running> {
-    /// 让出 CPU（Running -> Ready）
-    ///
-    /// 主动让出 CPU，将任务从 `Running` 状态转换为 `Ready` 状态。
-    ///
-    /// # 返回值
-    ///
-    /// 返回 `TypedTask<Ready>`
-    pub fn yield_now(mut self) -> TypedTask<Ready> {
-        self.inner.ready();
-        TypedTask {
-            inner: self.inner,
-            blocked_event: None,
-            _state: PhantomData,
-        }
-    }
-
-    /// 阻塞任务（Running -> Blocked）
-    ///
-    /// 将任务从 `Running` 状态转换为 `Blocked` 状态，
-    /// 等待指定的事件。
-    ///
-    /// # 参数
-    ///
-    /// - `event`: 等待的事件
-    ///
-    /// # 返回值
-    ///
-    /// 返回 `TypedTask<Blocked>`
-    pub fn block(mut self, event: Event) -> TypedTask<Blocked> {
-        self.inner.block(event);
-        TypedTask {
-            inner: self.inner,
-            blocked_event: Some(event),
-            _state: PhantomData,
-        }
-    }
-
     /// 获取任务 ID
     pub fn id(&self) -> usize {
         self.inner.get_taskid()
@@ -420,23 +288,6 @@ impl TypedTask<Running> {
 // ============================================================================
 
 impl TypedTask<Blocked> {
-    /// 唤醒任务（Blocked -> Ready）
-    ///
-    /// 将任务从 `Blocked` 状态转换为 `Ready` 状态。
-    /// 通常在等待的事件发生时调用。
-    ///
-    /// # 返回值
-    ///
-    /// 返回 `TypedTask<Ready>`
-    pub fn wake(mut self) -> TypedTask<Ready> {
-        self.inner.ready();
-        TypedTask {
-            inner: self.inner,
-            blocked_event: None,
-            _state: PhantomData,
-        }
-    }
-
     /// 获取阻塞事件
     pub fn blocked_event(&self) -> Option<Event> {
         self.blocked_event
@@ -465,11 +316,14 @@ impl<S: TaskStateMarker> TypedTask<S> {
         &self.inner
     }
 
-    /// 获取内部任务句柄的可变引用
-    pub fn inner_mut(&mut self) -> &mut Task {
-        &mut self.inner
-    }
+}
 
+pub trait StartedState: TaskStateMarker {}
+impl StartedState for Ready {}
+impl StartedState for Running {}
+impl StartedState for Blocked {}
+
+impl<S: StartedState> TypedTask<S> {
     /// 消费自身，返回内部任务句柄
     ///
     /// 用于需要脱离类型状态系统的场景
@@ -491,11 +345,11 @@ impl<S: TaskStateMarker> TypedTask<S> {
 /// ```rust,no_run
 /// # use neon_rtos2::prelude::*;
 /// # use neon_rtos2::kernel::task::state::TypedTask;
-/// # fn main() -> Result<(), RtosError> {
+/// # fn main() -> core::result::Result<(), RtosError> {
 /// # kernel_init();
 /// let task = TypedTask::builder("my_task")
 ///     .priority(Priority::High)
-///     .spawn(|_| {
+///     .spawn(|| {
 ///         // 任务逻辑
 ///     })?;
 /// # Ok(())
@@ -531,12 +385,12 @@ impl TypedTaskBuilder {
     /// 3. 调用 `start()` 转换为 `Ready` 状态
     pub fn spawn<F>(self, func: F) -> Result<TypedTask<Ready>>
     where
-        F: TaskFunction,
+        F: FnOnce() + Send + 'static,
     {
         let mut task = TypedTask::<Created>::new(self.name, func)?;
         // 在 Created 状态设置优先级（更符合语义）
         task.set_priority(self.priority);
-        Ok(task.start())
+        task.start()
     }
 
     /// 只创建任务，不启动
@@ -548,23 +402,23 @@ impl TypedTaskBuilder {
     /// ```rust,no_run
     /// # use neon_rtos2::prelude::*;
     /// # use neon_rtos2::kernel::task::state::TypedTask;
-    /// # fn main() -> Result<(), RtosError> {
+    /// # fn main() -> core::result::Result<(), RtosError> {
     /// # kernel_init();
     /// let task = TypedTask::builder("my_task")
     ///     .priority(Priority::High)
-    ///     .build(|_| {})?;
+    ///     .build(|| {})?;
     /// 
     /// // 任务已创建并设置了优先级，但还未启动
     /// assert_eq!(task.priority(), Priority::High);
     /// 
     /// // 稍后启动
-    /// let task = task.start();
+    /// let task = task.start()?;
     /// # Ok(())
     /// # }
     /// ```
     pub fn build<F>(self, func: F) -> Result<TypedTask<Created>>
     where
-        F: TaskFunction,
+        F: FnOnce() + Send + 'static,
     {
         let mut task = TypedTask::<Created>::new(self.name, func)?;
         task.set_priority(self.priority);
@@ -585,9 +439,9 @@ impl TypedTaskBuilder {
 /// ```rust,no_run
 /// # use neon_rtos2::prelude::*;
 /// # use neon_rtos2::kernel::task::state::TypedTaskAny;
-/// # fn main() -> Result<(), RtosError> {
+/// # fn main() -> core::result::Result<(), RtosError> {
 /// # kernel_init();
-/// let task = Task::new("task", |_| {})?;
+/// let task = Task::new("task", || {})?;
 /// match task.into_typed()? {
 ///     TypedTaskAny::Ready(ready_task) => {
 ///         // 处理就绪状态的任务
@@ -608,7 +462,7 @@ impl TypedTaskBuilder {
 #[derive(Debug)]
 pub enum TypedTaskAny {
     /// 已创建状态
-    Created(TypedTask<Created>),
+    Created(Task),
     /// 就绪状态
     Ready(TypedTask<Ready>),
     /// 运行状态
@@ -647,7 +501,7 @@ impl TypedTaskAny {
     }
 
     /// 尝试转换为 Created 状态
-    pub fn into_created(self) -> Option<TypedTask<Created>> {
+    pub fn into_created(self) -> Option<Task> {
         match self {
             TypedTaskAny::Created(task) => Some(task),
             _ => None,
@@ -657,7 +511,7 @@ impl TypedTaskAny {
     /// 获取任务 ID
     pub fn id(&self) -> usize {
         match self {
-            TypedTaskAny::Created(task) => task.id(),
+            TypedTaskAny::Created(task) => task.get_taskid(),
             TypedTaskAny::Ready(task) => task.id(),
             TypedTaskAny::Running(task) => task.id(),
             TypedTaskAny::Blocked(task) => task.id(),
@@ -667,7 +521,7 @@ impl TypedTaskAny {
     /// 获取任务名称
     pub fn name(&self) -> &'static str {
         match self {
-            TypedTaskAny::Created(task) => task.name(),
+            TypedTaskAny::Created(task) => task.get_name(),
             TypedTaskAny::Ready(task) => task.name(),
             TypedTaskAny::Running(task) => task.name(),
             TypedTaskAny::Blocked(task) => task.name(),
@@ -675,32 +529,11 @@ impl TypedTaskAny {
     }
 }
 
-impl From<Task> for TypedTask<Ready> {
-    /// 从普通 Task 转换为 TypedTask<Ready>
-    ///
-    /// **注意**：此方法假设传入的 Task 处于 Ready 状态。
-    /// 如果不确定任务状态，请使用 `Task::into_typed()` 方法。
-    ///
-    /// # 示例
-    ///
-    /// ```rust,no_run
-    /// # use neon_rtos2::kernel::task::Task;
-    /// # use neon_rtos2::kernel::task::state::TypedTask;
-    /// # use neon_rtos2::kernel::task::state::Ready;
-    /// # use neon_rtos2::prelude::*;
-    /// # fn main() -> Result<(), RtosError> {
-    /// # kernel_init();
-    /// let task = Task::new("task", |_| {})?;
-    /// let typed_task: TypedTask<Ready> = task.into();
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn from(task: Task) -> Self {
-        Self {
-            inner: task,
-            blocked_event: None,
-            _state: PhantomData,
-        }
+impl TryFrom<Task> for TypedTask<Ready> {
+    type Error = RtosError;
+
+    fn try_from(task: Task) -> Result<Self> {
+        task.into_typed()?.into_ready().ok_or(RtosError::InvalidTaskState)
     }
 }
 
@@ -711,6 +544,7 @@ impl From<Task> for TypedTask<Ready> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::scheduler::Scheduler;
     use crate::utils::kernel_init;
     use serial_test::serial;
 
@@ -719,7 +553,7 @@ mod tests {
     fn test_typed_task_creation() {
         kernel_init();
         
-        let task = TypedTask::<Created>::new("test_task", |_| {}).unwrap();
+        let task = TypedTask::<Created>::new("test_task", || {}).unwrap();
         assert_eq!(task.name(), "test_task");
     }
 
@@ -728,22 +562,13 @@ mod tests {
     fn test_typed_task_state_transitions() {
         kernel_init();
         
-        // Created -> Ready
-        let task = TypedTask::<Created>::new("transition_task", |_| {}).unwrap();
-        let task = task.start();
-        
-        // Ready -> Running
-        let task = task.run();
-        
-        // Running -> Ready (yield)
-        let task = task.yield_now();
-        
-        // Ready -> Blocked
-        let task = task.block(Event::Signal(1));
-        assert_eq!(task.blocked_event(), Some(Event::Signal(1)));
-        
-        // Blocked -> Ready (wake)
-        let _task = task.wake();
+        let task = TypedTask::<Created>::new("transition", || {}).unwrap().start().unwrap().into_inner();
+        assert!(task.block_if_ready(Event::Signal(1)));
+        assert!(!task.wake_if(Event::Timer(1)));
+        assert!(task.wake_if(Event::Signal(1)));
+        Scheduler::start();
+        Scheduler::task_switch();
+        assert!(task.into_typed().unwrap().into_running().is_some());
     }
 
     #[test]
@@ -753,7 +578,7 @@ mod tests {
         
         let task = TypedTask::builder("builder_task")
             .priority(Priority::High)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         assert_eq!(task.name(), "builder_task");
@@ -765,12 +590,14 @@ mod tests {
     fn test_typed_task_running_to_blocked() {
         kernel_init();
         
-        let task = TypedTask::<Created>::new("block_task", |_| {}).unwrap();
-        let task = task.start();
-        let task = task.run();
+        let task = TypedTask::<Created>::new("block_task", || {}).unwrap();
+        let mut task = task.start().unwrap().into_inner();
+        Scheduler::start();
+        Scheduler::task_switch();
         
         // Running -> Blocked
-        let task = task.block(Event::Timer(100));
+        task.block(Event::Timer(100));
+        let task = task.into_typed().unwrap().into_blocked().unwrap();
         assert_eq!(task.blocked_event(), Some(Event::Timer(100)));
     }
 
@@ -779,8 +606,8 @@ mod tests {
     fn test_typed_task_into_inner() {
         kernel_init();
         
-        let typed_task = TypedTask::<Created>::new("inner_task", |_| {}).unwrap();
-        let inner = typed_task.into_inner();
+        let typed_task = TypedTask::<Created>::new("inner_task", || {}).unwrap();
+        let inner = typed_task.start().unwrap().into_inner();
         
         assert_eq!(inner.get_name(), "inner_task");
     }
@@ -790,8 +617,8 @@ mod tests {
     fn test_typed_task_from_task() {
         kernel_init();
         
-        let task = Task::new("from_task", |_| {}).unwrap();
-        let typed_task: TypedTask<Ready> = task.into();
+        let task = Task::new("from_task", || {}).unwrap();
+        let typed_task: TypedTask<Ready> = task.try_into().unwrap();
         
         assert_eq!(typed_task.name(), "from_task");
     }
@@ -801,7 +628,7 @@ mod tests {
     fn test_task_into_typed_ready() {
         kernel_init();
         
-        let task = Task::new("typed_ready", |_| {}).unwrap();
+        let task = Task::new("typed_ready", || {}).unwrap();
         let typed = task.into_typed().unwrap();
         
         match typed {
@@ -817,8 +644,9 @@ mod tests {
     fn test_task_into_typed_running() {
         kernel_init();
         
-        let mut task = Task::new("typed_running", |_| {}).unwrap();
-        task.run();
+        let task = Task::new("typed_running", || {}).unwrap();
+        Scheduler::start();
+        Scheduler::task_switch();
         
         let typed = task.into_typed().unwrap();
         
@@ -835,7 +663,7 @@ mod tests {
     fn test_task_into_typed_blocked() {
         kernel_init();
         
-        let mut task = Task::new("typed_blocked", |_| {}).unwrap();
+        let mut task = Task::new("typed_blocked", || {}).unwrap();
         task.block(Event::Signal(42));
         
         let typed = task.into_typed().unwrap();
@@ -855,18 +683,20 @@ mod tests {
         kernel_init();
         
         // Test into_ready
-        let task = Task::new("conv_ready", |_| {}).unwrap();
+        let task = Task::new("conv_ready", || {}).unwrap();
         let typed = task.into_typed().unwrap();
         assert!(typed.into_ready().is_some());
         
         // Test into_running
-        let mut task = Task::new("conv_running", |_| {}).unwrap();
-        task.run();
+        let task = Task::new("conv_running", || {}).unwrap();
+        Scheduler::start();
+        Scheduler::task_switch();
+        Scheduler::task_switch();
         let typed = task.into_typed().unwrap();
         assert!(typed.into_running().is_some());
         
         // Test into_blocked
-        let mut task = Task::new("conv_blocked", |_| {}).unwrap();
+        let mut task = Task::new("conv_blocked", || {}).unwrap();
         task.block(Event::Timer(1));
         let typed = task.into_typed().unwrap();
         assert!(typed.into_blocked().is_some());
@@ -877,7 +707,7 @@ mod tests {
     fn test_typed_task_any_accessors() {
         kernel_init();
         
-        let task = Task::new("accessor_test", |_| {}).unwrap();
+        let task = Task::new("accessor_test", || {}).unwrap();
         let task_id = task.get_taskid();
         let typed = task.into_typed().unwrap();
         
@@ -891,7 +721,7 @@ mod tests {
         kernel_init();
         
         // 测试在 Created 状态设置优先级
-        let mut task = TypedTask::<Created>::new("priority_test", |_| {}).unwrap();
+        let mut task = TypedTask::<Created>::new("priority_test", || {}).unwrap();
         
         // 默认优先级是 Normal
         assert_eq!(task.priority(), Priority::Normal);
@@ -901,7 +731,7 @@ mod tests {
         assert_eq!(task.priority(), Priority::High);
         
         // 启动后优先级保持不变
-        let ready_task = task.start();
+        let ready_task = task.start().unwrap();
         assert_eq!(ready_task.priority(), Priority::High);
     }
 
@@ -913,14 +743,14 @@ mod tests {
         // 使用 builder 的 build() 方法，验证优先级在 Created 状态就已设置
         let task = TypedTask::builder("builder_priority_test")
             .priority(Priority::Critical)
-            .build(|_| {})
+            .build(|| {})
             .unwrap();
         
         // 在 Created 状态就应该有正确的优先级
         assert_eq!(task.priority(), Priority::Critical);
         
         // 启动后优先级保持不变
-        let ready_task = task.start();
+        let ready_task = task.start().unwrap();
         assert_eq!(ready_task.priority(), Priority::Critical);
     }
 }

@@ -1,6 +1,7 @@
 [package]
 name = "riscv-qemu-example"
 version = "0.1.0"
+default-run = "riscv-qemu-example"
 edition = "2021"
 authors = ["Neon-RTOS2 Team"]
 description = "RISC-V QEMU example for Neon-RTOS2"

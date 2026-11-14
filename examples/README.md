@@ -152,18 +152,18 @@ Task::for_each(|task, _| {
 
 ```rust
 // ✅ 推荐：使用 ? 或 expect
-let task = Task::new("task", |_| {})?;
-let task = Task::new("task", |_| {}).expect("Failed to create task");
+let task = Task::new("task", || {})?;
+let task = Task::new("task", || {}).expect("Failed to create task");
 
 // ✅ 推荐：模式匹配
-match Task::new("task", |_| {}) {
+match Task::new("task", || {}) {
     Ok(task) => { /* ... */ }
     Err(RtosError::TaskSlotsFull) => { /* 处理错误 */ }
     Err(e) => { /* 其他错误 */ }
 }
 
 // ❌ 不推荐：忽略错误
-let _ = Task::new("task", |_| {});
+let _ = Task::new("task", || {});
 ```
 
 ## 📖 更多文档

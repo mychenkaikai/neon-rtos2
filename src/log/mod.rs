@@ -39,7 +39,7 @@
 //! use neon_rtos2::log::{set_log_output, UartOutput, SemihostOutput};
 //!
 //! // 使用 UART 输出（指定地址）
-//! static UART: UartOutput<0x1000_0000> = UartOutput::new();
+//! static UART: UartOutput<0x1000_0000> = unsafe { UartOutput::new() };
 //! set_log_output(&UART);
 //!
 //! // 或使用半主机输出（仅调试用）
@@ -60,6 +60,8 @@
 //! ```
 
 use core::fmt::{self, Write};
+use core::cell::Cell;
+use critical_section::Mutex;
 
 // ============================================================================
 // 日志级别
@@ -82,18 +84,16 @@ pub enum LogLevel {
 }
 
 /// 全局日志级别，默认为Info
-static mut GLOBAL_LOG_LEVEL: LogLevel = LogLevel::Info;
+static GLOBAL_LOG_LEVEL: Mutex<Cell<LogLevel>> = Mutex::new(Cell::new(LogLevel::Info));
 
 /// 设置全局日志级别
 pub fn set_log_level(level: LogLevel) {
-    unsafe {
-        GLOBAL_LOG_LEVEL = level;
-    }
+    critical_section::with(|cs| GLOBAL_LOG_LEVEL.borrow(cs).set(level));
 }
 
 /// 获取全局日志级别
 pub fn get_log_level() -> LogLevel {
-    unsafe { GLOBAL_LOG_LEVEL }
+    critical_section::with(|cs| GLOBAL_LOG_LEVEL.borrow(cs).get())
 }
 
 // ============================================================================
@@ -146,7 +146,7 @@ impl LogOutput for NullOutputInner {
 static NULL_OUTPUT: NullOutputInner = NullOutputInner;
 
 /// 全局日志输出器
-static mut GLOBAL_LOG_OUTPUT: &dyn LogOutput = &NULL_OUTPUT;
+static GLOBAL_LOG_OUTPUT: Mutex<Cell<&'static dyn LogOutput>> = Mutex::new(Cell::new(&NULL_OUTPUT));
 
 /// 设置全局日志输出
 /// 
@@ -167,15 +167,13 @@ static mut GLOBAL_LOG_OUTPUT: &dyn LogOutput = &NULL_OUTPUT;
 /// 
 /// 此函数应该在单线程环境下调用（通常在 main 函数开始时）。
 pub fn set_log_output(output: &'static dyn LogOutput) {
-    unsafe {
-        GLOBAL_LOG_OUTPUT = output;
-    }
+    critical_section::with(|cs| GLOBAL_LOG_OUTPUT.borrow(cs).set(output));
 }
 
 /// 获取当前日志输出器
 #[inline(always)]
 fn get_log_output() -> &'static dyn LogOutput {
-    unsafe { GLOBAL_LOG_OUTPUT }
+    critical_section::with(|cs| GLOBAL_LOG_OUTPUT.borrow(cs).get())
 }
 
 // ============================================================================
@@ -204,19 +202,21 @@ impl LogOutput for NullOutput {
 /// 
 /// ```rust,ignore
 /// // QEMU RISC-V virt 平台
-/// static UART: UartOutput<0x1000_0000> = UartOutput::new();
+/// static UART: UartOutput<0x1000_0000> = unsafe { UartOutput::new() };
 /// 
 /// // STM32 USART1
-/// static UART: UartOutput<0x4001_1004> = UartOutput::new();
+/// static UART: UartOutput<0x4001_1004> = unsafe { UartOutput::new() };
 /// 
 /// set_log_output(&UART);
 /// ```
-pub struct UartOutput<const BASE_ADDR: usize>;
+pub struct UartOutput<const BASE_ADDR: usize>(());
 
 impl<const BASE_ADDR: usize> UartOutput<BASE_ADDR> {
     /// 创建新的 UART 输出实例
-    pub const fn new() -> Self {
-        Self
+    /// # Safety
+    /// BASE_ADDR must remain a valid byte-writable UART MMIO address for every use.
+    pub const unsafe fn new() -> Self {
+        Self(())
     }
 }
 

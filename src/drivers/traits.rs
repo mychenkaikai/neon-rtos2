@@ -61,7 +61,7 @@
 //! }
 //! ```
 
-use crate::error::RtosError;
+pub use crate::error::DeviceError;
 
 // ============================================================================
 // 基础设备 Trait
@@ -108,6 +108,16 @@ pub trait Device {
     /// 成功返回 `Ok(())`，失败返回设备特定的错误
     fn init(&mut self) -> Result<(), Self::Error>;
 
+    /// Initialize an owned device and return it ready for use.
+    /// Use init(&mut self) when the caller needs to retain the device on error.
+    fn into_initialized(mut self) -> Result<Self, Self::Error>
+    where
+        Self: Sized,
+    {
+        self.init()?;
+        Ok(self)
+    }
+
     /// 获取设备名称
     ///
     /// 返回设备的静态名称字符串，用于调试和日志。
@@ -132,6 +142,26 @@ pub trait Device {
 // 读写 Trait
 // ============================================================================
 
+/// Failure to complete a byte or buffer transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferError<E> {
+    Device(E),
+    /// The driver returned zero for a nonempty request.
+    NoProgress { completed: usize },
+    /// The reported count exceeds the slice passed to the driver.
+    InvalidCount { reported: usize, remaining: usize },
+}
+
+fn advance<E>(completed: usize, total: usize, result: Result<usize, E>) -> Result<usize, TransferError<E>> {
+    let count = result.map_err(TransferError::Device)?;
+    let remaining = total - completed;
+    match count {
+        0 => Err(TransferError::NoProgress { completed }),
+        n if n > remaining => Err(TransferError::InvalidCount { reported: n, remaining }),
+        n => Ok(completed + n),
+    }
+}
+
 /// 可读设备 trait
 ///
 /// 实现此 trait 的设备支持读取数据。
@@ -150,20 +180,20 @@ pub trait Read: Device {
     /// 读取单个字节
     ///
     /// 默认实现使用 `read()` 方法
-    fn read_byte(&mut self) -> Result<u8, Self::Error> {
+    fn read_byte(&mut self) -> Result<u8, TransferError<Self::Error>> {
         let mut buf = [0u8; 1];
-        self.read(&mut buf)?;
+        self.read_exact(&mut buf)?;
         Ok(buf[0])
     }
 
     /// 读取直到缓冲区满
     ///
     /// 阻塞直到读取了 `buf.len()` 个字节
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), TransferError<Self::Error>> {
         let mut offset = 0;
         while offset < buf.len() {
-            let n = self.read(&mut buf[offset..])?;
-            offset += n;
+            let result = self.read(&mut buf[offset..]);
+            offset = advance(offset, buf.len(), result)?;
         }
         Ok(())
     }
@@ -185,18 +215,18 @@ pub trait AsyncRead: Device {
     async fn read_async(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error>;
 
     /// 异步读取单个字节
-    async fn read_byte_async(&mut self) -> Result<u8, Self::Error> {
+    async fn read_byte_async(&mut self) -> Result<u8, TransferError<Self::Error>> {
         let mut buf = [0u8; 1];
-        self.read_async(&mut buf).await?;
+        self.read_exact_async(&mut buf).await?;
         Ok(buf[0])
     }
 
     /// 异步读取直到缓冲区满
-    async fn read_exact_async(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
+    async fn read_exact_async(&mut self, buf: &mut [u8]) -> Result<(), TransferError<Self::Error>> {
         let mut offset = 0;
         while offset < buf.len() {
-            let n = self.read_async(&mut buf[offset..]).await?;
-            offset += n;
+            let result = self.read_async(&mut buf[offset..]).await;
+            offset = advance(offset, buf.len(), result)?;
         }
         Ok(())
     }
@@ -225,21 +255,21 @@ pub trait Write: Device {
     /// 写入单个字节
     ///
     /// 默认实现使用 `write()` 方法
-    fn write_byte(&mut self, byte: u8) -> Result<(), Self::Error> {
-        self.write(&[byte])?;
+    fn write_byte(&mut self, byte: u8) -> Result<(), TransferError<Self::Error>> {
+        advance(0, 1, self.write(&[byte]))?;
         Ok(())
     }
 
     /// 写入所有数据
     ///
     /// 阻塞直到所有数据都已写入
-    fn write_all(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), TransferError<Self::Error>> {
         let mut offset = 0;
         while offset < buf.len() {
-            let n = self.write(&buf[offset..])?;
-            offset += n;
+            let result = self.write(&buf[offset..]);
+            offset = advance(offset, buf.len(), result)?;
         }
-        self.flush()
+        self.flush().map_err(TransferError::Device)
     }
 }
 
@@ -254,19 +284,19 @@ pub trait AsyncWrite: Device {
     async fn flush_async(&mut self) -> Result<(), Self::Error>;
 
     /// 异步写入单个字节
-    async fn write_byte_async(&mut self, byte: u8) -> Result<(), Self::Error> {
-        self.write_async(&[byte]).await?;
+    async fn write_byte_async(&mut self, byte: u8) -> Result<(), TransferError<Self::Error>> {
+        advance(0, 1, self.write_async(&[byte]).await)?;
         Ok(())
     }
 
     /// 异步写入所有数据
-    async fn write_all_async(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
+    async fn write_all_async(&mut self, buf: &[u8]) -> Result<(), TransferError<Self::Error>> {
         let mut offset = 0;
         while offset < buf.len() {
-            let n = self.write_async(&buf[offset..]).await?;
-            offset += n;
+            let result = self.write_async(&buf[offset..]).await;
+            offset = advance(offset, buf.len(), result)?;
         }
-        self.flush_async().await
+        self.flush_async().await.map_err(TransferError::Device)
     }
 }
 
@@ -438,17 +468,19 @@ pub enum Parity {
     Odd,
 }
 
-/// UART 设备 trait
-pub trait Uart: Read + Write {
-    /// 配置 UART
-    fn configure(&mut self, config: SerialConfig) -> Result<(), Self::Error>;
+/// Configuration shared by synchronous and asynchronous bus interfaces.
+pub trait Configure: Device {
+    type Config;
+    fn configure(&mut self, config: Self::Config) -> Result<(), Self::Error>;
+}
 
-    /// 设置波特率
+pub trait SerialPort: Configure<Config = SerialConfig> {
     fn set_baudrate(&mut self, baudrate: u32) -> Result<(), Self::Error>;
-
-    /// 获取当前波特率
     fn baudrate(&self) -> u32;
+}
 
+/// UART 设备 trait
+pub trait Uart: SerialPort + Read + Write {
     /// 检查是否有数据可读
     fn is_rx_ready(&self) -> bool;
 
@@ -457,16 +489,8 @@ pub trait Uart: Read + Write {
 }
 
 /// 异步 UART 设备 trait
-pub trait AsyncUart: AsyncRead + AsyncWrite {
-    /// 配置 UART
-    fn configure(&mut self, config: SerialConfig) -> Result<(), Self::Error>;
-
-    /// 设置波特率
-    fn set_baudrate(&mut self, baudrate: u32) -> Result<(), Self::Error>;
-
-    /// 获取当前波特率
-    fn baudrate(&self) -> u32;
-}
+pub trait AsyncUart: SerialPort + AsyncRead + AsyncWrite {}
+impl<T: SerialPort + AsyncRead + AsyncWrite> AsyncUart for T {}
 
 // ============================================================================
 // SPI Trait
@@ -507,9 +531,7 @@ impl Default for SpiConfig {
 }
 
 /// SPI 设备 trait
-pub trait Spi: Device {
-    /// 配置 SPI
-    fn configure(&mut self, config: SpiConfig) -> Result<(), Self::Error>;
+pub trait Spi: Configure<Config = SpiConfig> {
 
     /// 传输数据（同时读写）
     ///
@@ -536,9 +558,7 @@ pub trait Spi: Device {
 }
 
 /// 异步 SPI 设备 trait
-pub trait AsyncSpi: Device {
-    /// 配置 SPI
-    fn configure(&mut self, config: SpiConfig) -> Result<(), Self::Error>;
+pub trait AsyncSpi: Configure<Config = SpiConfig> {
 
     /// 异步传输数据（同时读写）
     async fn transfer_async(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error>;
@@ -577,9 +597,7 @@ impl Default for I2cConfig {
 }
 
 /// I2C 设备 trait
-pub trait I2c: Device {
-    /// 配置 I2C
-    fn configure(&mut self, config: I2cConfig) -> Result<(), Self::Error>;
+pub trait I2c: Configure<Config = I2cConfig> {
 
     /// 写入数据到指定地址
     ///
@@ -610,9 +628,7 @@ pub trait I2c: Device {
 }
 
 /// 异步 I2C 设备 trait
-pub trait AsyncI2c: Device {
-    /// 配置 I2C
-    fn configure(&mut self, config: I2cConfig) -> Result<(), Self::Error>;
+pub trait AsyncI2c: Configure<Config = I2cConfig> {
 
     /// 异步写入数据到指定地址
     async fn write_async(&mut self, addr: u8, data: &[u8]) -> Result<(), Self::Error>;
@@ -636,13 +652,9 @@ pub trait TimerDevice: Device {
     /// 停止定时器
     fn stop(&mut self) -> Result<(), Self::Error>;
 
-    /// 设置周期（微秒）
-    fn set_period_us(&mut self, period: u32) -> Result<(), Self::Error>;
-
-    /// 设置周期（毫秒）
-    fn set_period_ms(&mut self, period: u32) -> Result<(), Self::Error> {
-        self.set_period_us(period * 1000)
-    }
+    /// Configure a positive period. Drivers round up to hardware resolution
+    /// and reject periods beyond their representable range.
+    fn set_period(&mut self, period: core::time::Duration) -> Result<(), Self::Error>;
 
     /// 获取当前计数值
     fn count(&self) -> u32;
@@ -707,33 +719,6 @@ pub trait AdcChannel {
 // ============================================================================
 // 设备错误类型
 // ============================================================================
-
-/// 通用设备错误
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceError {
-    /// 设备未初始化
-    NotInitialized,
-    /// 设备忙
-    Busy,
-    /// 超时
-    Timeout,
-    /// 无效参数
-    InvalidParameter,
-    /// 通信错误
-    CommunicationError,
-    /// 设备不存在
-    NotFound,
-    /// 缓冲区溢出
-    BufferOverflow,
-    /// 其他错误
-    Other,
-}
-
-impl From<DeviceError> for RtosError {
-    fn from(_: DeviceError) -> Self {
-        RtosError::InvalidHandle
-    }
-}
 
 // ============================================================================
 // 单元测试
@@ -833,6 +818,36 @@ mod tests {
         let read = device.read(&mut read_data).unwrap();
         assert_eq!(read, 4);
         assert_eq!(read_data, write_data);
+    }
+
+    #[test]
+    fn complete_io_handles_short_zero_and_invalid_counts() {
+        let mut device = MockDevice::new().into_initialized().unwrap();
+        let mut bytes = [0; 17];
+        assert_eq!(device.read_exact(&mut bytes), Err(TransferError::NoProgress { completed: 16 }));
+        assert_eq!(device.read_byte(), Err(TransferError::NoProgress { completed: 0 }));
+        device.pos = 0;
+        assert_eq!(device.write_all(&bytes), Err(TransferError::NoProgress { completed: 16 }));
+        assert_eq!(device.write_byte(1), Err(TransferError::NoProgress { completed: 0 }));
+        assert!(device.read_exact(&mut []).is_ok());
+        assert_eq!(advance::<DeviceError>(2, 3, Ok(2)), Err(TransferError::InvalidCount { reported: 2, remaining: 1 }));
+        assert_eq!(MockDevice::new().read_byte(), Err(TransferError::Device(DeviceError::NotInitialized)));
+        assert_eq!(crate::error::RtosError::from(DeviceError::Timeout), crate::error::RtosError::Device(DeviceError::Timeout));
+    }
+
+    #[test]
+    fn asynchronous_uart_reports_progress_on_a_short_read_and_full_write() {
+        use crate::drivers::examples::MockUart;
+        use core::{future::Future, task::{Context, Poll, Waker}};
+        let mut uart = MockUart::new().into_initialized().unwrap();
+        uart.mock_receive(&[42]);
+        let mut bytes = [0; 2];
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(core::pin::pin!(uart.read_exact_async(&mut bytes)).as_mut().poll(&mut cx),
+                   Poll::Ready(Err(TransferError::NoProgress { completed: 1 })));
+        assert_eq!(bytes[0], 42);
+        assert_eq!(core::pin::pin!(uart.write_all_async(&[7; 256])).as_mut().poll(&mut cx),
+                   Poll::Ready(Err(TransferError::NoProgress { completed: 255 })));
     }
 
     #[test]

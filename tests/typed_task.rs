@@ -24,7 +24,7 @@ use serial_test::serial;
 fn test_typed_task_new() {
     kernel_init();
     
-    let task = TypedTask::<Created>::new("test_new", |_| {}).unwrap();
+    let task = TypedTask::<Created>::new("test_new", || {}).unwrap();
     assert_eq!(task.name(), "test_new");
     assert!(task.id() < 16); // MAX_TASKS = 16
 }
@@ -35,7 +35,7 @@ fn test_typed_task_builder_basic() {
     kernel_init();
     
     let task = TypedTask::builder("builder_basic")
-        .spawn(|_| {})
+        .spawn(|| {})
         .unwrap();
     
     assert_eq!(task.name(), "builder_basic");
@@ -49,7 +49,7 @@ fn test_typed_task_builder_with_priority() {
     
     let task = TypedTask::builder("high_priority")
         .priority(Priority::High)
-        .spawn(|_| {})
+        .spawn(|| {})
         .unwrap();
     
     assert_eq!(task.priority(), Priority::High);
@@ -62,13 +62,13 @@ fn test_typed_task_builder_build_vs_spawn() {
     
     // build() 返回 Created 状态
     let created_task = TypedTask::builder("build_task")
-        .build(|_| {})
+        .build(|| {})
         .unwrap();
     assert_eq!(created_task.name(), "build_task");
     
     // spawn() 返回 Ready 状态
     let ready_task = TypedTask::builder("spawn_task")
-        .spawn(|_| {})
+        .spawn(|| {})
         .unwrap();
     assert_eq!(ready_task.name(), "spawn_task");
 }
@@ -83,142 +83,43 @@ fn test_created_to_ready() {
     kernel_init();
     
     // Created 状态
-    let task: TypedTask<Created> = TypedTask::new("c2r", |_| {}).unwrap();
+    let task: TypedTask<Created> = TypedTask::new("c2r", || {}).unwrap();
     
     // Created -> Ready
-    let task: TypedTask<Ready> = task.start();
+    let task: TypedTask<Ready> = task.start().unwrap();
     assert_eq!(task.name(), "c2r");
 }
 
 #[test]
 #[serial]
-fn test_ready_to_running() {
+fn scheduler_owns_dispatch_and_checks_wake_event() {
+    use neon_rtos2::prelude::{Scheduler, TaskState};
     kernel_init();
-    
-    let task = TypedTask::<Created>::new("r2run", |_| {}).unwrap();
-    let task = task.start(); // Ready
-    
-    // Ready -> Running
-    let task: TypedTask<Running> = task.run();
-    assert_eq!(task.name(), "r2run");
+    let task = TypedTask::<Created>::new("dispatch", || {}).unwrap().start().unwrap().into_inner();
+    assert!(task.block_if_ready(Event::Signal(1)));
+    assert!(TypedTask::<Ready>::try_from(task).is_err());
+    assert!(!task.wake_if(Event::Timer(1)));
+    assert_eq!(task.get_state(), TaskState::Blocked(Event::Signal(1)));
+    assert!(task.wake_if(Event::Signal(1)));
+    Scheduler::start();
+    Scheduler::task_switch();
+    assert_eq!(Scheduler::get_current_task(), task);
+    assert!(task.into_typed().unwrap().into_running().is_some());
+    assert!(!task.block_if_ready(Event::Signal(1)));
 }
 
 #[test]
 #[serial]
-fn test_running_to_ready_yield() {
+fn created_snapshot_cannot_restart_a_dispatched_task() {
+    use neon_rtos2::prelude::Scheduler;
     kernel_init();
-    
-    let task = TypedTask::<Created>::new("yield_test", |_| {}).unwrap();
-    let task = task.start();
-    let task = task.run();
-    
-    // Running -> Ready (yield)
-    let task: TypedTask<Ready> = task.yield_now();
-    assert_eq!(task.name(), "yield_test");
-}
-
-#[test]
-#[serial]
-fn test_running_to_blocked() {
-    kernel_init();
-    
-    let task = TypedTask::<Created>::new("run2block", |_| {}).unwrap();
-    let task = task.start();
-    let task = task.run();
-    
-    // Running -> Blocked
-    let task: TypedTask<Blocked> = task.block(Event::Signal(42));
-    assert_eq!(task.blocked_event(), Some(Event::Signal(42)));
-}
-
-#[test]
-#[serial]
-fn test_ready_to_blocked() {
-    kernel_init();
-    
-    let task = TypedTask::<Created>::new("ready2block", |_| {}).unwrap();
-    let task = task.start();
-    
-    // Ready -> Blocked
-    let task: TypedTask<Blocked> = task.block(Event::Timer(100));
-    assert_eq!(task.blocked_event(), Some(Event::Timer(100)));
-}
-
-#[test]
-#[serial]
-fn test_blocked_to_ready_wake() {
-    kernel_init();
-    
-    let task = TypedTask::<Created>::new("wake_test", |_| {}).unwrap();
-    let task = task.start();
-    let task = task.run();
-    let task = task.block(Event::Signal(1));
-    
-    // Blocked -> Ready (wake)
-    let task: TypedTask<Ready> = task.wake();
-    assert_eq!(task.name(), "wake_test");
-}
-
-// ============================================================================
-// 完整状态转换链测试
-// ============================================================================
-
-#[test]
-#[serial]
-fn test_full_lifecycle() {
-    kernel_init();
-    
-    // 完整生命周期：Created -> Ready -> Running -> Blocked -> Ready -> Running
-    let task = TypedTask::<Created>::new("lifecycle", |_| {}).unwrap();
-    let name = task.name();
-    
-    let task = task.start();           // Created -> Ready
-    let task = task.run();             // Ready -> Running
-    let task = task.block(Event::Signal(1)); // Running -> Blocked
-    let task = task.wake();            // Blocked -> Ready
-    let task = task.run();             // Ready -> Running
-    let _task = task.yield_now();      // Running -> Ready
-    
-    assert_eq!(name, "lifecycle");
-}
-
-#[test]
-#[serial]
-fn test_multiple_yield_cycles() {
-    kernel_init();
-    
-    let task = TypedTask::<Created>::new("multi_yield", |_| {}).unwrap();
-    let task = task.start();
-    
-    // 多次 yield 循环
-    let task = task.run();
-    let task = task.yield_now();
-    let task = task.run();
-    let task = task.yield_now();
-    let task = task.run();
-    let _task = task.yield_now();
-}
-
-#[test]
-#[serial]
-fn test_multiple_block_wake_cycles() {
-    kernel_init();
-    
-    let task = TypedTask::<Created>::new("multi_block", |_| {}).unwrap();
-    let task = task.start();
-    let task = task.run();
-    
-    // 多次 block/wake 循环
-    let task = task.block(Event::Signal(1));
-    assert_eq!(task.blocked_event(), Some(Event::Signal(1)));
-    
-    let task = task.wake();
-    let task = task.run();
-    
-    let task = task.block(Event::Timer(200));
-    assert_eq!(task.blocked_event(), Some(Event::Timer(200)));
-    
-    let _task = task.wake();
+    let created = TypedTask::<Created>::new("once", || {}).unwrap();
+    let alias = created.inner().into_typed().unwrap().into_created().unwrap();
+    let ready = created.start().unwrap();
+    Scheduler::start();
+    Scheduler::task_switch();
+    assert_eq!(alias, *ready.inner());
+    assert!(ready.inner().into_typed().unwrap().into_running().is_some());
 }
 
 // ============================================================================
@@ -230,8 +131,8 @@ fn test_multiple_block_wake_cycles() {
 fn test_into_inner() {
     kernel_init();
     
-    let typed_task = TypedTask::<Created>::new("into_inner", |_| {}).unwrap();
-    let inner = typed_task.into_inner();
+    let typed_task = TypedTask::<Created>::new("into_inner", || {}).unwrap();
+    let inner = typed_task.start().unwrap().into_inner();
     
     assert_eq!(inner.get_name(), "into_inner");
 }
@@ -241,7 +142,7 @@ fn test_into_inner() {
 fn test_inner_ref() {
     kernel_init();
     
-    let typed_task = TypedTask::<Created>::new("inner_ref", |_| {}).unwrap();
+    let typed_task = TypedTask::<Created>::new("inner_ref", || {}).unwrap();
     let inner_ref = typed_task.inner();
     
     assert_eq!(inner_ref.get_name(), "inner_ref");
@@ -254,8 +155,8 @@ fn test_from_task() {
     
     use neon_rtos2::kernel::task::Task;
     
-    let task = Task::new("from_task", |_| {}).unwrap();
-    let typed_task: TypedTask<Ready> = task.into();
+    let task = Task::new("from_task", || {}).unwrap();
+    let typed_task: TypedTask<Ready> = task.try_into().unwrap();
     
     assert_eq!(typed_task.name(), "from_task");
 }
@@ -271,7 +172,7 @@ fn test_priority_in_ready_state() {
     
     let mut task = TypedTask::builder("priority_test")
         .priority(Priority::Low)
-        .spawn(|_| {})
+        .spawn(|| {})
         .unwrap();
     
     assert_eq!(task.priority(), Priority::Low);
@@ -288,51 +189,13 @@ fn test_priority_in_running_state() {
     
     let task = TypedTask::builder("running_priority")
         .priority(Priority::Normal)
-        .spawn(|_| {})
+        .spawn(|| {})
         .unwrap();
     
-    let task = task.run();
+    neon_rtos2::prelude::Scheduler::start();
+    neon_rtos2::prelude::Scheduler::task_switch();
+    let task = task.into_inner().into_typed().unwrap().into_running().unwrap();
     assert_eq!(task.priority(), Priority::Normal);
-}
-
-// ============================================================================
-// 编译期类型安全说明
-// ============================================================================
-
-/// 以下代码展示了类型状态模式如何在编译期防止非法状态转换。
-/// 这些代码如果取消注释将无法编译，证明了类型安全性。
-///
-/// ```compile_fail
-/// use neon_rtos2::kernel::task::state::*;
-/// use neon_rtos2::utils::kernel_init;
-///
-/// fn illegal_transitions() {
-///     kernel_init();
-///     
-///     // 错误 1: Created 状态没有 run() 方法
-///     let task = TypedTask::<Created>::new("test", |_| {}).unwrap();
-///     task.run(); // 编译错误！
-///     
-///     // 错误 2: Created 状态没有 yield_now() 方法
-///     let task = TypedTask::<Created>::new("test", |_| {}).unwrap();
-///     task.yield_now(); // 编译错误！
-///     
-///     // 错误 3: Running 状态没有 start() 方法
-///     let task = TypedTask::<Created>::new("test", |_| {}).unwrap();
-///     let task = task.start().run();
-///     task.start(); // 编译错误！
-///     
-///     // 错误 4: Blocked 状态没有 run() 方法
-///     let task = TypedTask::<Created>::new("test", |_| {}).unwrap();
-///     let task = task.start().run().block(Event::Signal(1));
-///     task.run(); // 编译错误！
-/// }
-/// ```
-#[test]
-fn test_compile_time_safety_documented() {
-    // 这个测试只是为了文档目的
-    // 真正的编译期检查由上面的 compile_fail 文档测试完成
-    assert!(true);
 }
 
 // ============================================================================
@@ -347,7 +210,7 @@ fn test_task_with_closure() {
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter_clone = counter.clone();
     
-    let task = TypedTask::<Created>::new("closure_task", move |_| {
+    let task = TypedTask::<Created>::new("closure_task", move || {
         counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }).unwrap();
     
@@ -360,12 +223,33 @@ fn test_different_event_types() {
     kernel_init();
     
     // 测试不同的事件类型
-    let task1 = TypedTask::<Created>::new("signal_event", |_| {}).unwrap();
-    let task1 = task1.start().run().block(Event::Signal(123));
+    let task1 = TypedTask::<Created>::new("signal_event", || {}).unwrap();
+    let task1 = task1.start().unwrap().into_inner();
+    assert!(task1.block_if_ready(Event::Signal(123)));
+    let task1 = task1.into_typed().unwrap().into_blocked().unwrap();
     assert_eq!(task1.blocked_event(), Some(Event::Signal(123)));
     
-    let task2 = TypedTask::<Created>::new("timer_event", |_| {}).unwrap();
-    let task2 = task2.start().run().block(Event::Timer(456));
+    let task2 = TypedTask::<Created>::new("timer_event", || {}).unwrap();
+    let task2 = task2.start().unwrap().into_inner();
+    assert!(task2.block_if_ready(Event::Timer(456)));
+    let task2 = task2.into_typed().unwrap().into_blocked().unwrap();
     assert_eq!(task2.blocked_event(), Some(Event::Timer(456)));
 }
 
+
+#[test]
+#[serial]
+fn an_unstarted_job_never_enters_the_ready_queue() {
+    use neon_rtos2::prelude::{Scheduler, TaskState};
+    kernel_init();
+    let before = Scheduler::ready_task_stats().total;
+    let job = TypedTask::<Created>::new("deferred", || {}).unwrap();
+    let stale = *job.inner();
+    assert_eq!(stale.get_state(), TaskState::Created);
+    assert_eq!(Scheduler::ready_task_stats().total, before);
+    drop(job);
+    assert_eq!(stale.get_state(), TaskState::Finished);
+    let next = TypedTask::<Created>::new("next", || {}).unwrap().start().unwrap();
+    assert_eq!(next.id(), stale.get_taskid());
+    assert_eq!(Scheduler::ready_task_stats().total, before + 1);
+}

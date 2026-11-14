@@ -18,7 +18,7 @@
 //! ```rust,ignore
 //! let signal = Signal::new();  // 局部创建
 //! let signal_clone = signal.clone();
-//! Task::builder("task").spawn(move |_| {
+//! Task::builder("task").spawn(move || {
 //!     signal_clone.wait().unwrap();  // 通过闭包捕获
 //! });
 //! ```
@@ -42,7 +42,6 @@
 #![no_main]
 
 use cortex_m::Peripherals;
-use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::entry;
 
 // 导入 RTOS prelude - 包含所有常用类型
@@ -89,9 +88,6 @@ const SYS_CLOCK: u32 = 12_000_000;
 /// SysTick 频率 (Hz) - 1000Hz = 1ms tick
 const SYST_FREQ: u32 = 1000;
 
-/// SysTick 重载值
-const SYST_RELOAD: u32 = SYS_CLOCK / SYST_FREQ;
-
 // ============================================================================
 // 主函数
 // ============================================================================
@@ -125,11 +121,7 @@ fn main() -> ! {
     // ========================================
     info!("Initializing SysTick...");
     let p = Peripherals::take().unwrap();
-    let mut syst = p.SYST;
-    syst.set_clock_source(SystClkSource::Core);
-    syst.set_reload(SYST_RELOAD);
-    syst.enable_counter();
-    syst.enable_interrupt();
+    neon_rtos2::hal::cortex_m3::configure_systick(p.SYST, SYS_CLOCK, Duration::from_millis(1)).unwrap();
     info!("SysTick initialized: {} Hz", SYST_FREQ);
     info!("");
     
@@ -171,7 +163,7 @@ fn main() -> ! {
     let producer_counter = counter_mutex.clone();
     Task::builder("producer")
         .priority(Priority::High)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[Producer] Started with Signal + Mutex");
             
             loop {
@@ -185,7 +177,7 @@ fn main() -> ! {
                 // 发送信号通知消费者
                 producer_signal.send();
                 
-                Delay::delay(500).unwrap();
+                Delay::delay(Duration::from_millis(500)).unwrap();
             }
         })
         .expect("Failed to create producer task");
@@ -194,7 +186,7 @@ fn main() -> ! {
     // ----- 消费者任务 -----
     Task::builder("consumer")
         .priority(Priority::Normal)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[Consumer] Started, waiting for Signal...");
             
             loop {
@@ -215,7 +207,7 @@ fn main() -> ! {
     // ----- signal_pair 发送者任务 -----
     Task::builder("pair_tx")
         .priority(Priority::Normal)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[PairTx] Started with SignalSender");
             let mut count = 0u32;
             
@@ -223,7 +215,7 @@ fn main() -> ! {
                 count += 1;
                 debug!("[PairTx] Sending signal #{}", count);
                 pair_sender.send();
-                Delay::delay(1000).unwrap();
+                Delay::delay(Duration::from_millis(1000)).unwrap();
             }
         })
         .expect("Failed to create pair_tx task");
@@ -232,7 +224,7 @@ fn main() -> ! {
     // ----- signal_pair 接收者任务 -----
     Task::builder("pair_rx")
         .priority(Priority::Normal)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[PairRx] Started with SignalReceiver");
             let mut count = 0u32;
             
@@ -249,18 +241,17 @@ fn main() -> ! {
     // ----- Semaphore 工作者任务 1 -----
     Task::builder("worker1")
         .priority(Priority::Low)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[Worker1] Started, using Semaphore");
             
             loop {
                 debug!("[Worker1] Waiting for permit...");
-                if work_sem_1.acquire().is_ok() {
+                if let Ok(_permit) = work_sem_1.acquire_permit() {
                     info!("[Worker1] Got permit, working...");
-                    Delay::delay(800).unwrap();
+                    Delay::delay(Duration::from_millis(800)).unwrap();
                     info!("[Worker1] Done, releasing permit");
-                    let _ = work_sem_1.release();
                 }
-                Delay::delay(200).unwrap();
+                Delay::delay(Duration::from_millis(200)).unwrap();
             }
         })
         .expect("Failed to create worker1 task");
@@ -269,18 +260,17 @@ fn main() -> ! {
     // ----- Semaphore 工作者任务 2 -----
     Task::builder("worker2")
         .priority(Priority::Low)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[Worker2] Started, using Semaphore");
             
             loop {
                 debug!("[Worker2] Waiting for permit...");
-                if work_sem_2.acquire().is_ok() {
+                if let Ok(_permit) = work_sem_2.acquire_permit() {
                     info!("[Worker2] Got permit, working...");
-                    Delay::delay(600).unwrap();
+                    Delay::delay(Duration::from_millis(600)).unwrap();
                     info!("[Worker2] Done, releasing permit");
-                    let _ = work_sem_2.release();
                 }
-                Delay::delay(300).unwrap();
+                Delay::delay(Duration::from_millis(300)).unwrap();
             }
         })
         .expect("Failed to create worker2 task");
@@ -289,7 +279,7 @@ fn main() -> ! {
     // ----- Semaphore 工作者任务 3 -----
     Task::builder("worker3")
         .priority(Priority::Low)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[Worker3] Started, using Semaphore");
             
             loop {
@@ -298,7 +288,7 @@ fn main() -> ! {
                 match work_sem_3.try_acquire() {
                     Ok(true) => {
                         info!("[Worker3] Got permit (try), working...");
-                        Delay::delay(500).unwrap();
+                        Delay::delay(Duration::from_millis(500)).unwrap();
                         info!("[Worker3] Done, releasing permit");
                         let _ = work_sem_3.release();
                     }
@@ -309,7 +299,7 @@ fn main() -> ! {
                         debug!("[Worker3] Semaphore error");
                     }
                 }
-                Delay::delay(400).unwrap();
+                Delay::delay(Duration::from_millis(400)).unwrap();
             }
         })
         .expect("Failed to create worker3 task");
@@ -318,7 +308,7 @@ fn main() -> ! {
     // ----- 监控任务 -----
     Task::builder("monitor")
         .priority(Priority::Low)
-        .spawn(|_| {
+        .spawn(|| {
             info!("[Monitor] Started");
             let mut tick = 0u32;
             
@@ -335,6 +325,8 @@ fn main() -> ! {
                 
                 Task::iter().for_each(|task| {
                     let state = match task.get_state() {
+                        TaskState::Created => "Created",
+                        TaskState::Finished => "Finished",
                         TaskState::Uninit => "Uninit",
                         TaskState::Ready => "Ready",
                         TaskState::Running => "Running",
@@ -345,7 +337,7 @@ fn main() -> ! {
                 
                 info!("================================================");
                 
-                Delay::delay(5000).unwrap();
+                Delay::delay(Duration::from_millis(5000)).unwrap();
             }
         })
         .expect("Failed to create monitor task");
@@ -354,14 +346,14 @@ fn main() -> ! {
     // ----- 心跳任务 -----
     Task::builder("heartbeat")
         .priority(Priority::Idle)
-        .spawn(|_| {
+        .spawn(|| {
             info!("[Heartbeat] Started");
             let mut beat = 0u32;
             
             loop {
                 beat += 1;
                 trace!("Heartbeat: {}", beat);
-                Delay::delay(1000).unwrap();
+                Delay::delay(Duration::from_millis(1000)).unwrap();
             }
         })
         .expect("Failed to create heartbeat task");

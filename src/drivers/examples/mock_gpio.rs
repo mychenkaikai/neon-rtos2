@@ -44,7 +44,7 @@ use crate::drivers::{
 ///
 /// ```rust
 /// use neon_rtos2::drivers::examples::MockGpio;
-/// use neon_rtos2::drivers::{Device, OutputPin, PinMode};
+/// use neon_rtos2::drivers::{Device, GpioPin, OutputPin, PinMode};
 ///
 /// let mut led = MockGpio::new(13);
 /// led.init().unwrap();
@@ -109,7 +109,7 @@ impl MockGpio {
     ///
     /// ```rust
     /// use neon_rtos2::drivers::examples::MockGpio;
-    /// use neon_rtos2::drivers::{Device, InputPin, PinMode};
+    /// use neon_rtos2::drivers::{Device, GpioPin, InputPin, PinMode};
     ///
     /// let mut gpio = MockGpio::new(0);
     /// gpio.init().unwrap();

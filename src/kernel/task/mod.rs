@@ -10,7 +10,9 @@ use core::prelude::rust_2024::*;
 use core::ptr::addr_of;
 use core::sync::atomic::{AtomicUsize, AtomicU8, Ordering};
 
-use spin::{Once, Mutex};
+use core::cell::RefCell;
+use critical_section::{CriticalSection, Mutex};
+use crate::kernel::scheduler::Scheduler;
 
 // 子模块
 pub mod priority;
@@ -37,31 +39,16 @@ const STATE_UNINIT: u8 = 0;
 const STATE_READY: u8 = 1;
 const STATE_RUNNING: u8 = 2;
 const STATE_BLOCKED: u8 = 3;
+const STATE_FINISHED: u8 = 4;
+const STATE_CREATED: u8 = 5;
 
 // ============================================================================
 // 全局任务列表（优化后的细粒度锁版本）
 // ============================================================================
 
-/// 任务列表 - 每个 TCB 独立锁
-/// 
-/// ## 优化说明
-/// 
-/// 原实现使用全局 `RwLock<[TaskControlBlock; MAX_TASKS]>`，
-/// 每次访问任何任务都需要获取全局锁，导致严重的锁竞争。
-/// 
-/// 新实现将 TCB 分为两部分：
-/// 1. **不变字段**（创建后不变）：直接存储，无需锁
-/// 2. **可变字段**：使用原子操作或细粒度锁
-/// 
-/// 这样可以：
-/// - 读取不变字段（name, taskid）：无锁，O(1)
-/// - 读取可变字段（state, priority, stack_top）：原子操作，O(1)
-/// - ��改可变字段：原子操作或细粒度锁，O(1)
-/// - 任务创建：只需获取分配锁，不影响其他任务的访问
-static TASK_LIST: Once<[TaskControlBlock; MAX_TASKS]> = Once::new();
-
-/// 任务分配锁 - 仅用于任务创建时的槽位分配
-static TASK_ALLOC_LOCK: Once<Mutex<()>> = Once::new();
+// 所有元数据在临界区内发布；中断不能等待被抢占任务持有的锁。
+static TASK_LIST: [TaskControlBlock; MAX_TASKS] =
+    [const { TaskControlBlock::new() }; MAX_TASKS];
 
 #[unsafe(no_mangle)]
 static mut TASK_STACKS: [Stack; MAX_TASKS] = [const {
@@ -73,9 +60,11 @@ static mut TASK_STACKS: [Stack; MAX_TASKS] = [const {
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum TaskState {
     Uninit,
+    Created,
     Ready,
     Running,
     Blocked(Event),
+    Finished,
 }
 
 impl TaskState {
@@ -83,6 +72,8 @@ impl TaskState {
     #[inline]
     fn to_u8(&self) -> u8 {
         match self {
+            TaskState::Created => STATE_CREATED,
+            TaskState::Finished => STATE_FINISHED,
             TaskState::Uninit => STATE_UNINIT,
             TaskState::Ready => STATE_READY,
             TaskState::Running => STATE_RUNNING,
@@ -94,6 +85,8 @@ impl TaskState {
     #[inline]
     fn from_u8_simple(value: u8) -> Self {
         match value {
+            STATE_CREATED => TaskState::Created,
+            STATE_FINISHED => TaskState::Finished,
             STATE_UNINIT => TaskState::Uninit,
             STATE_READY => TaskState::Ready,
             STATE_RUNNING => TaskState::Running,
@@ -109,20 +102,6 @@ pub struct Stack {
     pub data: [u8; STACK_SIZE],
 }
 
-pub trait TaskFunction: Send + 'static + Sync {
-    fn call(self: Box<Self>, task_id: usize);
-}
-
-// 为闭包实现TaskFunction
-impl<F> TaskFunction for F
-where
-    F: FnOnce(usize) + Send + 'static + Sync,
-{
-    fn call(self: Box<Self>, task_id: usize) {
-        (*self)(task_id);
-    }
-}
-
 /// 任务控制块 - 优化后的细粒度锁版本
 /// 
 /// ## 内存布局优化
@@ -132,13 +111,9 @@ where
 /// 2. **原子字段**（可变但无需锁）
 /// 3. **冷数据**（不常访问）放在后面
 /// 
-/// ## 锁策略
-/// 
-/// - `stack_top`: 原子操作（上下文切换时频繁访问）
-/// - `state`: 原子操作 + 事件锁（状态切换频繁）
-/// - `priority`: 原子操作（优先级调度时访问）
-/// - `name`, `taskid`: 不变字段，无需锁
-/// - `task_fn`: 细粒度锁（仅任务启动时访问一次）
+/// 元数据使用 critical-section 保护的内部可变性。
+/// 状态、优先级和调度队列由 Scheduler 在同一临界区提交。
+/// 栈顶由 HAL 在上下文切换边界保存。
 #[repr(C)]
 pub struct TaskControlBlock {
     // ========== 热数据（调度器频繁访问）==========
@@ -152,93 +127,86 @@ pub struct TaskControlBlock {
     
     /// 任务优先级（原子操作）
     pub(crate) priority_atomic: AtomicU8,
+    base_priority: AtomicU8,
+    generation: AtomicUsize,
     
     // ========== 阻塞事件（需要锁保护）==========
     /// 阻塞事件 - 仅在 Blocked 状态时有效
     /// 使用细粒度锁，因为事件信息无法用原子操作存储
-    pub(crate) blocked_event: Mutex<Option<Event>>,
+    pub(crate) blocked_event: Mutex<RefCell<Option<Event>>>,
     
     // ========== 冷数据（不常访问）==========
     /// 任务名称 - 创建后不变
-    pub(crate) name: &'static str,
-    
-    /// 任务 ID - 创建后不变
-    pub(crate) taskid: usize,
+    name: Mutex<RefCell<&'static str>>,
     
     /// 任务函数 - 仅启动时访问一次
     /// 使用细粒度锁
-    pub(crate) task_fn: Mutex<Option<Box<dyn TaskFunction>>>,
+    pub(crate) task_fn: Mutex<RefCell<Option<Box<dyn FnOnce() + Send + 'static>>>>,
 }
 
 #[derive(Clone, PartialEq, Copy, Debug)]
-pub struct Task(pub usize);
+/// A handle identifies one incarnation of a task. The numeric slot returned by
+/// `get_taskid` can be reused after return. Retained handles report Finished
+/// and cannot change the state or priority of a replacement.
+pub struct Task(pub(crate) usize, usize);
 
 /// 获取任务列表（优化后的版本）
 /// 
 /// 返回静态任务列表的引用，每个 TCB 内部使用原子操作和细粒度锁
-fn get_task_list() -> &'static [TaskControlBlock; MAX_TASKS] {
-    TASK_LIST.call_once(|| {
-        [(); MAX_TASKS].map(|_| TaskControlBlock::default())
-    })
-}
-
-/// 获取任务分配锁
-fn get_alloc_lock() -> &'static Mutex<()> {
-    TASK_ALLOC_LOCK.call_once(|| Mutex::new(()))
+pub(super) fn get_task_list() -> &'static [TaskControlBlock; MAX_TASKS] {
+    &TASK_LIST
 }
 
 // 关键：统一的包装器函数，���固定的入口地址
 fn task_wrapper_entry(task_id: usize) {
     let task_list = get_task_list();
     // 使用细粒度锁获取任务函数
-    let task_fn = task_list[task_id].task_fn.lock().take();
+    let task_fn = critical_section::with(|cs| task_list[task_id].task_fn.borrow_ref_mut(cs).take());
     if let Some(func) = task_fn {
-        func.call(task_id);
+        func();
     }
+    Scheduler::finish_current();
+    crate::hal::trigger_schedule();
+    // Retain this stack until the switch actually takes effect.
+    loop { core::hint::spin_loop(); }
 }
 
 impl TaskControlBlock {
     /// 创建默认的 TCB（未初始化状态）
-    fn default() -> Self {
+    const fn new() -> Self {
         Self {
             stack_top: AtomicUsize::new(0),
             state_atomic: AtomicU8::new(STATE_UNINIT),
             priority_atomic: AtomicU8::new(Priority::Normal.as_u8()),
-            blocked_event: Mutex::new(None),
-            name: "noinit",
-            taskid: 0,
-            task_fn: Mutex::new(None),
+            generation: AtomicUsize::new(0),
+            base_priority: AtomicU8::new(Priority::Normal.as_u8()),
+            blocked_event: Mutex::new(RefCell::new(None)),
+            name: Mutex::new(RefCell::new("noinit")),
+            task_fn: Mutex::new(RefCell::new(None)),
         }
     }
     
     /// 初始化任务（内部使用）
     /// 
-    /// 注意：此方法假设调用者已经持有分配锁
+    /// 调用者必须处于任务分配临界区
     fn init_unified<F>(&self, name: &'static str, func: F, taskid: usize, stack_top: usize)
     where
-        F: TaskFunction,
+        F: FnOnce() + Send + 'static,
     {
         // 设置栈顶（需要可变引用用于 init_task_stack）
         self.stack_top.store(stack_top, Ordering::Release);
         
-        // 设置不变字段（通过 unsafe 因为我们需要修改 &self）
-        // SAFETY: 我们持有分配锁，保证没有其他线程在访问这个 TCB
-        unsafe {
-            let self_mut = self as *const Self as *mut Self;
-            (*self_mut).taskid = taskid;
-            (*self_mut).name = name;
-        }
-        
-        // 设置任务函数
-        *self.task_fn.lock() = Some(Box::new(func));
-        
+        critical_section::with(|cs| {
+            *self.name.borrow_ref_mut(cs) = name;
+            *self.task_fn.borrow_ref_mut(cs) = Some(Box::new(func));
+        });
+
         // 初始化栈（需要获取栈顶的可变引用）
         let mut stack_top_val = self.stack_top.load(Ordering::Acquire);
         init_task_stack(&mut stack_top_val, task_wrapper_entry, taskid);
         self.stack_top.store(stack_top_val, Ordering::Release);
         
-        // 最后设置状态为 Ready（使用 Release 保证之前的写入对其他线程可见）
-        self.state_atomic.store(STATE_READY, Ordering::Release);
+        // 调用者在优先级、栈和入口就绪后，通过调度器发布 Ready 状态。
     }
     
     /// 重置 TCB 到未初始化状态
@@ -246,55 +214,49 @@ impl TaskControlBlock {
         self.state_atomic.store(STATE_UNINIT, Ordering::Release);
         self.stack_top.store(0, Ordering::Release);
         self.priority_atomic.store(Priority::Normal.as_u8(), Ordering::Release);
-        *self.blocked_event.lock() = None;
-        *self.task_fn.lock() = None;
+        self.base_priority.store(Priority::Normal.as_u8(), Ordering::Release);
+        critical_section::with(|cs| *self.blocked_event.borrow_ref_mut(cs) = None);
+        critical_section::with(|cs| {
+            *self.task_fn.borrow_ref_mut(cs) = None;
+            *self.name.borrow_ref_mut(cs) = "noinit";
+        });
     }
     
     // ========== 原子访问方法 ==========
     
-    /// 获取状态（原子操作）- O(1)，无锁
+    /// 在同一临界区读取状态编码和阻塞原因
     #[inline]
-    fn get_state(&self) -> TaskState {
+    pub(super) fn get_state(&self, cs: CriticalSection<'_>) -> TaskState {
         let state_code = self.state_atomic.load(Ordering::Acquire);
         if state_code == STATE_BLOCKED {
-            // 需要获取事件信息
-            let event = self.blocked_event.lock().unwrap_or(Event::None);
-            TaskState::Blocked(event)
+            TaskState::Blocked(self.blocked_event.borrow_ref(cs).unwrap_or(Event::None))
         } else {
             TaskState::from_u8_simple(state_code)
         }
     }
-    
-    /// 设置状态为 Ready（原子操作）- O(1)
-    #[inline]
-    fn set_ready(&self) {
-        *self.blocked_event.lock() = None;
-        self.state_atomic.store(STATE_READY, Ordering::Release);
+
+    pub(super) fn set_state(&self, cs: CriticalSection<'_>, state: TaskState) {
+        *self.blocked_event.borrow_ref_mut(cs) = match state {
+            TaskState::Blocked(event) => Some(event),
+            _ => None,
+        };
+        self.state_atomic.store(state.to_u8(), Ordering::Release);
     }
-    
-    /// 设置状态为 Running（原子操作）- O(1)
-    #[inline]
-    fn set_running(&self) {
-        self.state_atomic.store(STATE_RUNNING, Ordering::Release);
+
+    pub(super) fn base_priority(&self) -> Priority {
+        Priority::from_u8(self.base_priority.load(Ordering::Acquire)).unwrap()
     }
-    
-    /// 设置状态为 Blocked（需要锁保护事件）
-    #[inline]
-    fn set_blocked(&self, event: Event) {
-        *self.blocked_event.lock() = Some(event);
-        self.state_atomic.store(STATE_BLOCKED, Ordering::Release);
-    }
-    
+
     /// 获取优先级（原子操作）- O(1)，无锁
     #[inline]
-    fn get_priority(&self) -> Priority {
+    pub(super) fn get_priority(&self) -> Priority {
         let prio = self.priority_atomic.load(Ordering::Acquire);
         Priority::from_u8(prio).unwrap_or(Priority::Normal)
     }
     
     /// 设置优先级（原子操作）- O(1)
     #[inline]
-    fn set_priority(&self, priority: Priority) {
+    pub(super) fn set_priority(&self, priority: Priority) {
         self.priority_atomic.store(priority.as_u8(), Ordering::Release);
     }
     
@@ -313,11 +275,32 @@ impl TaskControlBlock {
     /// 检查是否已初始化（原子操作）- O(1)，无锁
     #[inline]
     fn is_initialized(&self) -> bool {
-        self.state_atomic.load(Ordering::Acquire) != STATE_UNINIT
+        matches!(self.state_atomic.load(Ordering::Acquire), STATE_CREATED | STATE_READY | STATE_RUNNING | STATE_BLOCKED)
     }
 }
 
 impl Task {
+    // Slot lookup is kernel-only. Public handles retain their original generation.
+    pub(crate) fn from_slot(slot: usize) -> Self {
+        Self(slot, TASK_LIST[slot].generation.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn same_generation(self) -> bool {
+        self.1 == TASK_LIST[self.0].generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_live(self, cs: CriticalSection<'_>) -> bool {
+        !matches!(self.state_in(cs), TaskState::Uninit | TaskState::Finished)
+    }
+
+    pub fn wake_if(self, event: Event) -> bool {
+        critical_section::with(|cs| {
+            if self.state_in(cs) != TaskState::Blocked(event) { return false; }
+            Scheduler::set_task_state(self, TaskState::Ready);
+            true
+        })
+    }
+
     /// 创建新任务
     /// 
     /// ## 性能优化
@@ -327,50 +310,118 @@ impl Task {
     /// - 不影响其他任务的并发访问
     pub fn new<F>(name: &'static str, func: F) -> Result<Self>
     where
-        F: TaskFunction,
+        F: FnOnce() + Send + 'static,
     {
-        let task_list = get_task_list();
-        
-        // 获取分配锁，保证槽位分配的原子性
-        let _alloc_guard = get_alloc_lock().lock();
-        
-        // 查找空闲槽位
-        for i in 0..MAX_TASKS {
-            // 使用原子操作检查状态
-            if task_list[i].state_atomic.load(Ordering::Acquire) == STATE_UNINIT {
-                // SAFETY: TASK_STACKS 是静态数组，我们通过分配锁保证了
-                // 同一时间只有一个任务在初始化特定的栈槽位
-                let stack_top = unsafe { addr_of!(TASK_STACKS[i].data) as usize + STACK_SIZE };
-                task_list[i].init_unified(name, func, i, stack_top);
-                return Ok(Task(i));
+        Self::new_with_priority(name, func, Priority::Normal)
+    }
+
+    pub(crate) fn new_with_priority<F>(name: &'static str, func: F, priority: Priority) -> Result<Self>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        Self::allocate(name, func, priority, TaskState::Ready)
+    }
+
+    fn allocate<F: FnOnce() + Send + 'static>(name: &'static str, func: F, priority: Priority, initial: TaskState) -> Result<Self> {
+        critical_section::with(|cs| {
+            let task_list = get_task_list();
+            for i in 0..MAX_TASKS {
+                let state = task_list[i].get_state(cs);
+                if state == TaskState::Uninit || (state == TaskState::Finished && Scheduler::get_current_task().0 != i) {
+                    // Never wrap an identity onto a still-held old handle.
+                    let Some(generation) = task_list[i].generation.load(Ordering::Relaxed).checked_add(1) else { continue };
+                    task_list[i].generation.store(generation, Ordering::Release);
+                    // SAFETY: 槽位分配和栈初始化位于同一个临界区。
+                    let stack_top = unsafe { addr_of!(TASK_STACKS[i].data) as usize + STACK_SIZE };
+                    task_list[i].init_unified(name, func, i, stack_top);
+                    let task = Task::from_slot(i);
+                    task.set_base_priority(priority);
+                    task.set_priority_raw(priority);
+                    Scheduler::publish_task(cs, task, initial);
+                    return Ok(task);
+                }
             }
+            Err(RtosError::TaskSlotsFull)
+        })
+    }
+
+    /// Discard a task that has been created but has not started. Its closure
+    /// is dropped outside the kernel borrow. Running and finished tasks are unaffected.
+    fn cancel_unstarted(self) -> bool {
+        let closure = critical_section::with(|cs| {
+            if self.state_in(cs) != TaskState::Created { return None; }
+            self.set_state_raw(cs, TaskState::Finished);
+            Event::wake_task(Event::TaskExit(self));
+            TASK_LIST[self.0].task_fn.borrow_ref_mut(cs).take()
+        });
+        closure.is_some()
+    }
+
+    /// Block the calling task until this task returns or its creation is cancelled.
+    /// Multiple observers may join the same generation, including after slot reuse.
+    pub fn join(self) -> Result<()> {
+        loop {
+            let finished = critical_section::with(|cs| {
+                if self.state_in(cs) == TaskState::Finished {
+                    return Ok(true);
+                }
+                let mut caller = Scheduler::get_current_task();
+                if !Scheduler::is_running() || caller == self || caller.0 == 0 || self.0 == 0 {
+                    return Err(RtosError::InvalidTaskState);
+                }
+                caller.block(Event::TaskExit(self));
+                Ok(false)
+            })?;
+            if finished {
+                return Ok(());
+            }
+            crate::hal::trigger_schedule();
         }
-        Err(RtosError::TaskSlotsFull)
     }
 
-    /// 设置任务状态为 Running - O(1)，原子操作
-    pub fn run(&mut self) {
-        get_task_list()[self.0].set_running();
+    /// Suspend a ready task before dispatch. The idle task must always be runnable.
+    pub fn block_if_ready(self, event: Event) -> bool {
+        critical_section::with(|cs| {
+            if self.0 == 0 || self.state_in(cs) != TaskState::Ready { return false; }
+            Scheduler::set_task_state(self, TaskState::Blocked(event));
+            true
+        })
     }
 
-    /// 设置任务状态为 Ready - O(1)，原子操作
-    pub fn ready(&mut self) {
-        get_task_list()[self.0].set_ready();
+    pub(crate) fn ready(&mut self) {
+        Scheduler::set_task_state(*self, TaskState::Ready);
     }
 
-    /// 设置任务状态为 Blocked - O(1)
-    pub fn block(&mut self, reason: Event) {
-        get_task_list()[self.0].set_blocked(reason);
+    pub(crate) fn block(&mut self, reason: Event) {
+        Scheduler::set_task_state(*self, TaskState::Blocked(reason));
+    }
+
+    // 只供调度器在更新就绪队列的同一个临界区内调用。
+    pub(crate) fn set_state_raw(&self, cs: CriticalSection<'_>, state: TaskState) {
+        get_task_list()[self.0].set_state(cs, state);
+    }
+
+
+    pub(crate) fn set_base_priority(&self, priority: Priority) {
+        get_task_list()[self.0].base_priority.store(priority.as_u8(), Ordering::Release);
+    }
+
+    pub(crate) fn set_priority_raw(&self, priority: Priority) {
+        get_task_list()[self.0].set_priority(priority);
     }
 
     /// 获取任务状态 - O(1)，原子操作（Blocked 状态需要锁）
     pub fn get_state(&self) -> TaskState {
-        get_task_list()[self.0].get_state()
+        critical_section::with(|cs| self.state_in(cs))
     }
 
-    /// 获取任务名称 - O(1)，无锁（不变字段）
+    pub(crate) fn state_in(&self, cs: CriticalSection<'_>) -> TaskState {
+        if self.same_generation() { TASK_LIST[self.0].get_state(cs) } else { TaskState::Finished }
+    }
+
+    /// 在临界区读取任务名称，避免与槽位初始化竞争
     pub fn get_name(&self) -> &'static str {
-        get_task_list()[self.0].name
+        critical_section::with(|cs| if self.same_generation() { *TASK_LIST[self.0].name.borrow_ref(cs) } else { "<finished>" })
     }
 
     /// 获取任务 ID - O(1)，无锁（不变字段）
@@ -383,11 +434,25 @@ impl Task {
 
     /// 获取栈顶指针 - O(1)，原子操作
     pub fn get_stack_top(&self) -> usize {
-        get_task_list()[self.0].get_stack_top()
+        let top = TASK_LIST[self.0].get_stack_top();
+        if self.same_generation() { top } else { 0 }
+    }
+
+    // Validate the saved frame at the HAL boundary. This detects a bad SP;
+    // it cannot undo stores already made by an overflowing task.
+    #[cfg(target_os = "none")]
+    pub(crate) fn check_frame(&self, sp: usize) {
+        #[cfg(target_arch = "arm")]
+        let (frame_bytes, align) = (64, 8);
+        #[cfg(target_arch = "riscv32")]
+        let (frame_bytes, align) = (crate::hal::riscv::CONTEXT_FRAME_SIZE, 16);
+        let bottom = self.get_stack_bottom();
+        assert!(sp >= bottom + 32 && sp <= bottom + STACK_SIZE - frame_bytes && sp % align == 0,
+            "invalid context frame for task {}", self.0);
     }
 
     /// 设置栈顶指针 - O(1)，原子操作
-    pub fn set_stack_top(&mut self, stack_top: usize) {
+    pub(crate) fn set_stack_top(&mut self, stack_top: usize) {
         get_task_list()[self.0].set_stack_top(stack_top);
     }
 
@@ -402,7 +467,8 @@ impl Task {
     /// # 返回值
     /// 任务的当前优先级
     pub fn get_priority(&self) -> Priority {
-        get_task_list()[self.0].get_priority()
+        let priority = TASK_LIST[self.0].get_priority();
+        if self.same_generation() { priority } else { Priority::Idle }
     }
 
     /// 设置任务优先级 - O(1)，原子操作
@@ -410,7 +476,7 @@ impl Task {
     /// # 参数
     /// - `priority`: 新的优先级
     pub fn set_priority(&mut self, priority: Priority) {
-        get_task_list()[self.0].set_priority(priority);
+        Scheduler::set_task_priority(*self, priority);
     }
     
     /// 批量获取任务信息 - 减少多次访问的开销
@@ -423,14 +489,13 @@ impl Task {
     /// 返回 (state, priority, stack_top) 元组
     #[inline]
     pub fn get_info(&self) -> (TaskState, Priority, usize) {
-        let tcb = &get_task_list()[self.0];
-        (tcb.get_state(), tcb.get_priority(), tcb.get_stack_top())
+        critical_section::with(|cs| (self.state_in(cs), self.get_priority(), self.get_stack_top()))
     }
 
     /// 初始化任务系统
     pub(crate) fn init() {
         let task_list = get_task_list();
-        let _alloc_guard = get_alloc_lock().lock();
+        critical_section::with(|_| {
         
         for i in 0..MAX_TASKS {
             task_list[i].reset();
@@ -445,6 +510,7 @@ impl Task {
                 };
             }
         }
+        });
     }
 
     /// 遍历所有初始化的任务，对每个任务执行函数f
@@ -459,7 +525,7 @@ impl Task {
         let task_list = get_task_list();
         for i in 0..MAX_TASKS {
             if task_list[i].is_initialized() {
-                f(&mut Task(i), i);
+                f(&mut Task::from_slot(i), i);
             }
         }
     }
@@ -476,12 +542,12 @@ impl Task {
         let task_list = get_task_list();
         for i in start..MAX_TASKS {
             if task_list[i].is_initialized() {
-                f(&mut Task(i), i);
+                f(&mut Task::from_slot(i), i);
             }
         }
         for i in 0..start {
             if task_list[i].is_initialized() {
-                f(&mut Task(i), i);
+                f(&mut Task::from_slot(i), i);
             }
         }
     }
@@ -554,7 +620,7 @@ impl Task {
     /// # fn main() -> Result<(), neon_rtos2::error::RtosError> {
     /// let task = Task::builder("my_task")
     ///     .priority(Priority::High)
-    ///     .spawn(|_| { /* ... */ });
+    ///     .spawn(|| { /* ... */ });
     /// # Ok(())
     /// # }
     /// ```
@@ -578,12 +644,12 @@ impl Task {
     /// # use neon_rtos2::kernel::task::{Task, TaskState};
     /// # use neon_rtos2::kernel::task::state::TypedTaskAny;
     /// # fn main() -> Result<(), neon_rtos2::error::RtosError> {
-    /// let task = Task::new("my_task", |_| {})?;
+    /// let task = Task::new("my_task", || {})?;
     ///
     /// match task.into_typed()? {
     ///     TypedTaskAny::Ready(ready_task) => {
     ///         println!("Task is ready");
-    ///         let running_task = ready_task.run();
+    ///         assert_eq!(ready_task.id(), task.get_taskid());
     ///     }
     ///     TypedTaskAny::Running(running_task) => {
     ///         println!("Task is running");
@@ -599,25 +665,26 @@ impl Task {
     /// # }
     /// ```
     pub fn into_typed(self) -> Result<state::TypedTaskAny> {
-        use state::{TypedTask, TypedTaskAny, Created, Ready, Running, Blocked};
-        use core::marker::PhantomData;
+        use state::{TypedTask, TypedTaskAny};
+
 
         match self.get_state() {
-            TaskState::Uninit => Err(RtosError::InvalidTaskState),
+            TaskState::Uninit | TaskState::Finished => Err(RtosError::InvalidTaskState),
+            TaskState::Created => Ok(TypedTaskAny::Created(self)),
             TaskState::Ready => Ok(TypedTaskAny::Ready(TypedTask {
                 inner: self,
                 blocked_event: None,
-                _state: PhantomData,
+                _state: state::Ready,
             })),
             TaskState::Running => Ok(TypedTaskAny::Running(TypedTask {
                 inner: self,
                 blocked_event: None,
-                _state: PhantomData,
+                _state: state::Running,
             })),
             TaskState::Blocked(event) => Ok(TypedTaskAny::Blocked(TypedTask {
                 inner: self,
                 blocked_event: Some(event),
-                _state: PhantomData,
+                _state: state::Blocked,
             })),
         }
     }
@@ -652,7 +719,7 @@ impl Iterator for TaskIter {
             self.current += 1;
             // 使用原子操作检查状态，无需锁
             if task_list[idx].is_initialized() {
-                return Some(Task(idx));
+                return Some(Task::from_slot(idx));
             }
         }
         None
@@ -723,9 +790,9 @@ impl TaskSnapshotIter {
             if task_list[i].is_initialized() {
                 snapshots[count] = Some(TaskSnapshot {
                     task_id: i,
-                    state: task_list[i].get_state(),
+                    state: Task::from_slot(i).get_state(),
                     priority: task_list[i].get_priority(),
-                    name: task_list[i].name,
+                    name: Task::from_slot(i).get_name(),
                 });
                 count += 1;
             }
@@ -811,11 +878,11 @@ mod tests {
     extern crate std;
     use std::vec::Vec;
 
-    fn task1(_args: usize) {
+    fn task1() {
         // 简化的任务函数
     }
 
-    fn task2(_args: usize) {
+    fn task2() {
         // 简化的任务函数
     }
 
@@ -853,7 +920,8 @@ mod tests {
     fn test_task_state() {
         kernel_init();
         let mut task = Task::new("task", task1).unwrap();
-        task.run();
+        Scheduler::start();
+        Scheduler::task_switch();
         assert_eq!(task.get_state(), TaskState::Running);
         task.block(Event::Signal(1));
         assert_eq!(task.get_state(), TaskState::Blocked(Event::Signal(1)));
@@ -926,12 +994,13 @@ mod tests {
     #[serial]
     fn test_task_state_transitions() {
         kernel_init();
-        let mut task = Task::new("transition_task", |_| {}).unwrap();
+        let mut task = Task::new("transition_task", || {}).unwrap();
 
         // 测试所有状态转换
         assert_eq!(task.get_state(), TaskState::Ready);
 
-        task.run();
+        Scheduler::start();
+        Scheduler::task_switch();
         assert_eq!(task.get_state(), TaskState::Running);
 
         task.block(Event::Signal(1));
@@ -945,7 +1014,7 @@ mod tests {
     #[serial]
     fn test_task_stack_manipulation() {
         kernel_init();
-        let mut task = Task::new("stack_task", |_| {}).unwrap();
+        let mut task = Task::new("stack_task", || {}).unwrap();
 
         let original_stack_top = task.get_stack_top();
         assert_ne!(original_stack_top, 0);
@@ -977,9 +1046,9 @@ mod tests {
         kernel_init();
 
         // 创建几个任务，但中间有空隙
-        Task::new("task_1", |_| {}).unwrap();
+        Task::new("task_1", || {}).unwrap();
         // task_2位置空出来
-        let task3 = Task::new("task_3", |_| {}).unwrap();
+        let task3 = Task::new("task_3", || {}).unwrap();
 
         let mut count = 0;
         let mut found_task3 = false;
@@ -1001,9 +1070,9 @@ mod tests {
         kernel_init();
 
         // 创建几个任务
-        let task1 = Task::new("task_1", |_| {}).unwrap();
-        let task2 = Task::new("task_2", |_| {}).unwrap();
-        let task3 = Task::new("task_3", |_| {}).unwrap();
+        let task1 = Task::new("task_1", || {}).unwrap();
+        let task2 = Task::new("task_2", || {}).unwrap();
+        let task3 = Task::new("task_3", || {}).unwrap();
 
         let mut count = 0;
         let mut found_task1 = false;
@@ -1026,9 +1095,9 @@ mod tests {
     fn test_snapshot_iter_basic() {
         kernel_init();
         
-        Task::new("task1", |_| {}).unwrap();
-        Task::new("task2", |_| {}).unwrap();
-        Task::new("task3", |_| {}).unwrap();
+        Task::new("task1", || {}).unwrap();
+        Task::new("task2", || {}).unwrap();
+        Task::new("task3", || {}).unwrap();
         
         // 使用快照迭代器
         let snapshot_iter = Task::snapshot_iter();
@@ -1058,12 +1127,14 @@ mod tests {
     fn test_snapshot_iter_ready_tasks() {
         kernel_init();
         
-        let mut task1 = Task::new("ready_task", |_| {}).unwrap();
-        let mut task2 = Task::new("running_task", |_| {}).unwrap();
-        let mut task3 = Task::new("blocked_task", |_| {}).unwrap();
+        let mut task1 = Task::new("ready_task", || {}).unwrap();
+        let mut task2 = Task::new("running_task", || {}).unwrap();
+        let mut task3 = Task::new("blocked_task", || {}).unwrap();
         
         // 设置不同状态
-        task2.run();
+        Scheduler::start();
+        Scheduler::task_switch();
+        Scheduler::task_switch();
         task3.block(Event::Signal(1));
         
         // 使用快照迭代器获取就绪任务
@@ -1084,17 +1155,17 @@ mod tests {
         
         let mut low_task = Task::builder("low_task")
             .priority(Priority::Low)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         let high_task = Task::builder("high_task")
             .priority(Priority::High)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         let normal_task = Task::builder("normal_task")
             .priority(Priority::Normal)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         // 找到最高优先级的就绪任务
@@ -1109,8 +1180,8 @@ mod tests {
     fn test_snapshot_iter_blocked_tasks() {
         kernel_init();
         
-        let mut task1 = Task::new("task1", |_| {}).unwrap();
-        let mut task2 = Task::new("task2", |_| {}).unwrap();
+        let mut task1 = Task::new("task1", || {}).unwrap();
+        let mut task2 = Task::new("task2", || {}).unwrap();
         
         // 阻塞一个任务
         task1.block(Event::Signal(42));
@@ -1130,8 +1201,8 @@ mod tests {
     fn test_snapshot_iter_exact_size() {
         kernel_init();
         
-        Task::new("task1", |_| {}).unwrap();
-        Task::new("task2", |_| {}).unwrap();
+        Task::new("task1", || {}).unwrap();
+        Task::new("task2", || {}).unwrap();
         
         let mut iter = Task::snapshot_iter();
         assert_eq!(iter.len(), 3);

@@ -22,6 +22,25 @@
 //! ```
 
 pub mod traits;
+pub mod dma;
+pub use dma::{DmaChannel, DmaCompletion, DmaTransfer};
+
+/// Run a bounded operation with interrupts masked, restoring the previous
+/// state even for nested calls and early returns.
+pub use critical_section::with as with_interrupts_masked;
+
+#[cfg(any(test, target_arch = "arm", target_arch = "riscv32"))]
+fn tick_reload(clock_hz: u32, period: core::time::Duration, maximum: u32)
+    -> crate::error::Result<(u32, core::time::Duration)>
+{
+    use crate::error::RtosError;
+    if clock_hz == 0 || period.is_zero() { return Err(RtosError::InvalidArgument); }
+    let cycles = (period.as_nanos() * u128::from(clock_hz)).div_ceil(1_000_000_000);
+    if cycles > u128::from(maximum) { return Err(RtosError::InvalidArgument); }
+    let nanos = (cycles * 1_000_000_000).div_ceil(u128::from(clock_hz));
+    Ok((cycles as u32, core::time::Duration::from_nanos(nanos as u64)))
+}
+
 
 // ============================================================================
 // 架构模块
@@ -37,7 +56,7 @@ pub mod riscv;
 
 /// 测试/模拟架构
 #[cfg(any(test, all(not(target_arch = "arm"), not(target_arch = "riscv32"))))]
-pub mod test;
+pub(crate) mod test;
 
 // ============================================================================
 // 重新导出 traits
@@ -60,3 +79,18 @@ pub(crate) use riscv::{init_task_stack, start_first_task, trigger_schedule, init
 // 测试/模拟实现
 #[cfg(any(test, all(not(target_arch = "arm"), not(target_arch = "riscv32"))))]
 pub(crate) use test::{init_task_stack, start_first_task, trigger_schedule, init_idle_task};  
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::time::Duration;
+
+    #[test]
+    fn tick_configuration_rounds_up_and_rejects_invalid_reloads() {
+        assert_eq!(tick_reload(10_000_000, Duration::from_nanos(101), 2), Ok((2, Duration::from_nanos(200))));
+        for (hz, period) in [(0, Duration::from_millis(1)), (1, Duration::ZERO), (u32::MAX, Duration::MAX)] {
+            assert!(tick_reload(hz, period, u32::MAX).is_err());
+        }
+        assert!(tick_reload(10_000_000, Duration::from_nanos(201), 2).is_err());
+    }
+}

@@ -30,8 +30,7 @@
 ///     name: DeviceName,
 ///     base_addr: 0x4000_0000,
 ///     registers: {
-///         reg_name: reg_type, offset;
-///         ...
+///         status: u32, 0x04;
 ///     }
 /// }
 /// ```
@@ -44,7 +43,7 @@
 ///
 /// # 示例
 ///
-/// ```rust
+/// ```rust,no_run
 /// # use neon_rtos2::device_driver;
 /// device_driver! {
 ///     name: Uart0,
@@ -57,8 +56,9 @@
 /// }
 ///
 /// let uart = Uart0::new();
-/// let status = uart.status();
-/// uart.data_write(0x55);
+/// // The board must map these addresses to valid UART registers.
+/// let status = unsafe { uart.status() };
+/// unsafe { uart.data_write(0x55) };
 /// ```
 #[macro_export]
 macro_rules! device_driver {
@@ -89,13 +89,17 @@ macro_rules! device_driver {
                 $crate::paste::paste! {
                     /// 读取寄存器值
                     #[inline]
-                    pub fn $reg_name(&self) -> $reg_type {
+                    /// # Safety
+                    /// The address must be a valid aligned readable MMIO register of this type.
+                    pub unsafe fn $reg_name(&self) -> $reg_type {
                         unsafe { core::ptr::read_volatile((self.base + $offset) as *const $reg_type) }
                     }
 
                     /// 写入寄存器值
                     #[inline]
-                    pub fn [<$reg_name _write>](&self, value: $reg_type) {
+                    /// # Safety
+                    /// The address must be valid aligned writable MMIO and the value valid for this register.
+                    pub unsafe fn [<$reg_name _write>](&self, value: $reg_type) {
                         unsafe { core::ptr::write_volatile((self.base + $offset) as *mut $reg_type, value) }
                     }
 
@@ -227,7 +231,7 @@ macro_rules! interrupt_handler {
         name: $name:ident,
         handler: $handler:expr
     ) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn $name() {
             ($handler)()
         }

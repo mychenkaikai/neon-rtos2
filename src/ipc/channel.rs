@@ -1,171 +1,39 @@
-use crate::kernel::task::Task;
-use crate::{sync::event::Event, kernel::scheduler::Scheduler};
 use crate::compat::{Box, Vec, VecDeque};
 
 use core::any::Any;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::Mutex;
+
+use core::cell::RefCell;
+use critical_section::Mutex;
 
 // IPC句柄类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IpcHandle(usize);
+pub struct IpcHandle(usize, u64);
 
-// 消息类型，使用 Box<dyn Any> 进行类型安全的类型擦除
-struct Message {
-    data: Box<dyn Any + Send>,
-}
-
-impl Message {
-    fn new<T: 'static + Send>(data: T) -> Self {
-        Self {
-            data: Box::new(data),
-        }
-    }
-
-    fn try_into<T: 'static>(self) -> Result<T, Self> {
-        match self.data.downcast::<T>() {
-            Ok(boxed) => Ok(*boxed),
-            Err(data) => Err(Self { data }),
-        }
-    }
-    
-    fn is_type<T: 'static>(&self) -> bool {
-        self.data.is::<T>()
-    }
-}
-
-// 消息队列结构
 struct MessageQueue {
-    queue: VecDeque<Message>,
+    messages: VecDeque<Box<dyn Any + Send>>,
     capacity: usize,
-    waiting_senders: Vec<Task>,
-    waiting_receivers: Vec<Task>,
+    generation: u64,
 }
 
-impl MessageQueue {
-    fn new(capacity: usize) -> Self {
-        MessageQueue {
-            queue: VecDeque::with_capacity(capacity),
-            capacity,
-            waiting_senders: Vec::new(),
-            waiting_receivers: Vec::new(),
-        }
-    }
-
-    fn is_full(&self) -> bool {
-        self.queue.len() >= self.capacity
-    }
-
-    fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-}
-
-// 全局IPC管理器
 struct IpcManager {
     queues: Vec<Option<MessageQueue>>,
-    next_handle: AtomicUsize,
+    next_generation: u64,
 }
 
 impl IpcManager {
-    const fn new() -> Self {
-        IpcManager {
-            queues: Vec::new(),
-            next_handle: AtomicUsize::new(1), // 从1开始，0表示无效句柄
-        }
-    }
-
-    fn create_queue(&mut self, capacity: usize) -> IpcHandle {
-        let handle_id = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let queue = MessageQueue::new(capacity);
-
-        // 扩展队列数组以容纳新的句柄
-        while self.queues.len() <= handle_id {
-            self.queues.push(None);
-        }
-
-        self.queues[handle_id] = Some(queue);
-        IpcHandle(handle_id)
-    }
-
-    fn send_message<T: 'static + Send>(&mut self, handle: IpcHandle, data: T) -> Result<(), IpcError> {
-        let queue_opt = self.queues.get_mut(handle.0);
-
-        match queue_opt {
-            Some(Some(queue)) => {
-                if queue.is_full() {
-                    // 队列满，阻塞当前任务
-                    let mut current_task = Scheduler::get_current_task();
-                    queue.waiting_senders.push(current_task);
-                    current_task.block(Event::Mq(handle.0));
-
-                    Err(IpcError::QueueFull)
-                } else {
-                    let message = Message::new(data);
-                    queue.queue.push_back(message);
-
-                    // 唤醒等待接收的任务
-                    if let Some(waiting_task) = queue.waiting_receivers.pop() {
-                        Event::wake_task_by_id(waiting_task.get_taskid());
-                    }
-
-                    Ok(())
-                }
-            }
-            _ => Err(IpcError::InvalidHandle),
-        }
-    }
-
-    fn receive_message<T: 'static>(&mut self, handle: IpcHandle) -> Result<T, IpcError> {
-        let queue_opt = self.queues.get_mut(handle.0);
-
-        match queue_opt {
-            Some(Some(queue)) => {
-                if queue.is_empty() {
-                    // 队列空，阻塞当前任务
-                    let mut current_task = Scheduler::get_current_task();
-                    queue.waiting_receivers.push(current_task);
-                    current_task.block(Event::Mq(handle.0));
-
-                    Err(IpcError::QueueEmpty)
-                } else {
-                    // 先检查类型是否匹配，不要立即消费消息
-                    if let Some(front_message) = queue.queue.front() {
-                        if !front_message.is_type::<T>() {
-                            return Err(IpcError::TypeMismatch);
-                        }
-                    }
-
-                    // 类型匹配，现在可以安全地消费消息
-                    let message = queue.queue.pop_front().unwrap();
-
-                    // 唤醒等待发送的任务
-                    if let Some(waiting_task) = queue.waiting_senders.pop() {
-                        Event::wake_task_by_id(waiting_task.get_taskid());
-                    }
-
-                    match message.try_into::<T>() {
-                        Ok(data) => Ok(data),
-                        Err(_) => Err(IpcError::TypeMismatch), // 这种情况理论上不会发生
-                    }
-                }
-            }
-            _ => Err(IpcError::InvalidHandle),
-        }
-    }
-
-    fn destroy_queue(&mut self, handle: IpcHandle) -> Result<(), IpcError> {
-        if handle.0 < self.queues.len() {
-            self.queues[handle.0] = None;
-            Ok(())
-        } else {
-            Err(IpcError::InvalidHandle)
-        }
+    fn get(&mut self, handle: IpcHandle) -> Result<&mut MessageQueue, IpcError> {
+        self.queues
+            .get_mut(handle.0)
+            .and_then(Option::as_mut)
+            .filter(|q| q.generation == handle.1)
+            .ok_or(IpcError::InvalidHandle)
     }
 }
 
-// 全局IPC管理器实例
-static IPC_MANAGER: Mutex<IpcManager> = Mutex::new(IpcManager::new());
+static IPC_MANAGER: Mutex<RefCell<IpcManager>> = Mutex::new(RefCell::new(IpcManager {
+    queues: Vec::new(),
+    next_generation: 0,
+}));
 
 // IPC错误类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,35 +48,94 @@ pub enum IpcError {
 pub struct Ipc;
 
 impl Ipc {
+    pub(crate) fn init() {
+        // Keep generations monotonic across host kernel resets.
+        let old = critical_section::with(|cs| {
+            core::mem::take(&mut IPC_MANAGER.borrow_ref_mut(cs).queues)
+        });
+        drop(old);
+    }
+
     /// 创建一个新的消息队列
     pub fn create_queue(capacity: usize) -> IpcHandle {
-        IPC_MANAGER.lock().create_queue(capacity)
+        let messages = VecDeque::with_capacity(capacity);
+        critical_section::with(|cs| {
+            let mut manager = IPC_MANAGER.borrow_ref_mut(cs);
+            let generation = manager.next_generation;
+            manager.next_generation = generation.checked_add(1).expect("IPC IDs exhausted");
+            let queue = Some(MessageQueue {
+                messages,
+                capacity,
+                generation,
+            });
+            let slot = manager
+                .queues
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or(manager.queues.len());
+            if slot == manager.queues.len() {
+                manager.queues.push(queue);
+            } else {
+                manager.queues[slot] = queue;
+            }
+            IpcHandle(slot, generation)
+        })
     }
 
-    /// 发送消息到指定队列
+    /// 非阻塞发送消息；队列满时返回 QueueFull，不改变调用任务状态。
     pub fn send<T: 'static + Send>(handle: IpcHandle, data: T) -> Result<(), IpcError> {
-        IPC_MANAGER.lock().send_message(handle, data)
+        let mut data = Some(data);
+        critical_section::with(|cs| {
+            let mut manager = IPC_MANAGER.borrow_ref_mut(cs);
+            let queue = manager.get(handle)?;
+            if queue.messages.len() == queue.capacity {
+                return Err(IpcError::QueueFull);
+            }
+            queue.messages.push_back(Box::new(data.take().unwrap()));
+            Ok(())
+        })
     }
 
-    /// 从指定队列接收消息
+    /// 非阻塞接收消息；队列空时返回 QueueEmpty，不改变调用任务状态。
     pub fn receive<T: 'static>(handle: IpcHandle) -> Result<T, IpcError> {
-        IPC_MANAGER.lock().receive_message(handle)
+        let message = critical_section::with(|cs| {
+            let mut manager = IPC_MANAGER.borrow_ref_mut(cs);
+            let queue = manager.get(handle)?;
+            if !queue
+                .messages
+                .front()
+                .ok_or(IpcError::QueueEmpty)?
+                .is::<T>()
+            {
+                return Err(IpcError::TypeMismatch);
+            }
+            Ok(queue.messages.pop_front().unwrap())
+        })?;
+        message
+            .downcast::<T>()
+            .map(|value| *value)
+            .map_err(|_| IpcError::TypeMismatch)
     }
 
     /// 销毁消息队列
     pub fn destroy_queue(handle: IpcHandle) -> Result<(), IpcError> {
-        IPC_MANAGER.lock().destroy_queue(handle)
+        let removed = critical_section::with(|cs| {
+            let mut manager = IPC_MANAGER.borrow_ref_mut(cs);
+            manager.get(handle)?;
+            Ok(manager.queues[handle.0].take())
+        })?;
+        // Message destructors may call back into IPC.
+        drop(removed);
+        Ok(())
     }
 
     /// 非阻塞发送（如果队列满则立即返回错误）
     pub fn try_send<T: 'static + Send>(handle: IpcHandle, data: T) -> Result<(), IpcError> {
-        // 这里可以实现非阻塞版本
         Self::send(handle, data)
     }
 
     /// 非阻塞接收（如果队列空则立即返回错误）
     pub fn try_receive<T: 'static>(handle: IpcHandle) -> Result<T, IpcError> {
-        // 这里可以实现非阻塞版本
         Self::receive(handle)
     }
 }
@@ -220,10 +147,11 @@ mod tests {
     use crate::kernel::task::Task;
     use crate::utils::kernel_init;
 
-    fn test1(_: usize) {}
-    fn test2(_: usize) {}
+    fn test1() {}
+    fn test2() {}
 
     #[test]
+    #[serial_test::serial]
     fn test_ipc_basic() {
         kernel_init();
         Task::new("task1", test1);
@@ -246,5 +174,44 @@ mod tests {
         assert_eq!(Ipc::receive::<&str>(queue).unwrap(), "hello");
 
         Ipc::destroy_queue(queue).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn try_operations_never_block_the_caller() {
+        kernel_init();
+        Scheduler::start();
+        let task = Scheduler::get_current_task();
+        let handle = Ipc::create_queue(1);
+        assert_eq!(Ipc::try_receive::<u32>(handle), Err(IpcError::QueueEmpty));
+        assert_eq!(task.get_state(), crate::kernel::task::TaskState::Running);
+        Ipc::try_send(handle, 1u32).unwrap();
+        assert_eq!(Ipc::try_send(handle, 2u32), Err(IpcError::QueueFull));
+        assert_eq!(task.get_state(), crate::kernel::task::TaskState::Running);
+        Ipc::destroy_queue(handle).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recycling_ipc_slots_and_reentrant_payload_drop() {
+        struct OnDrop(IpcHandle);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                Ipc::send(self.0, 42u32).unwrap();
+            }
+        }
+        let sink = Ipc::create_queue(2);
+        let old = Ipc::create_queue(1);
+        Ipc::send(old, OnDrop(sink)).unwrap();
+        assert_eq!(Ipc::send(old, OnDrop(sink)), Err(IpcError::QueueFull));
+        Ipc::destroy_queue(old).unwrap();
+        assert_eq!(Ipc::receive::<u32>(sink), Ok(42));
+        assert_eq!(Ipc::receive::<u32>(sink), Ok(42));
+        let next = Ipc::create_queue(1);
+        assert_eq!(next.0, old.0);
+        assert_eq!(Ipc::destroy_queue(old), Err(IpcError::InvalidHandle));
+        Ipc::send(next, 1u32).unwrap();
+        Ipc::destroy_queue(next).unwrap();
+        Ipc::destroy_queue(sink).unwrap();
     }
 }

@@ -20,7 +20,7 @@
 //! timer.init().unwrap();
 //!
 //! // 设置周期为 1000 微秒
-//! timer.set_period_us(1000).unwrap();
+//! timer.set_period(core::time::Duration::from_micros(1000)).unwrap();
 //!
 //! // 启动定时器
 //! timer.start().unwrap();
@@ -30,7 +30,15 @@
 //! assert_eq!(timer.count(), 500);
 //! ```
 
+use core::time::Duration;
 use crate::drivers::{Device, TimerDevice, DeviceError};
+
+fn period_micros(period: Duration) -> Result<u32, DeviceError> {
+    let micros = period.as_nanos().div_ceil(1000);
+    if micros == 0 { return Err(DeviceError::InvalidParameter); }
+    u32::try_from(micros).map_err(|_| DeviceError::InvalidParameter)
+}
+
 
 /// Mock Timer 驱动
 ///
@@ -50,7 +58,7 @@ use crate::drivers::{Device, TimerDevice, DeviceError};
 ///
 /// let mut timer = MockTimer::new();
 /// timer.init().unwrap();
-/// timer.set_period_us(1000).unwrap();
+/// timer.set_period(core::time::Duration::from_micros(1000)).unwrap();
 /// timer.start().unwrap();
 ///
 /// // 模拟 1500 微秒后
@@ -112,7 +120,7 @@ impl MockTimer {
     ///
     /// let mut timer = MockTimer::new();
     /// timer.init().unwrap();
-    /// timer.set_period_us(1000).unwrap();
+    /// timer.set_period(core::time::Duration::from_micros(1000)).unwrap();
     /// timer.start().unwrap();
     ///
     /// timer.mock_tick(500);
@@ -126,17 +134,19 @@ impl MockTimer {
             return;
         }
 
-        self.counter = self.counter.wrapping_add(ticks);
+        let elapsed = u64::from(self.counter) + u64::from(ticks);
+        let period = u64::from(self.period_us);
+        let overflows = elapsed / period;
+        self.counter = (elapsed % period) as u32;
 
         // 检查溢出
-        while self.counter >= self.period_us {
-            self.counter -= self.period_us;
-            self.overflow_count += 1;
+        if overflows > 0 {
+            self.overflow_count = self.overflow_count.saturating_add(overflows as usize);
             self.overflowed = true;
 
             // 调用回调
             if let Some(cb) = self.callback {
-                cb();
+                for _ in 0..overflows { cb(); }
             }
         }
     }
@@ -240,14 +250,11 @@ impl TimerDevice for MockTimer {
         Ok(())
     }
 
-    fn set_period_us(&mut self, period: u32) -> Result<(), Self::Error> {
+    fn set_period(&mut self, period: Duration) -> Result<(), Self::Error> {
         if !self.initialized {
             return Err(DeviceError::NotInitialized);
         }
-        if period == 0 {
-            return Err(DeviceError::InvalidParameter);
-        }
-        self.period_us = period;
+        self.period_us = period_micros(period)?;
         Ok(())
     }
 
@@ -283,7 +290,7 @@ impl TimerDevice for MockTimer {
 /// use neon_rtos2::drivers::examples::PeriodicTimer;
 /// use neon_rtos2::drivers::Device;
 ///
-/// let mut timer = PeriodicTimer::new(1000); // 1ms 周期
+/// let mut timer = PeriodicTimer::new(core::time::Duration::from_millis(1)).unwrap(); // 1ms 周期
 /// timer.init().unwrap();
 /// timer.start().unwrap();
 ///
@@ -307,15 +314,15 @@ impl PeriodicTimer {
     ///
     /// # 参数
     ///
-    /// - `period_us`: 周期（微秒）
-    pub fn new(period_us: u32) -> Self {
+    /// 周期向上取整到微秒；零周期或超出计数范围时返回 InvalidParameter。
+    pub fn new(period: Duration) -> Result<Self, DeviceError> {
         let mut inner = MockTimer::new();
-        inner.period_us = period_us;
-        Self {
+        inner.period_us = period_micros(period)?;
+        Ok(Self {
             inner,
             elapsed_periods: 0,
             auto_reload: true,
-        }
+        })
     }
 
     /// 设置是否自动重载
@@ -331,11 +338,12 @@ impl PeriodicTimer {
     /// 模拟时间流逝
     pub fn mock_tick(&mut self, ticks: u32) {
         let before = self.inner.overflow_count();
+        let ticks = if self.auto_reload { ticks } else { ticks.min(self.inner.remaining_us()) };
         self.inner.mock_tick(ticks);
         let after = self.inner.overflow_count();
         self.elapsed_periods += after - before;
 
-        if !self.auto_reload && self.inner.has_overflowed() {
+        if !self.auto_reload && after != before {
             self.inner.stop().ok();
         }
     }
@@ -421,7 +429,7 @@ mod tests {
     fn test_mock_timer_count() {
         let mut timer = MockTimer::new();
         timer.init().unwrap();
-        timer.set_period_us(1000).unwrap();
+        timer.set_period(core::time::Duration::from_micros(1000)).unwrap();
         timer.start().unwrap();
 
         assert_eq!(timer.count(), 0);
@@ -437,7 +445,7 @@ mod tests {
     fn test_mock_timer_overflow() {
         let mut timer = MockTimer::new();
         timer.init().unwrap();
-        timer.set_period_us(1000).unwrap();
+        timer.set_period(core::time::Duration::from_micros(1000)).unwrap();
         timer.start().unwrap();
 
         timer.mock_tick(1500);
@@ -450,7 +458,7 @@ mod tests {
     fn test_mock_timer_multiple_overflow() {
         let mut timer = MockTimer::new();
         timer.init().unwrap();
-        timer.set_period_us(100).unwrap();
+        timer.set_period(core::time::Duration::from_micros(100)).unwrap();
         timer.start().unwrap();
 
         timer.mock_tick(350);
@@ -462,7 +470,7 @@ mod tests {
     fn test_mock_timer_clear() {
         let mut timer = MockTimer::new();
         timer.init().unwrap();
-        timer.set_period_us(1000).unwrap();
+        timer.set_period(core::time::Duration::from_micros(1000)).unwrap();
         timer.start().unwrap();
 
         timer.mock_tick(500);
@@ -476,7 +484,7 @@ mod tests {
     fn test_mock_timer_remaining() {
         let mut timer = MockTimer::new();
         timer.init().unwrap();
-        timer.set_period_us(1000).unwrap();
+        timer.set_period(core::time::Duration::from_micros(1000)).unwrap();
         timer.start().unwrap();
 
         assert_eq!(timer.remaining_us(), 1000);
@@ -489,7 +497,7 @@ mod tests {
     fn test_mock_timer_not_running() {
         let mut timer = MockTimer::new();
         timer.init().unwrap();
-        timer.set_period_us(1000).unwrap();
+        timer.set_period(core::time::Duration::from_micros(1000)).unwrap();
         // 不启动定时器
 
         timer.mock_tick(500);
@@ -510,7 +518,7 @@ mod tests {
         timer.init().unwrap();
 
         assert!(matches!(
-            timer.set_period_us(0),
+            timer.set_period(core::time::Duration::from_micros(0)),
             Err(DeviceError::InvalidParameter)
         ));
     }
@@ -520,13 +528,23 @@ mod tests {
         let mut timer = MockTimer::new();
         timer.init().unwrap();
 
-        timer.set_period_ms(5).unwrap();
+        timer.set_period(core::time::Duration::from_millis(5)).unwrap();
         assert_eq!(timer.period_us(), 5000);
     }
 
     #[test]
+    fn period_conversion_rounds_up_and_rejects_unrepresentable_values() {
+        assert!(matches!(PeriodicTimer::new(Duration::ZERO), Err(DeviceError::InvalidParameter)));
+        let mut timer = MockTimer::new().into_initialized().unwrap();
+        timer.set_period(Duration::from_nanos(1001)).unwrap();
+        assert_eq!(timer.period_us(), 2);
+        assert_eq!(timer.set_period(Duration::MAX), Err(DeviceError::InvalidParameter));
+        assert_eq!(timer.period_us(), 2);
+    }
+
+    #[test]
     fn test_periodic_timer() {
-        let mut timer = PeriodicTimer::new(1000);
+        let mut timer = PeriodicTimer::new(core::time::Duration::from_millis(1)).unwrap();
         timer.init().unwrap();
         timer.start().unwrap();
 
@@ -539,12 +557,12 @@ mod tests {
 
     #[test]
     fn test_periodic_timer_no_auto_reload() {
-        let mut timer = PeriodicTimer::new(1000);
+        let mut timer = PeriodicTimer::new(core::time::Duration::from_millis(1)).unwrap();
         timer.init().unwrap();
         timer.set_auto_reload(false);
         timer.start().unwrap();
 
-        timer.mock_tick(1500);
+        timer.mock_tick(5500);
         assert!(!timer.is_running()); // 溢出后自动停止
         assert_eq!(timer.elapsed_periods(), 1);
     }
@@ -565,7 +583,7 @@ mod tests {
 
         let mut timer = MockTimer::new();
         timer.init().unwrap();
-        timer.set_period_us(100).unwrap();
+        timer.set_period(core::time::Duration::from_micros(100)).unwrap();
         timer.set_callback(test_callback);
         timer.start().unwrap();
 

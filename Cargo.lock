@@ -34,15 +34,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b8e56985ec62d17e9c1001dc89c88ecd7dc08e47eba5ec7c29c7b5eeecde967"
 
 [[package]]
-name = "cc"
-version = "1.2.30"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deec109607ca693028562ed836a5f1c4b8bd77755c4e132fc5ce11b0b6211ae7"
-dependencies = [
- "shlex",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -263,13 +254,13 @@ name = "neon-rtos2"
 version = "0.1.0"
 dependencies = [
  "alloc-cortex-m",
- "cc",
  "cortex-m",
  "cortex-m-rt",
  "cortex-m-semihosting",
  "critical-section",
  "embedded-alloc",
  "paste",
+ "pin-project-lite",
  "rand",
  "riscv",
  "riscv-rt",
@@ -291,10 +282,10 @@ dependencies = [
 name = "neon-rtos2-example-tests"
 version = "0.1.0"
 dependencies = [
- "alloc-cortex-m",
  "cortex-m",
  "cortex-m-rt",
  "cortex-m-semihosting",
+ "critical-section",
  "neon-rtos2",
 ]
 
@@ -516,12 +507,6 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[package]]
-name = "shlex"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "slab"

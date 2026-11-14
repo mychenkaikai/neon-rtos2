@@ -20,8 +20,8 @@
 //!     
 //!     for i in 0..5 {
 //!         let sem_clone = sem.clone();
-//!         Task::builder(&format!("worker_{}", i))
-//!             .spawn(move |_| {
+//!         Task::builder("worker")
+//!             .spawn(move || {
 //!                 // 获取许可
 //!                 sem_clone.acquire().unwrap();
 //!                 // 访问受限资源...
@@ -32,40 +32,52 @@
 //! }
 //! ```
 
-use crate::compat::{Arc, VecDeque};
-use crate::kernel::scheduler::Scheduler;
-use crate::kernel::task::{Task, TaskState};
-use crate::kernel::time::systick::Systick;
-use crate::hal::trigger_schedule;
+use crate::kernel::time::systick::Ticks;
+use crate::kernel::time::systick::Deadline;
+use crate::compat::Arc;
 use crate::error::{Result, RtosError};
-use crate::sync::signal::WaiterList;
-use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-use core::task::Waker;
-use spin::Mutex;
+use crate::sync::event::Event;
+use crate::sync::wait::{Registration, WaitQueue, WakeBatch};
+use core::cell::Cell;
+use critical_section::Mutex;
 
-/// 信号量内部状态
 struct SemaphoreInner {
-    /// 当前可用许可数
-    permits: AtomicUsize,
-    /// 最大许可数（0 表示无限制）
+    permits: Mutex<Cell<usize>>,
+    closed: Mutex<Cell<bool>>,
     max_permits: usize,
-    /// 同步等待者列表
-    waiters: Mutex<WaiterList>,
-    /// 异步等待者列表
-    async_waiters: Mutex<VecDeque<Waker>>,
-    /// 是否已关闭
-    closed: AtomicBool,
+    waiters: WaitQueue,
 }
 
 impl SemaphoreInner {
     fn new(initial_permits: usize, max_permits: usize) -> Self {
         Self {
-            permits: AtomicUsize::new(initial_permits),
+            permits: Mutex::new(Cell::new(initial_permits)),
             max_permits,
-            waiters: Mutex::new(WaiterList::new()),
-            async_waiters: Mutex::new(VecDeque::new()),
-            closed: AtomicBool::new(false),
+            closed: Mutex::new(Cell::new(false)),
+            waiters: WaitQueue::new(),
         }
+    }
+
+    fn release(&self, n: usize) -> Result<()> {
+        let wakers = critical_section::with(|cs| {
+            if self.closed.borrow(cs).get() || n == 0 {
+                return Ok(WakeBatch::default());
+            }
+            let permits = self.permits.borrow(cs);
+            let total = permits
+                .get()
+                .checked_add(n)
+                .ok_or(RtosError::SemaphoreOverflow)?;
+            if self.max_permits != 0 && total > self.max_permits {
+                return Err(RtosError::SemaphoreOverflow);
+            }
+            permits.set(total);
+            Ok(self
+                .waiters
+                .take_all(cs, Event::Signal(self as *const Self as usize)))
+        })?;
+        wakers.wake();
+        Ok(())
     }
 }
 
@@ -159,47 +171,7 @@ impl Semaphore {
     /// - `Ok(())`: 成功获取许可
     /// - `Err(RtosError::SemaphoreClosed)`: 信号量已关闭
     pub fn acquire_many(&self, n: usize) -> Result<()> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RtosError::SemaphoreClosed);
-        }
-
-        loop {
-            let current = self.inner.permits.load(Ordering::Acquire);
-            if current >= n {
-                if self.inner.permits.compare_exchange(
-                    current,
-                    current - n,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ).is_ok() {
-                    return Ok(());
-                }
-                continue;
-            }
-
-            // 许可不足，需要阻塞
-            let task_id = Scheduler::get_current_task().get_taskid();
-
-            {
-                let mut waiters = self.inner.waiters.lock();
-                
-                if self.inner.closed.load(Ordering::Acquire) {
-                    return Err(RtosError::SemaphoreClosed);
-                }
-                
-                if !waiters.push(task_id) {
-                    return Err(RtosError::WaiterQueueFull);
-                }
-            }
-
-            let sem_id = Arc::as_ptr(&self.inner) as usize;
-            Scheduler::get_current_task().block(crate::sync::event::Event::Signal(sem_id));
-            trigger_schedule();
-
-            if self.inner.closed.load(Ordering::Acquire) {
-                return Err(RtosError::SemaphoreClosed);
-            }
-        }
+        self.acquire_until(n, None)
     }
 
     /// 尝试获取一个许可（非阻塞）
@@ -214,89 +186,47 @@ impl Semaphore {
 
     /// 尝试获取多个许可（非阻塞）
     pub fn try_acquire_many(&self, n: usize) -> Result<bool> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RtosError::SemaphoreClosed);
-        }
-
-        loop {
-            let current = self.inner.permits.load(Ordering::Acquire);
-            if current >= n {
-                if self.inner.permits.compare_exchange(
-                    current,
-                    current - n,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ).is_ok() {
-                    return Ok(true);
-                }
-                continue;
+        critical_section::with(|cs| {
+            if self.inner.closed.borrow(cs).get() {
+                return Err(RtosError::SemaphoreClosed);
             }
-            return Ok(false);
-        }
+            let permits = self.inner.permits.borrow(cs);
+            if permits.get() < n {
+                return Ok(false);
+            }
+            permits.set(permits.get() - n);
+            Ok(true)
+        })
     }
 
     /// 带超时的获取许可
     ///
     /// # 参数
-    /// - `timeout_ms`: 超时时间（毫秒）
+    /// - `timeout`: 超时时间（Duration 或 Ticks）
     ///
     /// # 返回值
     /// - `Ok(())`: 成功获取许可
     /// - `Err(RtosError::Timeout)`: 等待超时
     /// - `Err(RtosError::SemaphoreClosed)`: 信号量已关闭
-    pub fn acquire_timeout(&self, timeout_ms: usize) -> Result<()> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RtosError::SemaphoreClosed);
+    pub fn acquire_timeout(&self, timeout: impl Into<Ticks>) -> Result<()> {
+        self.acquire_until(1, Some(Deadline::after(timeout.into().0)))
+    }
+
+    fn attempt(&self, n: usize) -> Result<()> {
+        if self.try_acquire_many(n)? {
+            Ok(())
+        } else {
+            Err(RtosError::WouldBlock)
         }
+    }
 
-        let deadline = Systick::get_current_time() + timeout_ms;
-
-        loop {
-            let current = self.inner.permits.load(Ordering::Acquire);
-            if current > 0 {
-                if self.inner.permits.compare_exchange(
-                    current,
-                    current - 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ).is_ok() {
-                    return Ok(());
-                }
-                continue;
-            }
-
-            if Systick::get_current_time() >= deadline {
-                return Err(RtosError::Timeout);
-            }
-
-            let task_id = Scheduler::get_current_task().get_taskid();
-
-            {
-                let mut waiters = self.inner.waiters.lock();
-                
-                if self.inner.closed.load(Ordering::Acquire) {
-                    return Err(RtosError::SemaphoreClosed);
-                }
-                
-                if !waiters.push(task_id) {
-                    return Err(RtosError::WaiterQueueFull);
-                }
-            }
-
-            let sem_id = Arc::as_ptr(&self.inner) as usize;
-            Scheduler::get_current_task().block(crate::sync::event::Event::Signal(sem_id));
-            trigger_schedule();
-
-            if self.inner.closed.load(Ordering::Acquire) {
-                return Err(RtosError::SemaphoreClosed);
-            }
-
-            if Systick::get_current_time() >= deadline {
-                let mut waiters = self.inner.waiters.lock();
-                waiters.remove(task_id);
-                return Err(RtosError::Timeout);
-            }
-        }
+    fn acquire_until(&self, n: usize, deadline: Option<Deadline>) -> Result<()> {
+        self.inner.waiters.wait_until(
+            Event::Signal(self.id()),
+            deadline,
+            || self.attempt(n),
+            || {},
+        )
     }
 
     /// 释放一个许可
@@ -312,91 +242,28 @@ impl Semaphore {
 
     /// 释放多个许可
     pub fn release_many(&self, n: usize) -> Result<()> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Ok(()); // 已关闭，忽略释放
-        }
-
-        // 检查是否会超过最大限制
-        if self.inner.max_permits > 0 {
-            let current = self.inner.permits.load(Ordering::Acquire);
-            if current + n > self.inner.max_permits {
-                return Err(RtosError::SemaphoreOverflow);
-            }
-        }
-
-        // 增加许可计数
-        self.inner.permits.fetch_add(n, Ordering::Release);
-
-        // 唤醒等待者
-        for _ in 0..n {
-            // 首先尝试唤醒同步等待者
-            let task_id = {
-                let mut waiters = self.inner.waiters.lock();
-                waiters.pop_front()
-            };
-
-            if let Some(task_id) = task_id {
-                let mut task = Task(task_id);
-                if let TaskState::Blocked(_) = task.get_state() {
-                    task.ready();
-                }
-                continue;
-            }
-
-            // 然后尝试唤醒异步等待者
-            let waker = {
-                let mut async_waiters = self.inner.async_waiters.lock();
-                async_waiters.pop_front()
-            };
-
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
-
-        Ok(())
+        self.inner.release(n)
     }
 
     /// ���闭信号量
     ///
     /// 关闭后，所有等待的任务会被唤醒并收到错误。
     pub fn close(&self) {
-        self.inner.closed.store(true, Ordering::Release);
-        
-        // 唤醒所有同步等待者
-        let task_ids: [Option<usize>; 16];
-        {
-            let mut waiters = self.inner.waiters.lock();
-            task_ids = waiters.drain();
-        }
-
-        for task_id in task_ids.iter().filter_map(|&id| id) {
-            let mut task = Task(task_id);
-            if let TaskState::Blocked(_) = task.get_state() {
-                task.ready();
-            }
-        }
-
-        // 唤醒所有异步等待者
-        let async_wakers: VecDeque<Waker>;
-        {
-            let mut async_waiters = self.inner.async_waiters.lock();
-            async_wakers = core::mem::take(&mut *async_waiters);
-        }
-
-        for waker in async_wakers {
-            waker.wake();
-        }
+        critical_section::with(|cs| {
+            self.inner.closed.borrow(cs).set(true);
+            self.inner.waiters.take_all(cs, Event::Signal(self.id()))
+        })
+        .wake();
     }
 
     /// 检查是否已关闭
     pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::Acquire)
+        critical_section::with(|cs| self.inner.closed.borrow(cs).get())
     }
 
     /// 获取当前可用许可数
     pub fn available_permits(&self) -> usize {
-        self.inner.permits.load(Ordering::Relaxed)
+        critical_section::with(|cs| self.inner.permits.borrow(cs).get())
     }
 
     /// 获取最大许可数（0 表示无限制）
@@ -406,7 +273,8 @@ impl Semaphore {
 
     /// 获取等待者数量
     pub fn waiter_count(&self) -> usize {
-        self.inner.waiters.lock().len() + self.inner.async_waiters.lock().len()
+        let (tasks, futures) = self.inner.waiters.counts();
+        tasks + futures
     }
 
     /// 获取唯一标识（用于调试）
@@ -452,6 +320,7 @@ impl core::fmt::Debug for Semaphore {
 ///     // 使用资源...
 /// } // 自动释放许可
 /// ```
+#[must_use = "keep the permit alive while using the resource"]
 pub struct SemaphorePermit<'a> {
     semaphore: &'a Semaphore,
     permits: usize,
@@ -461,8 +330,8 @@ impl<'a> SemaphorePermit<'a> {
     /// 忘记这个许可，不释放
     ///
     /// 调用此方法后，许可不会在 drop 时释放。
-    pub fn forget(self) {
-        core::mem::forget(self);
+    pub fn forget(mut self) {
+        self.permits = 0;
     }
 }
 
@@ -495,10 +364,11 @@ impl core::fmt::Debug for SemaphorePermit<'_> {
 ///
 /// let sem = Semaphore::new(3);
 /// let permit = sem.acquire_owned().unwrap();
-/// 
+///
 /// // permit 可以被存储或移动
 /// drop(permit); // 显式释放
 /// ```
+#[must_use = "keep the permit alive while using the resource"]
 pub struct OwnedSemaphorePermit {
     semaphore: Arc<SemaphoreInner>,
     permits: usize,
@@ -510,8 +380,8 @@ unsafe impl Sync for OwnedSemaphorePermit {}
 
 impl OwnedSemaphorePermit {
     /// 忘记这个许可，不释放
-    pub fn forget(self) {
-        core::mem::forget(self);
+    pub fn forget(mut self) {
+        self.permits = 0;
     }
 
     /// 获取持有的许可数量
@@ -522,14 +392,15 @@ impl OwnedSemaphorePermit {
     /// 合并另一个许可到当前许可
     ///
     /// 两个许可必须来自同一个信号量。
-    pub fn merge(&mut self, other: OwnedSemaphorePermit) {
-        assert_eq!(
-            Arc::as_ptr(&self.semaphore),
-            Arc::as_ptr(&other.semaphore),
-            "Cannot merge permits from different semaphores"
-        );
-        self.permits += other.permits;
-        core::mem::forget(other);
+    /// On failure the argument retains all of its permits.
+    pub fn try_merge(&mut self, mut other: Self) -> core::result::Result<(), Self> {
+        if !Arc::ptr_eq(&self.semaphore, &other.semaphore) {
+            return Err(other);
+        }
+        let Some(total) = self.permits.checked_add(other.permits) else { return Err(other) };
+        self.permits = total;
+        other.permits = 0;
+        Ok(())
     }
 
     /// 分割出指定数量的许可
@@ -554,38 +425,7 @@ impl OwnedSemaphorePermit {
 
 impl Drop for OwnedSemaphorePermit {
     fn drop(&mut self) {
-        if self.permits > 0 {
-            // 增加许可计数
-            self.semaphore.permits.fetch_add(self.permits, Ordering::Release);
-
-            // 唤醒等待者
-            for _ in 0..self.permits {
-                let task_id = {
-                    let mut waiters = self.semaphore.waiters.lock();
-                    waiters.pop_front()
-                };
-
-                if let Some(task_id) = task_id {
-                    Task::for_each(|task, id| {
-                        if id == task_id {
-                            if let TaskState::Blocked(_) = task.get_state() {
-                                task.ready();
-                            }
-                        }
-                    });
-                    continue;
-                }
-
-                let waker = {
-                    let mut async_waiters = self.semaphore.async_waiters.lock();
-                    async_waiters.pop_front()
-                };
-
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }
-        }
+        let _ = self.semaphore.release(self.permits);
     }
 }
 
@@ -647,8 +487,8 @@ impl Semaphore {
     }
 
     /// 带超时的获取拥有所有权的许可
-    pub fn acquire_owned_timeout(&self, timeout_ms: usize) -> Result<OwnedSemaphorePermit> {
-        self.acquire_timeout(timeout_ms)?;
+    pub fn acquire_owned_timeout(&self, timeout: impl Into<Ticks>) -> Result<OwnedSemaphorePermit> {
+        self.acquire_timeout(timeout)?;
         Ok(OwnedSemaphorePermit {
             semaphore: Arc::clone(&self.inner),
             permits: 1,
@@ -667,7 +507,7 @@ impl Semaphore {
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::semaphore_v2::semaphore;
+/// use neon_rtos2::sync::semaphore::semaphore;
 ///
 /// let sem = semaphore(5);
 /// ```
@@ -683,7 +523,7 @@ pub fn semaphore(permits: usize) -> Semaphore {
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::semaphore_v2::semaphore_with_max;
+/// use neon_rtos2::sync::semaphore::semaphore_with_max;
 ///
 /// let sem = semaphore_with_max(3, 5);
 /// ```
@@ -700,7 +540,7 @@ pub fn semaphore_with_max(initial: usize, max: usize) -> Semaphore {
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::semaphore_v2::binary_semaphore;
+/// use neon_rtos2::sync::semaphore::binary_semaphore;
 ///
 /// let sem = binary_semaphore(true); // 初始可用
 /// sem.acquire().unwrap();
@@ -749,8 +589,8 @@ impl Semaphore {
     }
 
     /// 带超时的获取 RAII 风格的许可
-    pub fn acquire_permit_timeout(&self, timeout_ms: usize) -> Result<SemaphorePermit<'_>> {
-        self.acquire_timeout(timeout_ms)?;
+    pub fn acquire_permit_timeout(&self, timeout: impl Into<Ticks>) -> Result<SemaphorePermit<'_>> {
+        self.acquire_timeout(timeout)?;
         Ok(SemaphorePermit {
             semaphore: self,
             permits: 1,
@@ -766,7 +606,7 @@ impl Semaphore {
 pub struct SemaphoreAcquireFuture<'a> {
     semaphore: &'a Semaphore,
     permits: usize,
-    registered: bool,
+    registration: Registration<'a>,
 }
 
 impl<'a> SemaphoreAcquireFuture<'a> {
@@ -774,7 +614,7 @@ impl<'a> SemaphoreAcquireFuture<'a> {
         Self {
             semaphore,
             permits,
-            registered: false,
+            registration: semaphore.inner.waiters.registration(),
         }
     }
 }
@@ -782,34 +622,14 @@ impl<'a> SemaphoreAcquireFuture<'a> {
 impl<'a> core::future::Future for SemaphoreAcquireFuture<'a> {
     type Output = Result<()>;
 
-    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Self::Output> {
-        if self.semaphore.inner.closed.load(Ordering::Acquire) {
-            return core::task::Poll::Ready(Err(RtosError::SemaphoreClosed));
-        }
-
-        loop {
-            let current = self.semaphore.inner.permits.load(Ordering::Acquire);
-            if current >= self.permits {
-                if self.semaphore.inner.permits.compare_exchange(
-                    current,
-                    current - self.permits,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ).is_ok() {
-                    return core::task::Poll::Ready(Ok(()));
-                }
-                continue;
-            }
-            break;
-        }
-
-        if !self.registered {
-            let mut async_waiters = self.semaphore.inner.async_waiters.lock();
-            async_waiters.push_back(cx.waker().clone());
-            self.registered = true;
-        }
-
-        core::task::Poll::Pending
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        let semaphore = self.semaphore;
+        let permits = self.permits;
+        self.registration
+            .poll_until(cx, || semaphore.attempt(permits))
     }
 }
 
@@ -817,6 +637,16 @@ impl Semaphore {
     /// 异步获取一个许可
     pub fn acquire_async(&self) -> SemaphoreAcquireFuture<'_> {
         SemaphoreAcquireFuture::new(self, 1)
+    }
+
+    /// Await a permit that returns to the semaphore when dropped.
+    pub async fn acquire_permit_async(&self) -> Result<SemaphorePermit<'_>> {
+        self.acquire_permits_async(1).await
+    }
+
+    pub async fn acquire_permits_async(&self, n: usize) -> Result<SemaphorePermit<'_>> {
+        self.acquire_many_async(n).await?;
+        Ok(SemaphorePermit { semaphore: self, permits: n })
     }
 
     /// 异步获取多个许可
@@ -836,30 +666,30 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_basic() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(3);
-        
+
         assert_eq!(sem.available_permits(), 3);
-        
+
         // 获取许可
         assert!(sem.try_acquire().unwrap());
         assert_eq!(sem.available_permits(), 2);
-        
+
         assert!(sem.try_acquire().unwrap());
         assert_eq!(sem.available_permits(), 1);
-        
+
         assert!(sem.try_acquire().unwrap());
         assert_eq!(sem.available_permits(), 0);
-        
+
         // 没有许可了
         assert!(!sem.try_acquire().unwrap());
-        
+
         // 释放许可
         sem.release().unwrap();
         assert_eq!(sem.available_permits(), 1);
-        
+
         // 又可以获取了
         assert!(sem.try_acquire().unwrap());
     }
@@ -868,18 +698,18 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_with_max() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::with_max(2, 3);
-        
+
         assert_eq!(sem.available_permits(), 2);
         assert_eq!(sem.max_permits(), 3);
-        
+
         // 释放到最大
         sem.release().unwrap();
         assert_eq!(sem.available_permits(), 3);
-        
+
         // 超过最大会失败
         assert!(sem.release().is_err());
     }
@@ -888,17 +718,17 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_clone() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem1 = Semaphore::new(2);
         let sem2 = sem1.clone();
-        
+
         assert_eq!(sem1.id(), sem2.id());
-        
+
         sem1.try_acquire().unwrap();
         assert_eq!(sem2.available_permits(), 1);
-        
+
         sem2.release().unwrap();
         assert_eq!(sem1.available_permits(), 2);
     }
@@ -907,16 +737,16 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_permit() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(1);
-        
+
         {
             let _permit = sem.acquire_permit().unwrap();
             assert_eq!(sem.available_permits(), 0);
         } // permit 被 drop，自动释放
-        
+
         assert_eq!(sem.available_permits(), 1);
     }
 
@@ -924,14 +754,14 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_close() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(1);
-        
+
         sem.close();
         assert!(sem.is_closed());
-        
+
         assert!(sem.try_acquire().is_err());
     }
 
@@ -939,16 +769,16 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_acquire_many() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(5);
-        
+
         assert!(sem.try_acquire_many(3).unwrap());
         assert_eq!(sem.available_permits(), 2);
-        
+
         assert!(!sem.try_acquire_many(3).unwrap()); // 不够
-        
+
         sem.release_many(3).unwrap();
         assert_eq!(sem.available_permits(), 5);
     }
@@ -957,16 +787,16 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_owned_permit() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(3);
-        
+
         // 获取 owned permit
         let permit = sem.acquire_owned().unwrap();
         assert_eq!(sem.available_permits(), 2);
         assert_eq!(permit.permits(), 1);
-        
+
         drop(permit);
         assert_eq!(sem.available_permits(), 3);
     }
@@ -975,15 +805,15 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_owned_permit_many() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(5);
-        
+
         let permit = sem.acquire_many_owned(3).unwrap();
         assert_eq!(sem.available_permits(), 2);
         assert_eq!(permit.permits(), 3);
-        
+
         drop(permit);
         assert_eq!(sem.available_permits(), 5);
     }
@@ -992,22 +822,27 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_owned_permit_merge() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(5);
-        
+
         let mut permit1 = sem.acquire_many_owned(2).unwrap();
         let permit2 = sem.acquire_many_owned(2).unwrap();
-        
+
         assert_eq!(sem.available_permits(), 1);
         assert_eq!(permit1.permits(), 2);
         assert_eq!(permit2.permits(), 2);
-        
+
         // 合并许可
-        permit1.merge(permit2);
+        assert!(permit1.try_merge(permit2).is_ok());
+        let separate = Semaphore::new(1);
+        let returned = permit1.try_merge(separate.acquire_owned().unwrap()).unwrap_err();
+        assert_eq!(separate.available_permits(), 0);
+        drop(returned);
+        assert_eq!(separate.available_permits(), 1);
         assert_eq!(permit1.permits(), 4);
-        
+
         drop(permit1);
         assert_eq!(sem.available_permits(), 5);
     }
@@ -1016,23 +851,23 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_owned_permit_split() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(5);
-        
+
         let mut permit = sem.acquire_many_owned(4).unwrap();
         assert_eq!(sem.available_permits(), 1);
-        
+
         // 分割许可
         let split = permit.split(2).unwrap();
         assert_eq!(permit.permits(), 2);
         assert_eq!(split.permits(), 2);
-        
+
         // 释放分割的许可
         drop(split);
         assert_eq!(sem.available_permits(), 3);
-        
+
         // 释放剩余许可
         drop(permit);
         assert_eq!(sem.available_permits(), 5);
@@ -1042,14 +877,14 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_owned_permit_forget() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(3);
-        
+
         let permit = sem.acquire_owned().unwrap();
         assert_eq!(sem.available_permits(), 2);
-        
+
         // 忘记许可（不释放）
         permit.forget();
         assert_eq!(sem.available_permits(), 2); // 仍然是 2
@@ -1059,19 +894,19 @@ mod tests {
     #[serial]
     fn test_semaphore_v2_try_acquire_owned() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = Semaphore::new(1);
-        
+
         // 第一次应该成功
         let permit = sem.try_acquire_owned().unwrap();
         assert!(permit.is_some());
-        
+
         // 第二次应该失败
         let permit2 = sem.try_acquire_owned().unwrap();
         assert!(permit2.is_none());
-        
+
         // 释放后应该成功
         drop(permit);
         let permit3 = sem.try_acquire_owned().unwrap();
@@ -1082,25 +917,25 @@ mod tests {
     #[serial]
     fn test_binary_semaphore() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let sem = super::binary_semaphore(true);
-        
+
         assert_eq!(sem.available_permits(), 1);
         assert_eq!(sem.max_permits(), 1);
-        
+
         // 获取
         assert!(sem.try_acquire().unwrap());
         assert_eq!(sem.available_permits(), 0);
-        
+
         // 不能再获取
         assert!(!sem.try_acquire().unwrap());
-        
+
         // 释放
         sem.release().unwrap();
         assert_eq!(sem.available_permits(), 1);
-        
+
         // 不能超过最大值
         assert!(sem.release().is_err());
     }
@@ -1109,13 +944,13 @@ mod tests {
     #[serial]
     fn test_semaphore_convenience_functions() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         // 测试 semaphore() 函数
         let sem = super::semaphore(3);
         assert_eq!(sem.available_permits(), 3);
-        
+
         // 测试 semaphore_with_max() 函数
         let sem2 = super::semaphore_with_max(2, 5);
         assert_eq!(sem2.available_permits(), 2);

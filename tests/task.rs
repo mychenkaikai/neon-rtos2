@@ -8,8 +8,8 @@ fn test_basic_task_operations() {
     kernel_init();
     
     // 创建测试任务
-    let task1 = Task::new("task1", |_| {}).unwrap();
-    let task2 = Task::new("task2", |_| {}).unwrap();
+    let task1 = Task::new("task1", || {}).unwrap();
+    let task2 = Task::new("task2", || {}).unwrap();
     
     // 启动调度器
     Scheduler::start();
@@ -34,8 +34,8 @@ fn test_task_switching() {
     kernel_init();
     
     // 创建测试任务
-    Task::new("switch_task1", |_| {}).unwrap();
-    Task::new("switch_task2", |_| {}).unwrap();
+    Task::new("switch_task1", || {}).unwrap();
+    Task::new("switch_task2", || {}).unwrap();
     
     // 启动调度器
     Scheduler::start();
@@ -60,9 +60,9 @@ fn test_multiple_tasks() {
     kernel_init();
     
     // 创建多个测试任务
-    let task1 = Task::new("multi_task1", |_| {}).unwrap();
-    let task2 = Task::new("multi_task2", |_| {}).unwrap();
-    let task3 = Task::new("multi_task3", |_| {}).unwrap();
+    let task1 = Task::new("multi_task1", || {}).unwrap();
+    let task2 = Task::new("multi_task2", || {}).unwrap();
+    let task3 = Task::new("multi_task3", || {}).unwrap();
     
     // 启动调度器
     Scheduler::start();
@@ -89,14 +89,14 @@ fn test_schedule_loop() {
     kernel_init();
     
     // 创建8个测试任务
-    let task1 = Task::new("schedule_loop_task1", |_| {}).unwrap();
-    let task2 = Task::new("schedule_loop_task2", |_| {}).unwrap();
-    let task3 = Task::new("schedule_loop_task3", |_| {}).unwrap();
-    let task4 = Task::new("schedule_loop_task4", |_| {}).unwrap();
-    let task5 = Task::new("schedule_loop_task5", |_| {}).unwrap();
-    let task6 = Task::new("schedule_loop_task6", |_| {}).unwrap();
-    let task7 = Task::new("schedule_loop_task7", |_| {}).unwrap();
-    let task8 = Task::new("schedule_loop_task8", |_| {}).unwrap();
+    let task1 = Task::new("schedule_loop_task1", || {}).unwrap();
+    let task2 = Task::new("schedule_loop_task2", || {}).unwrap();
+    let task3 = Task::new("schedule_loop_task3", || {}).unwrap();
+    let task4 = Task::new("schedule_loop_task4", || {}).unwrap();
+    let task5 = Task::new("schedule_loop_task5", || {}).unwrap();
+    let task6 = Task::new("schedule_loop_task6", || {}).unwrap();
+    let task7 = Task::new("schedule_loop_task7", || {}).unwrap();
+    let task8 = Task::new("schedule_loop_task8", || {}).unwrap();
     // 启动调度器
     Scheduler::start();
     
@@ -174,14 +174,14 @@ fn test_schedule_block() {
     kernel_init();
     
     // 创建8个测试任务
-    let task1 = Task::new("schedule_block_task1", |_| {}).unwrap();
-    let task2 = Task::new("schedule_block_task2", |_| {}).unwrap();
-    let mut task3 = Task::new("schedule_block_task3", |_| {}).unwrap();
-    let task4 = Task::new("schedule_block_task4", |_| {}).unwrap();
-    let task5 = Task::new("schedule_block_task5", |_| {}).unwrap();
-    let task6 = Task::new("schedule_block_task6", |_| {}).unwrap();
-    let task7 = Task::new("schedule_block_task7", |_| {}).unwrap();
-    let task8 = Task::new("schedule_block_task8", |_| {}).unwrap();
+    let task1 = Task::new("schedule_block_task1", || {}).unwrap();
+    let task2 = Task::new("schedule_block_task2", || {}).unwrap();
+    let task3 = Task::new("schedule_block_task3", || {}).unwrap();
+    let task4 = Task::new("schedule_block_task4", || {}).unwrap();
+    let task5 = Task::new("schedule_block_task5", || {}).unwrap();
+    let task6 = Task::new("schedule_block_task6", || {}).unwrap();
+    let task7 = Task::new("schedule_block_task7", || {}).unwrap();
+    let task8 = Task::new("schedule_block_task8", || {}).unwrap();
 
     // 启动调度器
     Scheduler::start(); 
@@ -210,7 +210,7 @@ fn test_schedule_block() {
     let current_task = Scheduler::get_current_task();
     assert_eq!(current_task.get_taskid(), task2.get_taskid());
     //阻塞第三个任务
-    task3.block(Event::Timer(0));
+    assert!(task3.block_if_ready(Event::Timer(0)));
 
 
 
@@ -255,7 +255,7 @@ fn test_schedule_block() {
     assert_eq!(current_task.get_taskid(), task2.get_taskid());
 
     //唤醒第三个任务
-    task3.ready();
+    assert!(task3.wake_if(Event::Timer(0)));
 
     // 验证调度器正常工作,应该是第三个任务
     Scheduler::task_switch();

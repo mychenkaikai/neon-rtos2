@@ -1,8 +1,9 @@
-use crate::kernel::task::{Task, TaskState, Priority};
+use crate::kernel::task::{get_task_list, Task, TaskState, Priority};
 use crate::hal::init_idle_task;
 use crate::config::MAX_TASKS;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use spin::{Once, RwLock, Mutex};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::cell::RefCell;
+use critical_section::{CriticalSection, Mutex};
 
 /// 优先级数量（对应 Priority 枚举的变体数）
 const PRIORITY_COUNT: usize = 5;
@@ -147,8 +148,8 @@ impl ReadyQueue {
 struct SchedulerInner {
     /// 当前运行的任务
     current_task: Option<Task>,
-    /// 下一个要运行的任务（用于上下文切换）
-    next_task: Option<Task>,
+    // Each blocked task can wait on at most one mutex owner.
+    waiting_on: [Option<usize>; MAX_TASKS],
     /// 就绪位图：第 i 位为 1 表示优先级 i 有就绪任务
     /// 位 0 = Idle, 位 1 = Low, 位 2 = Normal, 位 3 = High, 位 4 = Critical
     ready_bitmap: u8,
@@ -160,7 +161,7 @@ impl SchedulerInner {
     const fn new() -> Self {
         Self {
             current_task: None,
-            next_task: None,
+            waiting_on: [None; MAX_TASKS],
             ready_bitmap: 0,
             ready_queues: [
                 ReadyQueue::new(),
@@ -177,8 +178,7 @@ impl SchedulerInner {
         let prio_idx = priority.as_u8() as usize;
         if prio_idx < PRIORITY_COUNT {
             // 避免重复入队
-            if !self.ready_queues[prio_idx].contains(task_id) {
-                self.ready_queues[prio_idx].push(task_id);
+            if self.ready_queues[prio_idx].push(task_id) {
                 // 设置位图
                 self.ready_bitmap |= 1 << prio_idx;
             }
@@ -224,7 +224,7 @@ impl SchedulerInner {
             loop {
                 if let Some(task_id) = self.ready_queues[prio_idx].pop() {
                     // 验证任务状态
-                    let task = Task(task_id);
+                    let task = Task::from_slot(task_id);
                     if task.get_state() == TaskState::Ready {
                         // 如果队列为空，清除位图
                         if self.ready_queues[prio_idx].is_empty() {
@@ -259,7 +259,7 @@ impl SchedulerInner {
             let mut curr = queue.head;
             while curr != usize::MAX {
                 let task_id = curr;
-                let task = Task(task_id);
+                let task = Task::from_slot(task_id);
                 if task.get_state() == TaskState::Ready {
                     return Some((task_id, Priority::from_u8(prio_idx as u8).unwrap_or(Priority::Normal)));
                 }
@@ -286,12 +286,12 @@ impl SchedulerInner {
     }
 }
 
-/// 全局调度器状态
-static SCHEDULER_INNER: Once<Mutex<SchedulerInner>> = Once::new();
+// 内核控制状态只在短临界区中访问。不能使用会被中断抢占的自旋锁。
+static SCHEDULER_INNER: Mutex<RefCell<SchedulerInner>> =
+    Mutex::new(RefCell::new(SchedulerInner::new()));
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_RUNNING: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_USE_PRIORITY: AtomicBool = AtomicBool::new(false);
-
-/// 当前任务 ID（原子变量，用于快速访问）
 static CURRENT_TASK_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
@@ -299,317 +299,297 @@ pub(crate) fn set_current_task_id_for_test(id: usize) {
     CURRENT_TASK_ID.store(id, Ordering::Release);
 }
 
-fn get_scheduler_inner() -> &'static Mutex<SchedulerInner> {
-    SCHEDULER_INNER.call_once(|| Mutex::new(SchedulerInner::new()))
+impl SchedulerInner {
+    fn apply_priority(&mut self, cs: CriticalSection<'_>, slot: usize, priority: Priority) {
+        let tcb = &get_task_list()[slot];
+        let old = tcb.get_priority();
+        if old == priority { return; }
+        if tcb.get_state(cs) == TaskState::Ready {
+            self.dequeue_task(slot, old);
+            self.enqueue_ready(slot, priority);
+        }
+        tcb.set_priority(priority);
+    }
+
+    // Rebuild from base priorities so removing an edge also revokes transitive donations.
+    // No allocation. A simple chain has at most MAX_TASKS - 1 edges.
+    fn refresh_inheritance(&mut self, cs: CriticalSection<'_>) {
+        let mut effective: [Priority; MAX_TASKS] = core::array::from_fn(|id| get_task_list()[id].base_priority());
+        for _ in 1..MAX_TASKS {
+            let mut changed = false;
+            for (waiter, owner) in self.waiting_on.iter().enumerate() {
+                if let Some(owner) = *owner {
+                    if effective[waiter] > effective[owner] {
+                        effective[owner] = effective[waiter];
+                        changed = true;
+                    }
+                }
+            }
+            if !changed { break; }
+        }
+        for (id, priority) in effective.into_iter().enumerate() {
+            self.apply_priority(cs, id, priority);
+        }
+    }
+
+    fn set_state(&mut self, cs: CriticalSection<'_>, task: Task, state: TaskState) {
+        if self.waiting_on[task.0].is_some() && task.state_in(cs) != state {
+            self.waiting_on[task.0] = None;
+            self.refresh_inheritance(cs);
+        }
+        self.remove_task_from_all_queues(task.0);
+        task.set_state_raw(cs, state);
+        if state == TaskState::Ready {
+            self.enqueue_ready(task.0, task.get_priority());
+        }
+    }
+
+    fn switch_to(&mut self, cs: CriticalSection<'_>, next: Task) {
+        if let Some(current) = self.current_task {
+            if current != next && current.state_in(cs) == TaskState::Running {
+                self.set_state(cs, current, TaskState::Ready);
+            }
+        }
+        self.set_state(cs, next, TaskState::Running);
+        self.current_task = Some(next);
+        CURRENT_TASK_ID.store(next.0, Ordering::Release);
+    }
 }
 
 pub struct Scheduler;
 
 impl Scheduler {
-    pub fn init() {
-        // 重置调度器状态
-        {
-            let mut inner = get_scheduler_inner().lock();
-            *inner = SchedulerInner::new();
-        }
-        SCHEDULER_RUNNING.store(false, Ordering::Release);
-        SCHEDULER_USE_PRIORITY.store(false, Ordering::Release);
-        CURRENT_TASK_ID.store(0, Ordering::Release);
-        
-        init_idle_task();
+    pub(crate) fn init() {
+        critical_section::with(|cs| {
+            *SCHEDULER_INNER.borrow_ref_mut(cs) = SchedulerInner::new();
+            SCHEDULER_RUNNING.store(false, Ordering::Release);
+            SCHEDULER_USE_PRIORITY.store(false, Ordering::Release);
+            CURRENT_TASK_ID.store(0, Ordering::Release);
+            init_idle_task();
+            INITIALIZED.store(true, Ordering::Release);
+        });
     }
 
-    /// 启用优先级调度
-    ///
-    /// 启用后，调度器会优先选择优先级最高的就绪任务运行。
-    /// 
-    /// ## 性能说明
-    /// 
-    /// 优先级调度使用位图 + 优先级队列实现 O(1) 调度：
-    /// - 查找最高优先级任务：O(1)
-    /// - 任务入队/出队：O(1)
     pub fn enable_priority_scheduling() {
         SCHEDULER_USE_PRIORITY.store(true, Ordering::Release);
     }
 
-    /// 禁用优先级调度
-    ///
-    /// 禁用后，调度器使用轮转调度算法。
     pub fn disable_priority_scheduling() {
         SCHEDULER_USE_PRIORITY.store(false, Ordering::Release);
     }
 
-    /// 检查是否启用优先级调度
     pub fn is_priority_scheduling_enabled() -> bool {
         SCHEDULER_USE_PRIORITY.load(Ordering::Acquire)
     }
 
-    /// 检查调度器是否正在运行
     pub fn is_running() -> bool {
         SCHEDULER_RUNNING.load(Ordering::Acquire)
     }
-    
-    /// 将任务加入就绪队列
-    /// 
-    /// 当任务从阻塞状态变为就绪状态时调用。
-    /// 
-    /// ## 性能
-    /// - 时间复杂度：O(1)
-    pub fn enqueue_ready_task(task: &Task) {
-        let mut inner = get_scheduler_inner().lock();
-        inner.enqueue_ready(task.get_taskid(), task.get_priority());
-    }
-    
-    /// 从就绪队列移除任务
-    /// 
-    /// 当任务进入阻塞状态时调用。
-    /// 
-    /// ## 性能
-    /// - 时间复杂度：O(n)，n 为该优先级队列中的任务数
-    pub fn dequeue_task(task: &Task) {
-        let mut inner = get_scheduler_inner().lock();
-        inner.dequeue_task(task.get_taskid(), task.get_priority());
+
+    pub(crate) fn publish_task(cs: CriticalSection<'_>, task: Task, initial: TaskState) {
+        SCHEDULER_INNER.borrow_ref_mut(cs).set_state(cs, task, initial);
     }
 
-    /// 基于优先级的调度 - O(1)
-    ///
-    /// 选择优先级最高的就绪任务运行。
-    /// 如果有多个相同优先级的任务，按 FIFO 顺序选择。
-    /// 
-    /// ## 优化说明
-    /// 
-    /// 使用位图快速查找最高优先级：
-    /// - `ready_bitmap` 的每一位表示对应优先级是否有就绪任务
-    /// - 使用 `leading_zeros()` 指令在 O(1) 时间内找到最高优先级
-    pub fn schedule_by_priority() {
-        // 如果调度器未运行，直接返回
-        if !Self::is_running() {
-            return;
+    pub(crate) fn finish_current() {
+        critical_section::with(|cs| {
+            let mut inner = SCHEDULER_INNER.borrow_ref_mut(cs);
+            let current = inner.current_task.expect("task returned before scheduler start");
+            assert_ne!(current.0, 0, "idle task returned");
+            let mut changed = inner.waiting_on[current.0].take().is_some();
+            for owner in &mut inner.waiting_on {
+                if *owner == Some(current.0) { *owner = None; changed = true; }
+            }
+            if changed { inner.refresh_inheritance(cs); }
+            inner.set_state(cs, current, TaskState::Finished);
+            drop(inner);
+            crate::sync::event::Event::wake_task(crate::sync::event::Event::TaskExit(current));
+        });
+    }
+
+    // Task、Event 和优先级继承统一经过这里，状态和队列一次提交。
+    pub(crate) fn set_task_state(task: Task, state: TaskState) {
+        critical_section::with(|cs| {
+            if task.is_live(cs) { SCHEDULER_INNER.borrow_ref_mut(cs).set_state(cs, task, state); }
+        });
+    }
+
+    // All matching waiters leave their blocked state under the caller's single
+    // critical section. Revoke their donations together, before FIFO insertion
+    // at the final effective priorities. Other wait events keep their donations.
+    pub(crate) fn wake_tasks_if(
+        cs: CriticalSection<'_>,
+        ids: impl Iterator<Item = usize> + Clone,
+        event: crate::sync::event::Event,
+    ) -> usize {
+        let mut inner = SCHEDULER_INNER.borrow_ref_mut(cs);
+        let blocked = TaskState::Blocked(event);
+        let mut revoked = false;
+        for id in ids.clone() {
+            if id < MAX_TASKS && inner.waiting_on[id].is_some() && get_task_list()[id].get_state(cs) == blocked {
+                inner.waiting_on[id] = None;
+                revoked = true;
+            }
         }
+        if revoked {
+            inner.refresh_inheritance(cs);
+        }
+        let mut count = 0;
+        for id in ids {
+            if id < MAX_TASKS && get_task_list()[id].get_state(cs) == blocked {
+                let task = &get_task_list()[id];
+                // Blocked tasks have already been removed from the ready queues.
+                task.set_state(cs, TaskState::Ready);
+                inner.enqueue_ready(id, task.get_priority());
+                count += 1;
+            }
+        }
+        count
+    }
 
-        let mut inner = get_scheduler_inner().lock();
-        
-        let current_task = match inner.current_task {
-            Some(task) => task,
-            None => return,
-        };
-        
-        let current_priority = current_task.get_priority();
-        let current_state = current_task.get_state();
+    pub(crate) fn set_task_priority(task: Task, priority: Priority) {
+        critical_section::with(|cs| {
+            let mut inner = SCHEDULER_INNER.borrow_ref_mut(cs);
+            if !task.is_live(cs) { return; }
+            task.set_base_priority(priority);
+            if inner.waiting_on.iter().any(Option::is_some) {
+                inner.refresh_inheritance(cs);
+            } else {
+                inner.apply_priority(cs, task.0, priority);
+            }
+        });
 
-        // 查看最高优先级的就绪任务
-        if let Some((next_task_id, next_priority)) = inner.peek_highest_priority_ready_task() {
-            // 只有当找到的任务优先级更高，或者当前任务不是运行状态时才切换
-            if next_task_id != current_task.get_taskid() && 
-               (next_priority > current_priority || current_state != TaskState::Running) {
-                // 从队列中取出任务
-                let next_task_id = inner.get_highest_priority_ready_task().unwrap();
-                let mut next_task = Task(next_task_id);
-                
-                // 如果当前任务正在运行，将其设为就绪并重新入队
-                if current_state == TaskState::Running {
-                    let mut current = current_task;
-                    current.ready();
-                    inner.enqueue_ready(current.get_taskid(), current_priority);
-                }
+    }
 
-                // 运行下一个任务
-                next_task.run();
-                inner.current_task = Some(next_task);
-                CURRENT_TASK_ID.store(next_task_id, Ordering::Release);
+    pub(crate) fn donate_to_owner(waiter: Task, owner: Task) {
+        if waiter == owner { return; }
+        critical_section::with(|cs| {
+            let mut inner = SCHEDULER_INNER.borrow_ref_mut(cs);
+            if !owner.is_live(cs) || !waiter.is_live(cs) { return; }
+            inner.waiting_on[waiter.0] = Some(owner.0);
+            inner.refresh_inheritance(cs);
+        });
+    }
+
+    /// 由 HAL 保存当前上下文后调用；同优先级任务按 FIFO 轮转。
+    fn select_by_priority() {
+        critical_section::with(|cs| {
+            if !Self::is_running() {
                 return;
             }
-        }
-        
-        // 没找到更高优先级的任务
-        if current_state == TaskState::Ready {
-            let mut current = current_task;
-            current.run();
-            inner.current_task = Some(current);
-        }
+            let mut inner = SCHEDULER_INNER.borrow_ref_mut(cs);
+            let Some(current) = inner.current_task else { return };
+            if let Some((_, priority)) = inner.peek_highest_priority_ready_task() {
+                if current.get_state() != TaskState::Running || priority >= current.get_priority() {
+                    if let Some(id) = inner.get_highest_priority_ready_task() {
+                        inner.switch_to(cs, Task::from_slot(id));
+                    }
+                }
+            } else if current.get_state() == TaskState::Ready {
+                inner.switch_to(cs, current);
+            }
+        });
     }
 
-    /// 抢占式调度检查 - O(1)
-    ///
-    /// 如果有更高优先级的任务就绪，触发任务切换。
-    /// 通常在 SysTick 中断或任务唤醒时调用。
-    /// 
-    /// ## 性能
-    /// - 时间复杂度：O(1) - 只需检查位图
+    /// 仅请求硬件切换。当前任务 ID 必须保持到 HAL 保存旧上下文之后。
     pub fn preempt_check() {
-        // 如果调度器未运行或未启用优先级调度，直接返回
-        if !Self::is_running() || !Self::is_priority_scheduling_enabled() {
-            return;
-        }
-
-        let inner = get_scheduler_inner().lock();
-        
-        let current_task = match inner.current_task {
-            Some(task) => task,
-            None => return,
-        };
-        let current_priority = current_task.get_priority();
-
-        // O(1) 检查是否有更高优先级的就绪任务
-        if let Some((_, highest_priority)) = inner.peek_highest_priority_ready_task() {
-            if highest_priority > current_priority {
-                drop(inner); // 释放锁
-                Self::schedule_by_priority();
+        let preempt = critical_section::with(|cs| {
+            if !Self::is_running() || !Self::is_priority_scheduling_enabled() {
+                return false;
             }
+            let inner = SCHEDULER_INNER.borrow_ref(cs);
+            let Some(current) = inner.current_task else { return false };
+            inner.peek_highest_priority_ready_task().is_some_and(|(_, priority)| {
+                current.get_state() != TaskState::Running || priority > current.get_priority()
+            })
+        });
+        if preempt {
+            crate::hal::trigger_schedule();
         }
     }
 
-    /// 任务切换
-    ///
-    /// 根据调度策略选择下一个任务运行。
-    /// - 优先级调度：选择最高优先级的就绪任务
-    /// - 轮转调度：选择下一个就绪任务
+    /// HAL 上下文切换入口。主机测试可显式调用以模拟切换。
     pub fn task_switch() {
-        // 如果调度器未运行，直接返回
-        if !Self::is_running() {
-            return;
-        }
-
-        // 如果启用了优先级调度，使用优先级调度算法
-        if Self::is_priority_scheduling_enabled() {
-            Self::schedule_by_priority();
-            return;
-        }
-
-        // 否则使用轮转调度算法（使用快照迭代器减少锁竞争）
-        Self::round_robin_schedule();
+        #[cfg(target_os = "none")]
+        crate::hal::trigger_schedule();
+        #[cfg(not(target_os = "none"))]
+        Self::select_after_save();
     }
-    
-    /// 轮转调度算法
-    /// 
-    /// 使用快照迭代器减少锁持有时间
+
+    pub fn schedule_by_priority() {
+        #[cfg(target_os = "none")]
+        crate::hal::trigger_schedule();
+        #[cfg(not(target_os = "none"))]
+        Self::select_by_priority();
+    }
+
+    pub(crate) fn select_after_save() {
+        if Self::is_priority_scheduling_enabled() {
+            Self::select_by_priority();
+        } else {
+            Self::round_robin_schedule();
+        }
+    }
+
     fn round_robin_schedule() {
-        let current_task_id = CURRENT_TASK_ID.load(Ordering::Acquire);
-        
-        // 使用快照迭代器获取任务状态（只获取一次锁）
-        let snapshot_iter = Task::snapshot_iter();
-        
-        // 查找下一个就绪任务
-        let mut next_task_id: Option<usize> = None;
-        let mut current_task_ready = false;
-        
-        // 从当前任务之后开始查找
-        for snapshot in snapshot_iter {
-            if snapshot.task_id == current_task_id {
-                current_task_ready = snapshot.state == TaskState::Ready;
-                continue;
-            }
-            if snapshot.state == TaskState::Ready && snapshot.task_id > current_task_id && next_task_id.is_none() {
-                next_task_id = Some(snapshot.task_id);
-                break;
-            }
-        }
-        
-        // 如果没找到，从头开始查找
-        if next_task_id.is_none() {
-            for snapshot in Task::snapshot_iter() {
-                if snapshot.task_id == current_task_id {
-                    continue;
-                }
-                if snapshot.state == TaskState::Ready && snapshot.task_id < current_task_id {
-                    next_task_id = Some(snapshot.task_id);
-                    break;
+        critical_section::with(|cs| {
+            if !Self::is_running() { return; }
+            let mut inner = SCHEDULER_INNER.borrow_ref_mut(cs);
+            let Some(current) = inner.current_task else { return };
+            for offset in 1..MAX_TASKS {
+                let candidate = Task::from_slot((current.0 + offset) % MAX_TASKS);
+                if candidate.get_state() == TaskState::Ready {
+                    inner.switch_to(cs, candidate);
+                    return;
                 }
             }
-        }
-
-        // 执行任务切换
-        let mut inner = get_scheduler_inner().lock();
-        let current_task = match inner.current_task {
-            Some(task) => task,
-            None => return,
-        };
-        
-        match (next_task_id, current_task.get_state()) {
-            // 找到了下一个准备好的任务
-            (Some(next_id), _) => {
-                let mut next = Task(next_id);
-                
-                // 如果当前任务正在运行，将其设为就绪状态
-                if current_task.get_state() == TaskState::Running {
-                    let mut current = current_task;
-                    current.ready();
-                }
-
-                // 运行下一个任务
-                next.run();
-                inner.current_task = Some(next);
-                CURRENT_TASK_ID.store(next_id, Ordering::Release);
+            if current.get_state() == TaskState::Ready {
+                inner.switch_to(cs, current);
             }
-
-            // 没找到其他任务，但当前任务就绪
-            (None, TaskState::Ready) => {
-                let mut current = current_task;
-                current.run();
-                inner.current_task = Some(current);
-            }
-
-            // 其他情况保持不变
-            _ => {}
-        }
+        });
     }
 
     pub fn start() {
-        // 初始化就绪队列：将所有就绪任务加入队列
-        {
-            let mut inner = get_scheduler_inner().lock();
-            
-            // 遍历所有任务，将就绪任务加入队列
-            for snapshot in Task::snapshot_iter() {
-                if snapshot.state == TaskState::Ready {
-                    inner.enqueue_ready(snapshot.task_id, snapshot.priority);
+        let started = critical_section::with(|cs| {
+            if Self::is_running() { return false; }
+            assert!(INITIALIZED.load(Ordering::Acquire), "kernel_init must precede scheduler startup");
+            let mut inner = SCHEDULER_INNER.borrow_ref_mut(cs);
+            // stop/start 也重建一致的队列，不留下多个 Running 任务。
+            *inner = SchedulerInner::new();
+            for task in Task::iter() {
+                if matches!(task.get_state(), TaskState::Ready | TaskState::Running) {
+                    inner.set_state(cs, task, TaskState::Ready);
                 }
             }
-            
-            // 设置第一个任务为当前任务
-            inner.current_task = Some(Task(0));
+            inner.switch_to(cs, Task::from_slot(0));
+            SCHEDULER_RUNNING.store(true, Ordering::Release);
+            true
+        });
+        if started {
+            crate::hal::start_first_task();
         }
-        
-        Task(0).run();
-        CURRENT_TASK_ID.store(0, Ordering::Release);
-        SCHEDULER_RUNNING.store(true, Ordering::Release);
-        
-        // 触发当前架构的任务切换
-        crate::hal::start_first_task();
     }
 
-    /// 关闭调度器
+    #[cfg(not(target_os = "none"))]
     pub fn stop() {
         SCHEDULER_RUNNING.store(false, Ordering::Release);
     }
 
-    /// 获取当前任务 - O(1)
-    /// 
-    /// 使用原子变量快速获取当前任务 ID，避免锁竞争
     pub fn get_current_task() -> Task {
-        Task(CURRENT_TASK_ID.load(Ordering::Acquire))
+        Task::from_slot(CURRENT_TASK_ID.load(Ordering::Acquire))
     }
-    
-    /// 获取当前任务（从调度器内部状态）
-    /// 
-    /// 需要获取锁，但返回完整的 Task 信息
+
     pub fn get_current_task_locked() -> Task {
-        get_scheduler_inner().lock().current_task.unwrap()
+        critical_section::with(|cs| SCHEDULER_INNER.borrow_ref(cs).current_task.unwrap())
     }
-    
-    /// 获取就绪任务统计信息
+
     pub fn ready_task_stats() -> ReadyTaskStats {
-        let inner = get_scheduler_inner().lock();
-        ReadyTaskStats {
-            total: inner.total_ready_count(),
-            by_priority: [
-                inner.ready_count_at_priority(Priority::Idle),
-                inner.ready_count_at_priority(Priority::Low),
-                inner.ready_count_at_priority(Priority::Normal),
-                inner.ready_count_at_priority(Priority::High),
-                inner.ready_count_at_priority(Priority::Critical),
-            ],
-        }
+        critical_section::with(|cs| {
+            let inner = SCHEDULER_INNER.borrow_ref(cs);
+            ReadyTaskStats {
+                total: inner.total_ready_count(),
+                by_priority: core::array::from_fn(|i| inner.ready_queues[i].len()),
+            }
+        })
     }
 }
 
@@ -631,23 +611,23 @@ mod tests {
     use crate::utils::kernel_init;
     use serial_test::serial;
 
-    fn task1(_args: usize) {
+    fn task1() {
         // 简化的任务函数
     }
 
-    fn task2(_args: usize) {
+    fn task2() {
         // 简化的任务函数
     }
 
-    fn task3(_args: usize) {
+    fn task3() {
         // 简化的任务函数
     }
 
-    fn task4(_args: usize) {
+    fn task4() {
         // 简化的任务函数
     }
 
-    fn task5(_args: usize) {
+    fn task5() {
         // 简化的任务函数
     }
 
@@ -837,8 +817,8 @@ mod tests {
     #[serial]
     fn test_all_tasks_blocked() {
         kernel_init();
-        let mut task1 = Task::new("blocked_task1", |_| {}).unwrap();
-        let mut task2 = Task::new("blocked_task2", |_| {}).unwrap();
+        let mut task1 = Task::new("blocked_task1", || {}).unwrap();
+        let mut task2 = Task::new("blocked_task2", || {}).unwrap();
         
         Scheduler::start();
         
@@ -846,7 +826,7 @@ mod tests {
         let current_task = Scheduler::get_current_task();
         
         println!("current_task is {}, task1 is {}, task2 is {}", current_task.get_taskid(), task1.get_taskid(), task2.get_taskid());
-        println!("before blocking: idle state {:?}, task1 state {:?}, task2 state {:?}", Task(0).get_state(), task1.get_state(), task2.get_state());
+        println!("before blocking: idle state {:?}, task1 state {:?}, task2 state {:?}", Task::from_slot(0).get_state(), task1.get_state(), task2.get_state());
         
         // 阻塞非当前任务
         if current_task.get_taskid() == task1.get_taskid() {
@@ -865,7 +845,7 @@ mod tests {
             task2.block(Event::Signal(2));
         }
         
-        println!("after blocking: idle state {:?}, task1 state {:?}, task2 state {:?}", Task(0).get_state(), task1.get_state(), task2.get_state());
+        println!("after blocking: idle state {:?}, task1 state {:?}, task2 state {:?}", Task::from_slot(0).get_state(), task1.get_state(), task2.get_state());
         
         // 尝试调度 - 此时所有任务都被阻塞
         Scheduler::task_switch();
@@ -881,8 +861,8 @@ mod tests {
     fn test_schedule_after_unblock() {
         kernel_init();
         
-        let mut task1 = Task::new("unblock_test1", |_| {}).unwrap();
-        let task2 = Task::new("unblock_test2", |_| {}).unwrap();
+        let mut task1 = Task::new("unblock_test1", || {}).unwrap();
+        let task2 = Task::new("unblock_test2", || {}).unwrap();
         
         Scheduler::start();
         
@@ -912,7 +892,7 @@ mod tests {
     #[serial]
     fn test_start_stop_restart() {
         kernel_init();
-        Task::new("restart_test", |_| {}).unwrap();
+        Task::new("restart_test", || {}).unwrap();
         
         // 启动调度器
         Scheduler::start();
@@ -956,17 +936,17 @@ mod tests {
         // 创建不同优先级的任务
         let _low_task = Task::builder("low_priority")
             .priority(Priority::Low)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         let high_task = Task::builder("high_priority")
             .priority(Priority::High)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         let _normal_task = Task::builder("normal_priority")
             .priority(Priority::Normal)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         // 启用优先级调度
@@ -990,13 +970,13 @@ mod tests {
         // 创建低优先级任务
         let _low_task = Task::builder("low")
             .priority(Priority::Low)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         // 创建高优先级任务（初始阻塞）
         let mut high_task = Task::builder("high")
             .priority(Priority::High)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         // 启用优先级调度
@@ -1013,7 +993,10 @@ mod tests {
         high_task.ready();
         
         // 抢占检查应该触发切换到高优先级任务
+        let before = Scheduler::get_current_task();
         Scheduler::preempt_check();
+        assert_eq!(Scheduler::get_current_task(), before);
+        Scheduler::task_switch();
         assert_eq!(Scheduler::get_current_task().get_taskid(), high_task.get_taskid());
     }
 
@@ -1025,17 +1008,17 @@ mod tests {
         // 创建多个相同优先级的任务
         let _task1 = Task::builder("normal1")
             .priority(Priority::Normal)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         let _task2 = Task::builder("normal2")
             .priority(Priority::Normal)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         let _task3 = Task::builder("normal3")
             .priority(Priority::Normal)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         // 启用优先级调度
@@ -1056,17 +1039,17 @@ mod tests {
         // 创建任务
         let _low_task = Task::builder("low")
             .priority(Priority::Low)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         let mut high_task = Task::builder("high")
             .priority(Priority::Critical)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         let _normal_task = Task::builder("normal")
             .priority(Priority::Normal)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         // 启用优先级调度
@@ -1089,12 +1072,12 @@ mod tests {
         // 创建不同优先级的任务
         let task1 = Task::builder("task1")
             .priority(Priority::Low)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         let task2 = Task::builder("task2")
             .priority(Priority::High)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
         
         // 确保优先级调度禁用
@@ -1112,4 +1095,139 @@ mod tests {
         // 轮转调度下，应该切换到下一个任务
         assert_eq!(Scheduler::get_current_task().get_taskid(), task2.get_taskid());
     }
+
+    fn assert_ready_invariant() {
+        let stats = Scheduler::ready_task_stats();
+        let mut expected = [0; PRIORITY_COUNT];
+        for task in Task::ready_tasks() {
+            expected[task.get_priority().as_u8() as usize] += 1;
+        }
+        assert_eq!(stats.by_priority, expected);
+        assert_eq!(stats.total, expected.iter().sum());
+    }
+
+    #[test]
+    #[serial]
+    fn a_returning_tasks_stack_is_only_reusable_after_switch() {
+        use crate::kernel::time::{systick::{Deadline, Systick}, timer::Timer};
+        kernel_init();
+        let mut old = Task::builder("retiring").priority(Priority::Critical).spawn(|| {}).unwrap();
+        for _ in 2..MAX_TASKS { Task::new("occupied", || {}).unwrap(); }
+        Scheduler::enable_priority_scheduling();
+        Scheduler::start();
+        Scheduler::select_after_save();
+        assert_eq!(Scheduler::get_current_task(), old);
+        let event = Event::Signal(7);
+        let _outstanding = Timer::register_task_timeout(Deadline::after(1), old, event).unwrap();
+        Scheduler::finish_current();
+        assert_eq!(Task::new("too early", || {}), Err(crate::error::RtosError::TaskSlotsFull));
+        Scheduler::select_after_save();
+        let mut next = Task::new("replacement", || {}).unwrap();
+        assert_ne!(old, next);
+        assert_eq!(old.0, next.0);
+        next.block(event);
+        old.ready();
+        Systick::add_current_time(1);
+        Timer::timer_check_and_send_event();
+        assert_eq!(next.get_state(), TaskState::Blocked(event));
+        assert_eq!(old.get_state(), TaskState::Finished);
+        assert_ready_invariant();
+    }
+
+    #[test]
+    #[serial]
+    fn batch_wake_preserves_fifo_and_unrelated_donations() {
+        kernel_init();
+        let owner = Task::builder("owner").priority(Priority::Low).spawn(|| {}).unwrap();
+        let mut first = Task::builder("first").priority(Priority::High).spawn(|| {}).unwrap();
+        let mut second = Task::builder("second").priority(Priority::High).spawn(|| {}).unwrap();
+        let mut other = Task::builder("other").priority(Priority::Normal).spawn(|| {}).unwrap();
+        Scheduler::enable_priority_scheduling();
+        Scheduler::start();
+
+        let event = Event::Mutex(7);
+        let other_event = Event::Mutex(8);
+        for (task, reason) in [(&mut second, event), (&mut first, event), (&mut other, other_event)] {
+            task.block(reason);
+            Scheduler::donate_to_owner(*task, owner);
+        }
+        assert_eq!(owner.get_priority(), Priority::High);
+
+        let ids = [second.0, MAX_TASKS, other.0, second.0, first.0, owner.0];
+        let count = critical_section::with(|cs| Scheduler::wake_tasks_if(cs, ids.into_iter(), event));
+        assert_eq!(count, 2);
+        assert_eq!(other.get_state(), TaskState::Blocked(other_event));
+        assert_eq!(owner.get_priority(), Priority::Normal);
+        assert_ready_invariant();
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task(), second);
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task(), first);
+        Event::wake_task(other_event);
+        assert_eq!(owner.get_priority(), Priority::Low);
+        assert_ready_invariant();
+    }
+
+    #[test]
+    #[serial]
+    fn ready_queue_tracks_spawn_block_wake_and_priority_changes() {
+        kernel_init();
+        Scheduler::enable_priority_scheduling();
+        Scheduler::start();
+        let mut task = Task::builder("late").priority(Priority::Low).spawn(|| {}).unwrap();
+        assert_ready_invariant();
+        task.block(Event::Signal(99));
+        assert_ready_invariant();
+        Scheduler::task_switch();
+        assert!(Event::wake_task_by_id_if(task.0, Event::Signal(99)));
+        assert_ready_invariant();
+        task.set_priority(Priority::Critical);
+        assert_ready_invariant();
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task(), task);
+        assert_ready_invariant();
+        task.block(Event::Signal(99));
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task(), Task::from_slot(0));
+        assert_ready_invariant();
+        Event::wake_task(Event::Signal(99));
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task(), task);
+        assert_ready_invariant();
+    }
+
+    #[test]
+    #[serial]
+    fn equal_priority_tasks_rotate_without_running_lower_priority() {
+        kernel_init();
+        let first = Task::builder("first").priority(Priority::High).spawn(|| {}).unwrap();
+        let second = Task::builder("second").priority(Priority::High).spawn(|| {}).unwrap();
+        Task::builder("low").priority(Priority::Low).spawn(|| {}).unwrap();
+        Scheduler::enable_priority_scheduling();
+        Scheduler::start();
+        for expected in [first, second, first, second] {
+            Scheduler::task_switch();
+            assert_eq!(Scheduler::get_current_task(), expected);
+            assert_ready_invariant();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn switching_policy_and_reprioritizing_preserves_queues() {
+        kernel_init();
+        let mut first = Task::new("first", || {}).unwrap();
+        let second = Task::new("second", || {}).unwrap();
+        Scheduler::start();
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task(), first);
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task(), second);
+        first.set_priority(Priority::High);
+        Scheduler::enable_priority_scheduling();
+        Scheduler::task_switch();
+        assert_eq!(Scheduler::get_current_task(), first);
+        assert_ready_invariant();
+    }
+
 }

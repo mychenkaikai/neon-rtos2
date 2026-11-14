@@ -13,7 +13,7 @@
 //! ## 当前范围
 //!
 //! - `Executor::run()` 与 `Executor::poll_once()` 共享同一条核心轮询路径
-//! - `sleep(duration_ms)` 在首次 `poll` 时注册一次异步休眠槽位，截止时间到达后由
+//! - `sleep(duration)` 在首次 `poll` 时注册一次异步休眠槽位，截止时间到达后由
 //!   定时器路径唤醒，下一次 `poll` 返回 `Ready`
 //! - `run()` 在没有新唤醒任务但仍有未完成任务时，会阻塞当前 RTOS 任务，保持现有
 //!   空闲阻塞语义
@@ -27,7 +27,7 @@
 //! use neon_rtos2::runtime::{Executor, sleep};
 //!
 //! async fn worker() {
-//!     sleep(10).await;
+//!     sleep(neon_rtos2::prelude::Ticks(10)).await;
 //! }
 //!
 //! fn main() {
@@ -44,11 +44,10 @@
 //! # use neon_rtos2::select;
 //! # struct Rx;
 //! # impl Rx { async fn recv(&self) -> i32 { 0 } }
-//! # let rx = Rx;
-//! async fn handle_events() {
+//! async fn handle_events(rx: Rx) {
 //!     select! {
 //!         msg = rx.recv() => println!("Received: {:?}", msg),
-//!         _ = sleep(1000) => println!("Timeout!"),
+//!         _ = sleep(neon_rtos2::prelude::Ticks(1000)) => println!("Timeout!"),
 //!     }
 //! }
 //! ```
@@ -56,13 +55,12 @@
 mod waker;
 mod executor;
 mod future;
-mod channel;
+
 pub mod select;
 
-pub use waker::TaskWaker;
-pub use executor::Executor;
+pub use executor::{Executor, LocalExecutor, JoinHandle, RunState};
 pub use future::*;
-pub use channel::{channel, unbounded, Sender, Receiver, SendError, RecvError};
+pub use crate::ipc::typed::{bounded, channel, unbounded, Sender, Receiver, SendError, TrySendError, TryRecvError};
 
 // 重新导出 select 模块的类型
 pub use select::{

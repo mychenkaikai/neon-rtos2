@@ -12,13 +12,14 @@ members = [
 
 [dependencies]
 paste = "1.0"
+pin-project-lite = "0.2"
 
 [features]
-# 默认启用 spin（测试需要），但不启用 embedded-alloc
-default = ["dep:spin"]
+# 默认使用主机测试 HAL；嵌入式目标需显式选择架构。
+default = []
 # 嵌入式目标 features
-cortex_m3 = ["dep:cortex-m", "dep:cortex-m-rt", "embedded-alloc", "dep:spin", "dep:cortex-m-semihosting", "critical-section/restore-state-bool"]
-riscv = ["dep:riscv-rt", "dep:riscv", "embedded-alloc", "critical-section/restore-state-usize", "dep:spin"]
+cortex_m3 = ["dep:cortex-m", "dep:cortex-m-rt", "embedded-alloc", "dep:cortex-m-semihosting", "critical-section/restore-state-bool"]
+riscv = ["dep:riscv-rt", "dep:riscv", "embedded-alloc", "critical-section/restore-state-usize"]
 embedded-alloc = ["dep:embedded-alloc"]
 alloc = []
 
@@ -44,7 +45,6 @@ optional = true
 
 [dependencies.spin]
 version = "0.9.8"
-optional = true
 
 [dependencies.cortex-m-semihosting]
 version = "0.5.0"
@@ -67,8 +67,6 @@ version = "0.9.2"
 optional = true
 
 
-[build-dependencies]
-cc = "1.0"
 
 
 [profile.dev]

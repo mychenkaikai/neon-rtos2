@@ -24,7 +24,7 @@
 //!     
 //!     // 生产者
 //!     Task::builder("producer")
-//!         .spawn(move |_| {
+//!         .spawn(move || {
 //!             // 准备数据...
 //!             {
 //!                 let mut guard = mutex.lock().unwrap();
@@ -35,7 +35,7 @@
 //!     
 //!     // 消费者
 //!     Task::builder("consumer")
-//!         .spawn(move |_| {
+//!         .spawn(move || {
 //!             let mut guard = mutex_clone.lock().unwrap();
 //!             while !*guard {
 //!                 guard = condvar_clone.wait(guard).unwrap();
@@ -45,34 +45,63 @@
 //! }
 //! ```
 
-use crate::compat::{Arc, VecDeque};
-use crate::kernel::scheduler::Scheduler;
-use crate::kernel::task::{Task, TaskState};
-use crate::kernel::time::systick::Systick;
-use crate::hal::trigger_schedule;
+use crate::kernel::time::systick::Ticks;
+use crate::compat::Arc;
 use crate::error::{Result, RtosError};
-use crate::sync::signal::WaiterList;
-use crate::sync::mutex::{Mutex, MutexGuard};
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::Waker;
-use spin::Mutex as SpinMutex;
+use crate::hal::trigger_schedule;
+use crate::kernel::scheduler::Scheduler;
+use crate::kernel::time::{systick::{Systick, Deadline}, timer::Timer};
+use crate::sync::{
+    event::Event,
+    mutex::{Mutex, MutexGuard},
+    signal::WaiterList,
+    wait::{AsyncWaiters},
+};
+use core::cell::RefCell;
+use core::task::{Poll, Waker};
 
-/// 条件变量内部状态
 struct CondVarInner {
-    /// 同步���待者列表
-    waiters: SpinMutex<WaiterList>,
-    /// 异步等待者列表
-    async_waiters: SpinMutex<VecDeque<Waker>>,
-    /// 是否已关闭
-    closed: AtomicBool,
+    state: critical_section::Mutex<RefCell<CondVarState>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskWait {
+    ReleasingMutex,
+    Parked,
+    Notified,
+}
+
+struct CondVarState {
+    tasks: WaiterList,
+    phase: [TaskWait; crate::config::MAX_TASKS],
+    futures: AsyncWaiters,
+    broadcast_epoch: u64,
+    closed: bool,
+}
+
+impl CondVarState {
+    fn notify_task(&mut self, id: usize, event: Event) -> bool {
+        // A task delivering mutex wakeups is still runnable. Remember the notification
+        // so it skips parking. Once parked, only its matching event may be woken.
+        if self.phase[id] == TaskWait::ReleasingMutex || Event::wake_task_by_id_if(id, event) {
+            self.phase[id] = TaskWait::Notified;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl CondVarInner {
     fn new() -> Self {
         Self {
-            waiters: SpinMutex::new(WaiterList::new()),
-            async_waiters: SpinMutex::new(VecDeque::new()),
-            closed: AtomicBool::new(false),
+            state: critical_section::Mutex::new(RefCell::new(CondVarState {
+                tasks: WaiterList::new(),
+                phase: [TaskWait::Parked; crate::config::MAX_TASKS],
+                futures: AsyncWaiters::new(),
+                broadcast_epoch: 0,
+                closed: false,
+            })),
         }
     }
 }
@@ -140,48 +169,14 @@ impl CondVar {
     /// }
     /// ```
     pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> Result<MutexGuard<'a, T>> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RtosError::CondVarClosed);
-        }
-
-        // 获取互斥锁的引用（在释放 guard 之前）
-        let mutex = guard.mutex();
-        
-        // 获取当前任务 ID
-        let task_id = Scheduler::get_current_task().get_taskid();
-
-        // 将当前任务加入等待队列
-        {
-            let mut waiters = self.inner.waiters.lock();
-            if !waiters.push(task_id) {
-                return Err(RtosError::WaiterQueueFull);
-            }
-        }
-
-        // 释放互斥锁（通过 unlock 方法，避免 drop 后无法访问 mutex）
-        let mutex = MutexGuard::unlock(guard);
-
-        // 阻塞当前任务
-        let condvar_id = Arc::as_ptr(&self.inner) as usize;
-        Scheduler::get_current_task().block(crate::sync::event::Event::CondVar(condvar_id));
-        trigger_schedule();
-
-        // 被唤醒后检查是否因为关闭而唤醒
-        if self.inner.closed.load(Ordering::Acquire) {
-            // 尝试重新获取锁后返回错误
-            let _ = mutex.lock();
-            return Err(RtosError::CondVarClosed);
-        }
-
-        // 重新获取互斥锁
-        mutex.lock()
+        self.wait_until(guard, None).map(|(guard, _)| guard)
     }
 
     /// 带超时的等待条件变量
     ///
     /// # 参数
     /// - `guard`: 互斥锁守卫
-    /// - `timeout_ms`: 超时时间（毫秒）
+    /// - `timeout`: 超时时间（Duration 或 Ticks）
     ///
     /// # 返回值
     /// - `Ok((MutexGuard, false))`: 成功等待并重新获取锁
@@ -196,7 +191,7 @@ impl CondVar {
     /// let condvar = CondVar::new();
     ///
     /// let mut guard = mutex.lock().unwrap();
-    /// let (new_guard, timed_out) = condvar.wait_timeout(guard, 1000).unwrap();
+    /// let (new_guard, timed_out) = condvar.wait_timeout(guard, neon_rtos2::prelude::Ticks(1000)).unwrap();
     /// if timed_out {
     ///     // 超时处理
     /// }
@@ -205,49 +200,71 @@ impl CondVar {
     pub fn wait_timeout<'a, T>(
         &self,
         guard: MutexGuard<'a, T>,
-        timeout_ms: usize,
+        timeout: impl Into<Ticks>,
     ) -> Result<(MutexGuard<'a, T>, bool)> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RtosError::CondVarClosed);
-        }
+        self.wait_until(guard, Some(Deadline::after(timeout.into().0)))
+    }
 
-        let deadline = Systick::get_current_time() + timeout_ms;
-        let task_id = Scheduler::get_current_task().get_taskid();
-
-        // 将当前任务加入等待队列
-        {
-            let mut waiters = self.inner.waiters.lock();
-            if !waiters.push(task_id) {
+    fn wait_until<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        deadline: Option<Deadline>,
+    ) -> Result<(MutexGuard<'a, T>, bool)> {
+        let mutex = guard.mutex();
+        let mut guard = Some(guard);
+        let mut task = Scheduler::get_current_task();
+        let event = Event::CondVar(self.id());
+        let mut timer = None;
+        let wake = critical_section::with(|cs| {
+            let mut state = self.inner.state.borrow_ref_mut(cs);
+            if state.closed {
+                return Err(RtosError::CondVarClosed);
+            }
+            if let Some(deadline) = deadline {
+                if deadline.elapsed() {
+                    return Ok(None);
+                }
+                timer = Some(Timer::register_task_timeout(deadline, task, event)?);
+            }
+            if !state.tasks.push(task.0) {
                 return Err(RtosError::WaiterQueueFull);
             }
+            state.phase[task.0] = TaskWait::ReleasingMutex;
+            Ok(Some(guard.take().unwrap().unlock_deferred(cs)))
+        })?;
+        let Some(wakers) = wake else {
+            return Ok((guard.unwrap(), true));
+        };
+        // A notifier may itself be an async waiter on this mutex. Deliver its waker
+        // while this task is runnable, then recheck the notification before parking.
+        wakers.wake();
+        let parked = critical_section::with(|cs| {
+            let mut state = self.inner.state.borrow_ref_mut(cs);
+            if state.closed
+                || state.phase[task.0] == TaskWait::Notified
+                || deadline.is_some_and(|end| end.elapsed())
+            {
+                return false;
+            }
+            state.phase[task.0] = TaskWait::Parked;
+            task.block(event);
+            true
+        });
+        if parked {
+            trigger_schedule();
         }
 
-        // 释放互斥锁
-        let mutex = MutexGuard::unlock(guard);
-
-        // 阻塞当前任务
-        let condvar_id = Arc::as_ptr(&self.inner) as usize;
-        Scheduler::get_current_task().block(crate::sync::event::Event::CondVar(condvar_id));
-        trigger_schedule();
-
-        // 检查是否超时
-        let timed_out = Systick::get_current_time() >= deadline;
-
-        // 如果超时，从等待队列中移除
-        if timed_out {
-            let mut waiters = self.inner.waiters.lock();
-            waiters.remove(task_id);
-        }
-
-        // 检查是否因为关闭而唤醒
-        if self.inner.closed.load(Ordering::Acquire) {
-            let _ = mutex.lock();
-            return Err(RtosError::CondVarClosed);
-        }
-
-        // 重新获取互斥锁
-        let new_guard = mutex.lock()?;
-        Ok((new_guard, timed_out))
+        let timed_out = critical_section::with(|cs| {
+            let mut state = self.inner.state.borrow_ref_mut(cs);
+            state.tasks.remove(task.0);
+            if state.closed {
+                return Err(RtosError::CondVarClosed);
+            }
+            Ok(state.phase[task.0] != TaskWait::Notified
+                && deadline.is_some_and(|end| end.elapsed()))
+        })?;
+        drop(timer);
+        Ok((mutex.lock()?, timed_out))
     }
 
     /// 带条件的等待
@@ -291,7 +308,7 @@ impl CondVar {
     ///
     /// # 参数
     /// - `guard`: 互斥锁守卫
-    /// - `timeout_ms`: 超时时间（毫秒）
+    /// - `timeout`: 超时时间（Duration 或 Ticks）
     /// - `condition`: 条件检查函数
     ///
     /// # 返回值
@@ -301,21 +318,21 @@ impl CondVar {
     pub fn wait_while_timeout<'a, T, F>(
         &self,
         mut guard: MutexGuard<'a, T>,
-        timeout_ms: usize,
+        timeout: impl Into<Ticks>,
         mut condition: F,
     ) -> Result<(MutexGuard<'a, T>, bool)>
     where
         F: FnMut(&T) -> bool,
     {
-        let deadline = Systick::get_current_time() + timeout_ms;
+        let deadline = Deadline::after(timeout.into().0);
 
         while condition(&*guard) {
-            let remaining = deadline.saturating_sub(Systick::get_current_time());
+            let remaining = deadline.remaining_at(Systick::now());
             if remaining == 0 {
                 return Ok((guard, true));
             }
 
-            let (new_guard, timed_out) = self.wait_timeout(guard, remaining)?;
+            let (new_guard, timed_out) = self.wait_until(guard, Some(deadline))?;
             guard = new_guard;
 
             if timed_out {
@@ -338,33 +355,25 @@ impl CondVar {
     /// condvar.notify_one();
     /// ```
     pub fn notify_one(&self) {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return;
-        }
-
-        // 首先尝试唤醒同步等待者
-        let task_id = {
-            let mut waiters = self.inner.waiters.lock();
-            waiters.pop_front()
-        };
-
-        if let Some(task_id) = task_id {
-            let mut task = Task(task_id);
-            if let TaskState::Blocked(_) = task.get_state() {
-                task.ready();
+        let waker = critical_section::with(|cs| {
+            let mut state = self.inner.state.borrow_ref_mut(cs);
+            if state.closed {
+                return None;
             }
-            return;
-        }
-
-        // 然后尝试唤醒异步等待者
-        let waker = {
-            let mut async_waiters = self.inner.async_waiters.lock();
-            async_waiters.pop_front()
-        };
-
+            self.take_one(&mut state)
+        });
         if let Some(waker) = waker {
             waker.wake();
         }
+    }
+
+    fn take_one(&self, state: &mut CondVarState) -> Option<Waker> {
+        while let Some(id) = state.tasks.pop_front() {
+            if state.notify_task(id, Event::CondVar(self.id())) {
+                return None;
+            }
+        }
+        state.futures.pop()
     }
 
     /// 唤醒所有等待的任务
@@ -377,52 +386,42 @@ impl CondVar {
     /// condvar.notify_all();
     /// ```
     pub fn notify_all(&self) {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return;
-        }
-
-        // 唤醒所有同步等待者
-        let task_ids: [Option<usize>; 16];
-        {
-            let mut waiters = self.inner.waiters.lock();
-            task_ids = waiters.drain();
-        }
-
-        for task_id in task_ids.iter().filter_map(|&id| id) {
-            let mut task = Task(task_id);
-            if let TaskState::Blocked(_) = task.get_state() {
-                task.ready();
-            }
-        }
-
-        // 唤醒所有异步等待者
-        let async_wakers: VecDeque<Waker>;
-        {
-            let mut async_waiters = self.inner.async_waiters.lock();
-            async_wakers = core::mem::take(&mut *async_waiters);
-        }
-
-        for waker in async_wakers {
-            waker.wake();
-        }
+        self.broadcast(false);
     }
 
     /// 关闭条件变量
     ///
     /// 关闭后，所有等待的任务会被唤醒并收到错误。
     pub fn close(&self) {
-        self.inner.closed.store(true, Ordering::Release);
-        self.notify_all();
+        self.broadcast(true);
+    }
+
+    fn broadcast(&self, close: bool) {
+        let wakers = critical_section::with(|cs| {
+            let mut state = self.inner.state.borrow_ref_mut(cs);
+            state.closed |= close;
+            state.broadcast_epoch = state.broadcast_epoch.wrapping_add(1);
+            for id in state.tasks.drain().into_iter().flatten() {
+                state.notify_task(id, Event::CondVar(self.id()));
+            }
+            state.futures.drain()
+        });
+        for (_, waker) in wakers {
+            waker.wake();
+        }
     }
 
     /// 检查是否已关闭
     pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::Acquire)
+        critical_section::with(|cs| self.inner.state.borrow_ref(cs).closed)
     }
 
     /// 获取等待者数量
     pub fn waiter_count(&self) -> usize {
-        self.inner.waiters.lock().len() + self.inner.async_waiters.lock().len()
+        critical_section::with(|cs| {
+            let state = self.inner.state.borrow_ref(cs);
+            state.tasks.len() + state.futures.len()
+        })
     }
 
     /// 获取唯一标识（用于调试）
@@ -451,53 +450,96 @@ impl core::fmt::Debug for CondVar {
 // 异步支持
 // ============================================================================
 
-/// 条件变量的异步等待 Future
-pub struct CondVarFuture<'a, T> {
+// Keep a selected notify_one transferable until the waiter has reacquired
+// the mutex. Dropping the future at either await point runs this registration.
+struct Notification<'a> {
     condvar: &'a CondVar,
-    mutex: &'a Mutex<T>,
-    registered: bool,
+    token: Option<u64>,
+    epoch: u64,
 }
 
-impl<'a, T> CondVarFuture<'a, T> {
-    fn new(condvar: &'a CondVar, mutex: &'a Mutex<T>) -> Self {
-        Self {
-            condvar,
-            mutex,
-            registered: false,
-        }
+impl Notification<'_> {
+    fn poll(&mut self, cx: &mut core::task::Context<'_>) -> Poll<Result<()>> {
+        let mut incoming = Some(cx.waker().clone());
+        let (poll, old) = critical_section::with(|cs| {
+            let mut state = self.condvar.inner.state.borrow_ref_mut(cs);
+            if state.closed {
+                return (
+                    Poll::Ready(Err(RtosError::CondVarClosed)),
+                    state.futures.remove(self.token.take()),
+                );
+            }
+            if self.token.is_some_and(|id| !state.futures.contains(id)) {
+                return (Poll::Ready(Ok(())), None);
+            }
+            if !state
+                .futures
+                .has_room(self.token, crate::config::MAX_ASYNC_WAITERS)
+            {
+                return (Poll::Ready(Err(RtosError::WaiterQueueFull)), None);
+            }
+            self.epoch = state.broadcast_epoch;
+            (
+                Poll::Pending,
+                state
+                    .futures
+                    .register(&mut self.token, incoming.take().unwrap()),
+            )
+        });
+        drop(old);
+        poll
     }
 }
 
-impl<'a, T> core::future::Future for CondVarFuture<'a, T> {
-    type Output = Result<()>;
-
-    fn poll(
-        mut self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        if self.condvar.inner.closed.load(Ordering::Acquire) {
-            return core::task::Poll::Ready(Err(RtosError::CondVarClosed));
+impl Drop for Notification<'_> {
+    fn drop(&mut self) {
+        let Some(id) = self.token.take() else {
+            return;
+        };
+        let (removed, next) = critical_section::with(|cs| {
+            let mut state = self.condvar.inner.state.borrow_ref_mut(cs);
+            let old = state.futures.remove(Some(id));
+            let next = if old.is_none() && !state.closed && self.epoch == state.broadcast_epoch {
+                self.condvar.take_one(&mut state)
+            } else {
+                None
+            };
+            (old, next)
+        });
+        drop(removed);
+        if let Some(waker) = next {
+            waker.wake();
         }
-
-        if !self.registered {
-            let mut async_waiters = self.condvar.inner.async_waiters.lock();
-            async_waiters.push_back(cx.waker().clone());
-            self.registered = true;
-            return core::task::Poll::Pending;
-        }
-
-        // 被唤醒，返回 Ready
-        core::task::Poll::Ready(Ok(()))
     }
 }
 
 impl CondVar {
-    /// 异步等待条件变量
-    ///
-    /// 注意：这个方法需要手动管理锁的释放和重新获取。
-    /// 建议使用 `wait()` 方法进行同步等待。
-    pub fn wait_async<'a, T>(&'a self, mutex: &'a Mutex<T>) -> CondVarFuture<'a, T> {
-        CondVarFuture::new(self, mutex)
+    /// Register while holding the mutex, release it while waiting, and
+    /// return a reacquired guard. Cancellation releases both registrations.
+    pub async fn wait_async<'a, T>(&self, guard: MutexGuard<'a, T>) -> Result<MutexGuard<'a, T>> {
+        let mutex = guard.mutex();
+        let mut held = Some(guard);
+        let mut notification = Notification { condvar: self, token: None, epoch: 0 };
+        core::future::poll_fn(|cx| {
+            let result = notification.poll(cx);
+            drop(held.take());
+            result
+        }).await?;
+        let guard = mutex.lock_async().await?;
+        notification.token = None;
+        Ok(guard)
+    }
+
+    /// Recheck the predicate with the lock held after each notification.
+    pub async fn wait_while_async<'a, T>(
+        &self,
+        mut guard: MutexGuard<'a, T>,
+        mut predicate: impl FnMut(&T) -> bool,
+    ) -> Result<MutexGuard<'a, T>> {
+        while predicate(&guard) {
+            guard = self.wait_async(guard).await?;
+        }
+        Ok(guard)
     }
 }
 
@@ -553,11 +595,11 @@ mod tests {
     #[serial]
     fn test_condvar_v2_basic() {
         kernel_init();
-        crate::kernel::task::Task::new("test", |_| {}).unwrap();
+        crate::kernel::task::Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let condvar = CondVar::new();
-        
+
         assert!(!condvar.is_closed());
         assert_eq!(condvar.waiter_count(), 0);
     }
@@ -566,12 +608,12 @@ mod tests {
     #[serial]
     fn test_condvar_v2_clone() {
         kernel_init();
-        crate::kernel::task::Task::new("test", |_| {}).unwrap();
+        crate::kernel::task::Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let condvar1 = CondVar::new();
         let condvar2 = condvar1.clone();
-        
+
         assert_eq!(condvar1.id(), condvar2.id());
     }
 
@@ -579,11 +621,11 @@ mod tests {
     #[serial]
     fn test_condvar_v2_notify_without_waiters() {
         kernel_init();
-        crate::kernel::task::Task::new("test", |_| {}).unwrap();
+        crate::kernel::task::Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let condvar = CondVar::new();
-        
+
         // 没有��待者时 notify 不应该出错
         condvar.notify_one();
         condvar.notify_all();
@@ -593,11 +635,11 @@ mod tests {
     #[serial]
     fn test_condvar_v2_close() {
         kernel_init();
-        crate::kernel::task::Task::new("test", |_| {}).unwrap();
+        crate::kernel::task::Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let condvar = CondVar::new();
-        
+
         assert!(!condvar.is_closed());
         condvar.close();
         assert!(condvar.is_closed());
@@ -607,11 +649,11 @@ mod tests {
     #[serial]
     fn test_condvar_v2_debug() {
         kernel_init();
-        crate::kernel::task::Task::new("test", |_| {}).unwrap();
+        crate::kernel::task::Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let condvar = CondVar::new();
-        
+
         let debug_str = format!("{:?}", condvar);
         assert!(debug_str.contains("CondVar"));
         assert!(debug_str.contains("waiters"));
@@ -622,17 +664,17 @@ mod tests {
     #[serial]
     fn test_mutex_condvar_pair() {
         kernel_init();
-        crate::kernel::task::Task::new("test", |_| {}).unwrap();
+        crate::kernel::task::Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let (mutex, condvar) = mutex_condvar_pair(42);
-        
+
         // 验证互斥锁
         {
             let guard = mutex.lock().unwrap();
             assert_eq!(*guard, 42);
         }
-        
+
         // 验证条件变量
         assert!(!condvar.is_closed());
     }
@@ -641,9 +683,9 @@ mod tests {
     #[serial]
     fn test_condvar_convenience_function() {
         kernel_init();
-        crate::kernel::task::Task::new("test", |_| {}).unwrap();
+        crate::kernel::task::Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let cv = condvar();
         assert!(!cv.is_closed());
     }

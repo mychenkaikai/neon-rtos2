@@ -252,17 +252,17 @@ fn main() -> ! {
     kernel_init();
     
     // 创建任务
-    let task1 = Task::new("task1", |_| {
+    let task1 = Task::new("task1", || {
         loop {
             debug!("task1 running");
-            Delay::delay(1000);
+            Delay::delay(Ticks(1000));
         }
     });
     
-    let task2 = Task::new("task2", |_| {
+    let task2 = Task::new("task2", || {
         loop {
             debug!("task2 running");
-            Delay::delay(1000);
+            Delay::delay(Ticks(1000));
         }
     });
     
@@ -395,7 +395,6 @@ select! {
 Task::builder()
     .name("sensor_reader")
     .priority(Priority::High)
-    .stack_size(8192)
     .spawn(|| {
         // 任务逻辑
     })?;

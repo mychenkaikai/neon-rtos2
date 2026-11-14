@@ -1,246 +1,269 @@
-use crate::hal::trigger_schedule;
-use crate::config::MAX_TIMERS;
-use crate::sync::event::Event;
-use crate::kernel::scheduler::Scheduler;
-use crate::kernel::time::systick::Systick;
+use crate::compat::Vec;
+use crate::kernel::time::systick::Ticks;
+use crate::config::{MAX_TASKS, MAX_TIMERS};
 use crate::error::{Result, RtosError};
-use crate::compat::{BinaryHeap, Vec};
-use core::cmp::Ordering;
+use crate::hal::trigger_schedule;
+use crate::kernel::scheduler::Scheduler;
+use crate::kernel::task::Task;
+use crate::kernel::time::systick::{Deadline, Systick};
+use crate::sync::event::Event;
 use core::cell::RefCell;
 use core::task::Waker;
 use critical_section::Mutex;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub struct TimerInner {
-    running: bool,
-    timeout: usize,
-    seq: usize,
-    waiter: Option<usize>,
+struct TimerInner {
+    generation: u64,
+    duration: usize,
+    deadline: Option<Deadline>, // None once the tick handler has delivered expiry.
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct TimerEvent {
-    timeout: usize,
-    id: usize,
-    seq: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerSnapshot {
+    pub id: u64,
+    pub remaining: Ticks,
 }
 
 struct AsyncSleepEntry {
-    deadline: usize,
+    id: u64,
+    deadline: Deadline,
     waker: Option<Waker>,
 }
 
-impl Ord for TimerEvent {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Min-heap: smaller timeout is higher priority
-        other.timeout.cmp(&self.timeout)
-            .then_with(|| self.id.cmp(&other.id))
-    }
+struct TaskTimeoutEntry {
+    id: u64,
+    deadline: Deadline,
+    task: Task,
+    event: Event,
 }
 
-impl PartialOrd for TimerEvent {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+pub(crate) struct TaskTimeout {
+    slot: usize,
+    id: u64,
+}
+
+impl Drop for TaskTimeout {
+    fn drop(&mut self) {
+        critical_section::with(|cs| {
+            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+            let slot = &mut manager.task_timeouts[self.slot];
+            if slot.as_ref().is_some_and(|entry| entry.id == self.id) {
+                *slot = None;
+            }
+        });
     }
 }
 
 struct TimerManager {
     timers: [Option<TimerInner>; MAX_TIMERS],
-    heap: BinaryHeap<TimerEvent>,
     async_sleeps: Vec<Option<AsyncSleepEntry>>,
+    next_sleep_id: u64,
+    next_timer_id: u64,
+    task_timeouts: [Option<TaskTimeoutEntry>; MAX_TASKS],
+    next_task_timeout_id: u64,
 }
 
 impl TimerManager {
     const fn new() -> Self {
         Self {
             timers: [None; MAX_TIMERS],
-            heap: BinaryHeap::new(),
             async_sleeps: Vec::new(),
+            next_sleep_id: 0,
+            next_timer_id: 0,
+            task_timeouts: [const { None }; MAX_TASKS],
+            next_task_timeout_id: 0,
         }
     }
 }
 
 static TIMER_MANAGER: Mutex<RefCell<TimerManager>> = Mutex::new(RefCell::new(TimerManager::new()));
 
-pub struct Timer(usize);
+#[must_use = "dropping the timer cancels it"]
+pub struct Timer {
+    slot: usize,
+    generation: u64,
+}
 
 impl Timer {
-    /// 新建一个定时器的句柄
-    /// 
-    /// 通过 O(1) 的方式找到一个未使用的定时器槽位
-    pub fn new(timeout: usize) -> Result<Timer> {
-        let expire_time = timeout + Systick::get_current_time();
+    /// 创建并启动一次性定时器
+    ///
+    /// 从固定表中取得槽位。创建时立即开始计时。
+    pub fn after(timeout: impl Into<Ticks>) -> Result<Timer> {
+        let timeout = timeout.into().0;
         critical_section::with(|cs| {
             let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
             for i in 0..MAX_TIMERS {
                 if manager.timers[i].is_none() {
+                    let generation = manager.next_timer_id;
+                    manager.next_timer_id = generation.checked_add(1).expect("timer IDs exhausted");
                     manager.timers[i] = Some(TimerInner {
-                        running: false,
-                        timeout: expire_time,
-                        seq: 0,
-                        waiter: None,
+                        generation,
+                        duration: timeout,
+                        deadline: Some(Deadline::after(timeout)),
                     });
-                    return Ok(Timer(i));
+                    return Ok(Timer {
+                        slot: i,
+                        generation,
+                    });
                 }
             }
             Err(RtosError::TimerSlotsFull)
         })
     }
 
-    pub fn init() {
+    pub(crate) fn init() {
         critical_section::with(|cs| {
             let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
             for i in 0..MAX_TIMERS {
                 manager.timers[i] = None;
             }
-            manager.heap.clear();
-            manager.async_sleeps.clear();
-        })
+            manager.task_timeouts.fill_with(|| None);
+            core::mem::take(&mut manager.async_sleeps)
+        });
     }
 
-    pub fn get_id(&self) -> usize {
-        self.0
-    }
-    
-    /// 删除定时器
-    pub fn delete(&mut self) {
-        critical_section::with(|cs| {
-            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
-            manager.timers[self.0] = None;
-        })
-    }
+    /// Cancel the deadline and release its slot immediately.
+    pub fn cancel(self) {}
 
-    /// 启动定时器
-    pub fn start(&mut self) -> Result<()> {
+    /// Arm the same timer again for its original duration, measured from now.
+    pub fn restart(&mut self) -> Result<()> {
         critical_section::with(|cs| {
             let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
-            let (timeout, seq) = if let Some(ref mut timer) = manager.timers[self.0] {
-                timer.running = true;
-                timer.seq = timer.seq.wrapping_add(1);
-                timer.waiter = None;
-                (timer.timeout, timer.seq)
-            } else {
-                return Err(RtosError::TimerNotFound);
-            };
-            
-            manager.heap.push(TimerEvent {
-                timeout,
-                id: self.0,
-                seq,
-            });
+            let timer = manager.timers[self.slot]
+                .as_mut()
+                .filter(|timer| timer.generation == self.generation)
+                .ok_or(RtosError::TimerNotFound)?;
+            timer.deadline = Some(Deadline::after(timer.duration));
             Ok(())
         })
     }
 
-    /// 停止定时器
-    pub fn stop(&mut self) -> Result<()> {
+    pub fn is_elapsed(&self) -> bool {
         critical_section::with(|cs| {
-            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
-            if let Some(ref mut timer) = manager.timers[self.0] {
-                timer.running = false;
-                timer.seq = timer.seq.wrapping_add(1); // 使事件无效
-                timer.waiter = None;
-                Ok(())
-            } else {
-                Err(RtosError::TimerNotFound)
-            }
+            TIMER_MANAGER.borrow_ref(cs).timers[self.slot]
+                .filter(|timer| timer.generation == self.generation)
+                .and_then(|timer| timer.deadline)
+                .is_none_or(Deadline::elapsed)
         })
     }
 
-    /// 检查定时器是否正在运行
-    pub fn is_running(&self) -> bool {
-        critical_section::with(|cs| {
-            let manager = TIMER_MANAGER.borrow_ref(cs);
-            if let Some(ref timer) = manager.timers[self.0] {
-                timer.running
-            } else {
-                false
-            }
-        })
-    }
-
-    /// 检查定时器是否超时
-    pub fn is_timeout(&self) -> bool {
-        let current_time = Systick::get_current_time();
-        critical_section::with(|cs| {
-            let manager = TIMER_MANAGER.borrow_ref(cs);
-            if let Some(ref timer) = manager.timers[self.0] {
-                current_time >= timer.timeout
-            } else {
-                false
-            }
-        })
-    }
-
-    /// 遍历检查是否有满足条件的定时器，如果有的话就发送信号
-    /// 使用 O(1)/O(log N) 的 Min-Heap 实现
-    pub fn timer_check_and_send_event() {
-        let current_time = Systick::get_current_time();
-        let async_wakers = critical_section::with(|cs| {
-            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
-            while let Some(event) = manager.heap.peek() {
-                if event.timeout > current_time {
-                    break;
+    /// Block the calling task until expiry. Already elapsed timers return immediately.
+    pub fn wait(&self) -> Result<()> {
+        loop {
+            let elapsed = critical_section::with(|_| {
+                if self.is_elapsed() {
+                    return Ok(true);
                 }
-                
-                let event = manager.heap.pop().unwrap();
-                
-                if let Some(ref mut timer) = manager.timers[event.id] {
-                    if timer.running && timer.seq == event.seq {
-                        let timer_event = Event::Timer(event.id);
-                        let waiter = timer.waiter.take();
-                        if let Some(task_id) = waiter {
-                            if !Event::wake_task_by_id_if(task_id, timer_event) {
-                                Event::wake_task(timer_event);
-                            }
-                        } else {
-                            Event::wake_task(timer_event);
-                        }
-                    }
+                let mut task = Scheduler::get_current_task();
+                if !Scheduler::is_running() || task.get_taskid() == 0 {
+                    return Err(RtosError::InvalidTaskState);
                 }
+                task.block(Event::Timer(self.generation));
+                Ok(false)
+            })?;
+            if elapsed {
+                return Ok(());
             }
-
-            let mut async_wakers = Vec::new();
-            for entry in manager.async_sleeps.iter_mut() {
-                if let Some(sleep) = entry {
-                    if sleep.deadline <= current_time {
-                        if let Some(waker) = sleep.waker.take() {
-                            async_wakers.push(waker);
-                        }
-                        *entry = None;
-                    }
-                }
-            }
-
-            async_wakers
-        });
-
-        for waker in async_wakers {
-            waker.wake();
+            trigger_schedule();
         }
     }
 
-    pub(crate) fn set_waiter(&mut self, task_id: usize) -> Result<()> {
+    /// 遍历检查是否有满足条件的定时器，如果有的话就发送信号
+    /// 普通定时器直接扫描固定槽位，启停不会积累待清理的堆节点。
+    pub fn timer_check_and_send_event() {
+        let current_time = Systick::now();
+        // Scan empty slots together, but release the interrupt mask after each
+        // expiry. Check and deliver the event atomically with respect to reuse.
+        let mut timer_id = 0;
+        while timer_id < MAX_TIMERS {
+            critical_section::with(|cs| {
+                let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+                while timer_id < MAX_TIMERS {
+                    let id = timer_id;
+                    timer_id += 1;
+                    let Some(timer) = &mut manager.timers[id] else { continue };
+                    if timer.deadline.is_some_and(|end| end.elapsed_at(current_time)) {
+                        timer.deadline = None;
+                        Event::wake_task(Event::Timer(timer.generation));
+                        break;
+                    }
+                }
+            });
+        }
+        let mut index = 0;
+        while index < MAX_TASKS {
+            critical_section::with(|cs| {
+                let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+                while index < MAX_TASKS {
+                    let slot = &mut manager.task_timeouts[index];
+                    index += 1;
+                    if slot.as_ref().is_some_and(|entry| entry.deadline.elapsed_at(current_time)) {
+                        let entry = slot.take().unwrap();
+                        entry.task.wake_if(entry.event);
+                        break;
+                    }
+                }
+            });
+        }
+        let sleep_slots = critical_section::with(|cs| TIMER_MANAGER.borrow_ref(cs).async_sleeps.len());
+
+        // Fixed scratch space. Interrupt dispatch itself never allocates a Vec
+        // for due sleepers, and arbitrary wake callbacks run outside the borrow.
+        const BATCH: usize = 8;
+        for start in (0..sleep_slots).step_by(BATCH) {
+            let due: [Option<Waker>; BATCH] = critical_section::with(|cs| {
+                let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+                core::array::from_fn(|i| {
+                    let slot = manager.async_sleeps.get_mut(start + i)?;
+                    if slot.as_ref()?.deadline.elapsed_at(current_time) {
+                        slot.take()?.waker
+                    } else {
+                        None
+                    }
+                })
+            });
+            for waker in due.into_iter().flatten() {
+                waker.wake();
+            }
+        }
+    }
+
+    pub(crate) fn register_task_timeout(
+        deadline: Deadline,
+        task: Task,
+        event: Event,
+    ) -> Result<TaskTimeout> {
         critical_section::with(|cs| {
             let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
-            if let Some(ref mut timer) = manager.timers[self.0] {
-                timer.waiter = Some(task_id);
-                Ok(())
-            } else {
-                Err(RtosError::TimerNotFound)
-            }
+            let slot = manager
+                .task_timeouts
+                .iter()
+                .position(Option::is_none)
+                .ok_or(RtosError::TimerSlotsFull)?;
+            let id = manager.next_task_timeout_id;
+            manager.next_task_timeout_id = id.checked_add(1).ok_or(RtosError::OutOfMemory)?;
+            manager.task_timeouts[slot] = Some(TaskTimeoutEntry {
+                id,
+                deadline,
+                task,
+                event,
+            });
+            Ok(TaskTimeout { slot, id })
         })
     }
 
-    pub(crate) fn register_async_sleep(deadline: usize, waker: Waker) -> usize {
+    pub(crate) fn register_async_sleep(deadline: Deadline, waker: Waker) -> u64 {
         critical_section::with(|cs| {
             let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+            let id = manager.next_sleep_id;
+            manager.next_sleep_id = id.checked_add(1).expect("sleep registration IDs exhausted");
             let entry = AsyncSleepEntry {
+                id,
                 deadline,
                 waker: Some(waker),
             };
 
-            for (id, slot) in manager.async_sleeps.iter_mut().enumerate() {
+            for slot in manager.async_sleeps.iter_mut() {
                 if slot.is_none() {
                     *slot = Some(entry);
                     return id;
@@ -248,16 +271,31 @@ impl Timer {
             }
 
             manager.async_sleeps.push(Some(entry));
-            manager.async_sleeps.len() - 1
+            id
         })
     }
 
-    pub(crate) fn unregister_async_sleep(id: usize) {
+    pub(crate) fn unregister_async_sleep(id: u64) {
         critical_section::with(|cs| {
             let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
-            if let Some(slot) = manager.async_sleeps.get_mut(id) {
-                *slot = None;
-            }
+            manager
+                .async_sleeps
+                .iter_mut()
+                .find(|slot| slot.as_ref().is_some_and(|entry| entry.id == id))
+                .and_then(Option::take)
+        });
+    }
+
+    pub(crate) fn update_async_sleep(id: u64, waker: Waker) {
+        let mut incoming = Some(waker);
+        critical_section::with(|cs| {
+            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+            let entry = manager
+                .async_sleeps
+                .iter_mut()
+                .flatten()
+                .find(|entry| entry.id == id)?;
+            core::mem::replace(&mut entry.waker, incoming.take())
         });
     }
 
@@ -265,61 +303,54 @@ impl Timer {
     pub(crate) fn async_sleep_count() -> usize {
         critical_section::with(|cs| {
             let manager = TIMER_MANAGER.borrow_ref(cs);
-            manager.async_sleeps.iter().filter(|slot| slot.is_some()).count()
+            manager
+                .async_sleeps
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count()
         })
     }
 
-    /// 获取距离下一个定时器超时的剩余时间（毫秒/ticks）
-    pub fn get_next_timeout() -> Option<usize> {
-        let current_time = Systick::get_current_time();
-        critical_section::with(|cs| {
-            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
-            // 惰性删除已取消或过期的事件
-            while let Some(event) = manager.heap.peek() {
-                if let Some(ref timer) = manager.timers[event.id] {
-                    if timer.running && timer.seq == event.seq {
-                        if event.timeout <= current_time {
-                            return Some(0);
-                        } else {
-                            return Some(event.timeout - current_time);
-                        }
-                    }
-                }
-                manager.heap.pop(); // 清理无效事件
-            }
-            None
-        })
-    }
-
-    pub fn for_each_used<F>(mut f: F)
-    where
-        F: FnMut(&mut Timer, usize) -> bool,
-    {
-        let mut ids = [0; MAX_TIMERS];
-        let mut count = 0;
+    /// 获取距离下一个定时器超时的剩余时间（tick）
+    pub fn get_next_timeout() -> Option<Ticks> {
+        let current_time = Systick::now();
         critical_section::with(|cs| {
             let manager = TIMER_MANAGER.borrow_ref(cs);
-            for i in 0..MAX_TIMERS {
-                if manager.timers[i].is_some() {
-                    ids[count] = i;
-                    count += 1;
-                }
-            }
+            manager
+                .timers
+                .iter()
+                .flatten()
+                .filter_map(|t| t.deadline)
+                .chain(manager.async_sleeps.iter().flatten().map(|s| s.deadline))
+                .chain(manager.task_timeouts.iter().flatten().map(|t| t.deadline))
+                .min()
+                .map(|end| Ticks(end.remaining_at(current_time)))
+        })
+    }
+
+    /// Inspect occupied slots at one instant without borrowing live timers.
+    pub fn snapshots() -> impl Iterator<Item = TimerSnapshot> {
+        let snapshots: [_; MAX_TIMERS] = critical_section::with(|cs| {
+            let now = Systick::now();
+            TIMER_MANAGER.borrow_ref(cs).timers.map(|entry| entry.map(|timer| TimerSnapshot {
+                id: timer.generation,
+                remaining: Ticks(timer.deadline.map_or(0, |end| end.remaining_at(now))),
+            }))
         });
-        
-        for i in 0..count {
-            let id = ids[i];
-            let ret = f(&mut Timer(id), id);
-            if ret {
-                break;
-            }
-        }
+        snapshots.into_iter().flatten()
     }
 }
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        self.delete();
+        critical_section::with(|cs| {
+            let mut manager = TIMER_MANAGER.borrow_ref_mut(cs);
+            let slot = &mut manager.timers[self.slot];
+            if slot.is_some_and(|timer| timer.generation == self.generation) {
+                *slot = None;
+                Event::wake_task(Event::Timer(self.generation));
+            }
+        });
     }
 }
 
@@ -327,18 +358,34 @@ impl Drop for Timer {
 pub struct Delay;
 
 impl Delay {
-    /// 阻塞当前任务指定的时间（以 tick/毫秒为单位）
+    /// 阻塞当前任务指定的时间（Duration 或 Ticks）
     ///
-    /// 取代了之前需要手动创建 `Timer` 实例并 `start()`、`delete()` 的繁琐过程。
-    pub fn delay(timeout: usize) -> Result<()> {
-        let mut timer = Timer::new(timeout)?;
-        timer.start()?;
-        let task_id = Scheduler::get_current_task().get_taskid();
-        timer.set_waiter(task_id)?;
-        Scheduler::get_current_task().block(Event::Timer(timer.0));
-        trigger_schedule();
-        timer.delete();
-        Ok(())
+    /// 等待登记随调用作用域自动释放。
+    pub fn delay(timeout: impl Into<Ticks>) -> Result<()> {
+        let timeout = timeout.into().0;
+        if timeout == 0 {
+            trigger_schedule();
+            return Ok(());
+        }
+        let deadline = Deadline::after(timeout);
+        let mut task = Scheduler::get_current_task();
+        let mut alarm = None;
+        loop {
+            let elapsed = critical_section::with(|_| -> Result<bool> {
+                if deadline.elapsed() {
+                    return Ok(true);
+                }
+                if alarm.is_none() {
+                    alarm = Some(Timer::register_task_timeout(deadline, task, Event::Delay)?);
+                }
+                task.block(Event::Delay);
+                Ok(false)
+            })?;
+            if elapsed {
+                return Ok(());
+            }
+            trigger_schedule();
+        }
     }
 }
 
@@ -346,48 +393,77 @@ impl Delay {
 mod tests {
     use super::*;
     use crate::kernel::scheduler::Scheduler;
-    use crate::sync::event::Event;
-    use crate::kernel::time::systick::Systick;
     use crate::kernel::task::Task;
     use crate::kernel::task::TaskState;
+    use crate::kernel::time::systick::Systick;
+    use crate::sync::event::Event;
     use crate::utils::kernel_init;
     use serial_test::serial;
 
     #[test]
     #[serial]
+    fn deadlines_cross_the_32_bit_boundary_and_restart_from_now() {
+        use core::task::{Context, Waker};
+        use core::{future::Future, pin::Pin};
+        kernel_init();
+        Systick::add_current_time(u32::MAX as u64 - 2);
+        let mut timer = Timer::after(Ticks(5)).unwrap();
+        let mut sleep = crate::runtime::sleep(Ticks(4));
+        let mut cx = Context::from_waker(Waker::noop());
+        timer.restart().unwrap();
+        assert!(Pin::new(&mut sleep).poll(&mut cx).is_pending());
+        Systick::add_current_time(3);
+        assert_eq!(Systick::now(), 1u64 << 32);
+        assert!(!timer.is_elapsed());
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(1)));
+        timer.restart().unwrap();
+        Systick::add_current_time(1);
+        Timer::timer_check_and_send_event();
+        assert!(Pin::new(&mut sleep).poll(&mut cx).is_ready());
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(4)));
+        timer.cancel();
+        assert_eq!(Timer::get_next_timeout(), None);
+        let before = Systick::now();
+        crate::kernel::power::enter_idle(Some(1000));
+        assert_eq!(Systick::now(), before);
+    }
+
+    #[test]
+    #[serial]
+    fn task_timeout_only_wakes_its_event_and_survives_slot_reuse() {
+        kernel_init();
+        let mut task = Task::new("timed waiter", || {}).unwrap();
+        let event = Event::Signal(7);
+        let other = Event::Signal(9);
+        task.block(other);
+        let expired = Timer::register_task_timeout(Deadline::after(1), task, event).unwrap();
+        Systick::add_current_time(1);
+        Timer::timer_check_and_send_event();
+        assert_eq!(task.get_state(), TaskState::Blocked(other));
+        let next = Timer::register_task_timeout(Deadline::after(2), task, other).unwrap();
+        drop(expired);
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(2)));
+        Systick::add_current_time(2);
+        Timer::timer_check_and_send_event();
+        assert_eq!(task.get_state(), TaskState::Ready);
+        drop(next);
+        let cancelled = Timer::register_task_timeout(Deadline::after(2), task, other).unwrap();
+        drop(cancelled);
+        assert_eq!(Timer::get_next_timeout(), None);
+    }
+
+    #[test]
+    #[serial]
     fn test_timer_for_each() {
         kernel_init();
-        let mut timer1 = Timer::new(1000).unwrap();
-        let mut timer2 = Timer::new(2000).unwrap();
-        timer1.start().unwrap();
-        timer2.start().unwrap();
-        assert_eq!(timer1.is_running(), true);
-        assert_eq!(timer2.is_running(), true);
+        let first = Timer::after(Ticks(1000)).unwrap();
+        let second = Timer::after(Ticks(2000)).unwrap();
+        let snapshot = Timer::snapshots();
+        first.cancel();
         Systick::add_current_time(1000);
-        Timer::for_each_used(|timer, id| {
-            assert_eq!(id, 0);
-            assert_eq!(timer.get_id(), 0);
-            assert_eq!(timer.is_running(), true);
-            if timer.is_timeout() {
-                assert_eq!(timer.is_running(), true);
-                assert_eq!(timer.get_id(), 0);
-                timer.delete();
-                return true;
-            }
-            return false;
-        });
-
-        Systick::add_current_time(1000);
-        Timer::for_each_used(|timer, _| {
-            assert_eq!(timer.is_running(), true);
-            if timer.is_timeout() {
-                assert_eq!(timer.is_running(), true);
-                assert_eq!(timer.get_id(), 1);
-                timer.delete();
-                return true;
-            }
-            return false;
-        });
+        let remaining: Vec<_> = snapshot.map(|timer| timer.remaining).collect();
+        assert_eq!(remaining, [Ticks(1000), Ticks(2000)]);
+        assert!(!second.is_elapsed());
     }
 
     #[test]
@@ -397,13 +473,13 @@ mod tests {
         // 创建最大数量的定时器
         let mut timers = Vec::new();
         for i in 0..MAX_TIMERS {
-            let timer = Timer::new(1000 * i);
+            let timer = Timer::after(Ticks(1000 * i));
             assert!(timer.is_ok(), "Timer {} should be created successfully", i);
             timers.push(timer.unwrap());
         }
-        
+
         // 再创建一个应该失败
-        let result = Timer::new(1000);
+        let result = Timer::after(Ticks(1000));
         assert_eq!(result.err(), Some(RtosError::TimerSlotsFull));
     }
 
@@ -411,97 +487,118 @@ mod tests {
     #[serial]
     fn test_timer_start_stop() {
         kernel_init();
-        let mut timer = Timer::new(1000).unwrap();
-        
-        assert_eq!(timer.is_running(), false);
-        
-        timer.start().unwrap();
-        assert_eq!(timer.is_running(), true);
-        
-        timer.stop().unwrap();
-        assert_eq!(timer.is_running(), false);
+        let timer = Timer::after(Ticks(1000)).unwrap();
+        assert!(!timer.is_elapsed());
+        timer.cancel();
+        assert_eq!(Timer::snapshots().count(), 0);
     }
 
     #[test]
     #[serial]
     fn test_timer_timeout() {
         kernel_init();
-        let mut timer = Timer::new(500).unwrap();
-        timer.start().unwrap();
-        
-        assert_eq!(timer.is_timeout(), false);
-        
+        let mut timer = Timer::after(Ticks(500)).unwrap();
+        timer.restart().unwrap();
+
+        assert_eq!(timer.is_elapsed(), false);
+
         Systick::add_current_time(500);
-        assert_eq!(timer.is_timeout(), true);
+        assert_eq!(timer.is_elapsed(), true);
     }
 
     #[test]
     #[serial]
-    fn test_timer_min_heap_ordering() {
+    fn test_timer_deadline_ordering() {
         kernel_init();
-        
-        let mut t1 = Timer::new(300).unwrap();
-        let mut t2 = Timer::new(100).unwrap();
-        let mut t3 = Timer::new(200).unwrap();
-        
-        t1.start().unwrap();
-        t2.start().unwrap();
-        t3.start().unwrap();
-        
+
+        let _last = Timer::after(Ticks(300)).unwrap();
+        let _other = Timer::after(Ticks(100)).unwrap();
+        let _middle = Timer::after(Ticks(200)).unwrap();
+
         // 期望下一个超时时间是 100
-        assert_eq!(Timer::get_next_timeout(), Some(100));
-        
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(100)));
+
         Systick::add_current_time(100);
         Timer::timer_check_and_send_event(); // 处理 t2 超时
-        
+
         // 期望下一个超时时间是 100 (t3 剩余)
-        assert_eq!(Timer::get_next_timeout(), Some(100));
-        
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(100)));
+
         Systick::add_current_time(100);
         Timer::timer_check_and_send_event(); // 处理 t3 超时
-        
+
         // 期望下一个超时时间是 100 (t1 剩余)
-        assert_eq!(Timer::get_next_timeout(), Some(100));
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(100)));
     }
 
     #[test]
     #[serial]
-    fn test_timer_lazy_deletion() {
+    fn test_stopped_timer_does_not_set_next_timeout() {
         kernel_init();
-        
-        let mut t1 = Timer::new(100).unwrap();
-        let mut t2 = Timer::new(200).unwrap();
-        
-        t1.start().unwrap();
-        t2.start().unwrap();
-        
-        assert_eq!(Timer::get_next_timeout(), Some(100));
-        
-        // 停止 t1，它的事件仍然在堆中，但是无效（seq 不匹配）
-        t1.stop().unwrap();
-        
-        // `get_next_timeout` 会惰性删除堆顶无效事件，下一个应该是 t2 (200)
-        assert_eq!(Timer::get_next_timeout(), Some(200));
+
+        let t1 = Timer::after(Ticks(100)).unwrap();
+        let _other = Timer::after(Ticks(200)).unwrap();
+
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(100)));
+
+        // 停止最早到期的定时器
+        t1.cancel();
+
+        // 下一个应该是 t2 (200)
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(200)));
     }
 
     #[test]
     #[serial]
-    fn test_timer_directed_wakeup() {
+    fn test_timer_event_wakeup() {
         kernel_init();
 
-        let mut task = Task::new("timer_waiter", |_| {}).unwrap();
-        let mut timer = Timer::new(100).unwrap();
-        timer.start().unwrap();
+        let mut task = Task::new("timer_waiter", || {}).unwrap();
+        let mut timer = Timer::after(Ticks(100)).unwrap();
+        timer.restart().unwrap();
 
         Scheduler::start();
 
         let current_id = Scheduler::get_current_task().get_taskid();
         if task.get_taskid() != current_id {
-            timer.set_waiter(task.get_taskid()).unwrap();
-            task.block(Event::Timer(timer.get_id()));
+            task.block(Event::Timer(timer.generation));
             Systick::add_current_time(100);
             Timer::timer_check_and_send_event();
             assert_eq!(task.get_state(), TaskState::Ready);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn deleted_timer_cannot_delete_or_fire_reused_slot() {
+        kernel_init();
+        let old = Timer::after(Ticks(1)).unwrap();
+        let stale_event = Event::Timer(old.generation);
+        let slot = old.slot;
+        let mut task = Task::new("waiter", || {}).unwrap();
+        task.block(stale_event);
+        old.cancel();
+        assert_eq!(task.get_state(), TaskState::Ready);
+        let new = Timer::after(Ticks(10)).unwrap();
+        assert_eq!(slot, new.slot);
+        task.block(stale_event);
+        Systick::add_current_time(1);
+        Timer::timer_check_and_send_event();
+        assert!(!new.is_elapsed());
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(9)));
+        Systick::add_current_time(9);
+        Timer::timer_check_and_send_event();
+        assert_eq!(task.get_state(), TaskState::Blocked(stale_event));
+    }
+
+    #[test]
+    #[serial]
+    fn timer_iteration_does_not_destroy_owned_timers() {
+        kernel_init();
+        let mut timer = Timer::after(Ticks(100)).unwrap();
+        timer.restart().unwrap();
+        assert_eq!(Timer::snapshots().count(), 1);
+        assert!(!timer.is_elapsed());
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(100)));
     }
 }

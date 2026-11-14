@@ -20,7 +20,7 @@
 //!     let counter_clone = counter.clone();
 //!
 //!     Task::builder("incrementer")
-//!         .spawn(move |_| {
+//!         .spawn(move || {
 //!             loop {
 //!                 let mut guard = counter.lock().unwrap();
 //!                 *guard += 1;
@@ -29,7 +29,7 @@
 //!         });
 //!
 //!     Task::builder("reader")
-//!         .spawn(move |_| {
+//!         .spawn(move || {
 //!             loop {
 //!                 let guard = counter_clone.lock().unwrap();
 //!                 println!("Counter: {}", *guard);
@@ -38,65 +38,29 @@
 //! }
 //! ```
 
-use crate::compat::{Arc, VecDeque};
-use crate::kernel::scheduler::Scheduler;
-use crate::kernel::task::TaskState;
-use crate::kernel::time::systick::Systick;
-use crate::hal::trigger_schedule;
+use crate::kernel::time::systick::Ticks;
+use crate::compat::Arc;
 use crate::error::{Result, RtosError};
-use crate::sync::signal::WaiterList;
+use crate::kernel::scheduler::Scheduler;
+use crate::kernel::task::Task;
+use crate::kernel::time::systick::Deadline;
+use crate::sync::event::Event;
+use crate::sync::wait::{Registration, WaitQueue, WakeBatch};
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use core::task::Waker;
-use spin::Mutex as SpinMutex;
-use crate::kernel::task::Priority;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-/// 提取出的非泛型 Mutex 状态，用于类型擦除的优先级继承传播
-#[repr(C)]
-pub(crate) struct MutexState {
-    pub(crate) owner: AtomicUsize,
-    pub(crate) owner_original_priority: SpinMutex<Option<Priority>>,
-    pub(crate) priority_inheritance: bool,
-}
-
-impl MutexState {
-    pub(crate) fn propagate_priority(&self, new_priority: Priority, depth: usize) {
-        if !self.priority_inheritance || depth > 10 {
-            return;
-        }
-
-        let owner_id = self.owner.load(Ordering::Acquire);
-        if owner_id == usize::MAX {
-            return;
-        }
-
-        let mut owner_task = crate::kernel::task::Task(owner_id);
-        let owner_priority = owner_task.get_priority();
-
-        if new_priority > owner_priority {
-            owner_task.set_priority(new_priority);
-
-            if let TaskState::Blocked(crate::sync::event::Event::Mutex(next_mutex_id)) = owner_task.get_state() {
-                let next_state = unsafe { &*(next_mutex_id as *const MutexState) };
-                next_state.propagate_priority(new_priority, depth + 1);
-            }
-        }
-    }
-}
+use critical_section::CriticalSection;
 
 /// 互斥锁内部状态
 #[repr(C)]
 struct MutexInner<T> {
-    /// 非泛型状态（必须是第一个字段，以支持指针强转进行类型擦除）
-    state: MutexState,
+    owner: critical_section::Mutex<core::cell::Cell<Option<Task>>>,
+    priority_inheritance: bool,
     /// 锁状态
     locked: AtomicBool,
-    /// 同步等待者列表
-    waiters: SpinMutex<WaiterList>,
-    /// 异步等待者列表
-    async_waiters: SpinMutex<VecDeque<Waker>>,
+    waiters: WaitQueue,
     /// 是否已被毒化（持有锁的任务 panic 了）
     poisoned: AtomicBool,
     /// 被保护的数据
@@ -108,31 +72,19 @@ unsafe impl<T: Send> Send for MutexInner<T> {}
 unsafe impl<T: Send> Sync for MutexInner<T> {}
 
 impl<T> MutexInner<T> {
-    fn new(data: T) -> Self {
-        Self {
-            state: MutexState {
-                owner: AtomicUsize::new(usize::MAX),
-                owner_original_priority: SpinMutex::new(None),
-                priority_inheritance: false,
-            },
-            locked: AtomicBool::new(false),
-            waiters: SpinMutex::new(WaiterList::new()),
-            async_waiters: SpinMutex::new(VecDeque::new()),
-            poisoned: AtomicBool::new(false),
-            data: UnsafeCell::new(data),
-        }
+    fn release(&self, cs: CriticalSection<'_>) -> WakeBatch {
+        self.owner.borrow(cs).set(None);
+        self.locked.store(false, Ordering::Release);
+        self.waiters
+            .take_all(cs, Event::Mutex(self as *const Self as usize))
     }
 
-    fn new_with_priority_inheritance(data: T) -> Self {
+    fn new(data: T, priority_inheritance: bool) -> Self {
         Self {
-            state: MutexState {
-                owner: AtomicUsize::new(usize::MAX),
-                owner_original_priority: SpinMutex::new(None),
-                priority_inheritance: true,
-            },
+            owner: critical_section::Mutex::new(core::cell::Cell::new(None)),
+            priority_inheritance,
             locked: AtomicBool::new(false),
-            waiters: SpinMutex::new(WaiterList::new()),
-            async_waiters: SpinMutex::new(VecDeque::new()),
+            waiters: WaitQueue::new(),
             poisoned: AtomicBool::new(false),
             data: UnsafeCell::new(data),
         }
@@ -192,7 +144,7 @@ impl<T> Mutex<T> {
     /// ```
     pub fn new(data: T) -> Self {
         Self {
-            inner: Arc::new(MutexInner::new(data)),
+            inner: Arc::new(MutexInner::new(data, false)),
         }
     }
 
@@ -213,13 +165,13 @@ impl<T> Mutex<T> {
     /// ```
     pub fn with_priority_inheritance(data: T) -> Self {
         Self {
-            inner: Arc::new(MutexInner::new_with_priority_inheritance(data)),
+            inner: Arc::new(MutexInner::new(data, true)),
         }
     }
 
     /// 检查是否启用了优先级继承
     pub fn has_priority_inheritance(&self) -> bool {
-        self.inner.state.priority_inheritance
+        self.inner.priority_inheritance
     }
 
     /// 获取锁
@@ -245,62 +197,7 @@ impl<T> Mutex<T> {
     /// } // 自动释放锁
     /// ```
     pub fn lock(&self) -> Result<MutexGuard<'_, T>> {
-        // 检查是否已毒化
-        if self.inner.poisoned.load(Ordering::Acquire) {
-            return Err(RtosError::MutexPoisoned);
-        }
-
-        loop {
-            // 尝试获取锁
-            if self.inner.locked.compare_exchange(
-                false,
-                true,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ).is_ok() {
-                // 成功获取锁
-                let mut current = Scheduler::get_current_task();
-                let task_id = current.get_taskid();
-                self.inner.state.owner.store(task_id, Ordering::Release);
-                
-                // 如果启用优先级继承，保存原始优先级
-                if self.inner.state.priority_inheritance {
-                    let mut orig_priority = self.inner.state.owner_original_priority.lock();
-                    *orig_priority = Some(current.get_priority());
-                }
-                
-                return Ok(MutexGuard { mutex: self, _marker: PhantomData });
-            }
-
-            // 锁被占用，加入等待队列并阻塞
-            let current = Scheduler::get_current_task();
-            let task_id = current.get_taskid();
-            let current_priority = current.get_priority();
-
-            {
-                let mut waiters = self.inner.waiters.lock();
-                if !waiters.push(task_id) {
-                    return Err(RtosError::WaiterQueueFull);
-                }
-            }
-
-            // 优先级继承：提升持有者的优先级
-            self.inner.state.propagate_priority(current_priority, 0);
-
-            // 使用 Arc 的地址作为唯一标识
-            let mutex_id = Arc::as_ptr(&self.inner) as usize;
-            
-            // 阻塞当前任务
-            Scheduler::get_current_task().block(crate::sync::event::Event::Mutex(mutex_id));
-            trigger_schedule();
-
-            // 被唤醒后检查是否毒化
-            if self.inner.poisoned.load(Ordering::Acquire) {
-                return Err(RtosError::MutexPoisoned);
-            }
-
-            // 被唤醒后重新尝试获取锁
-        }
+        self.lock_until(None)
     }
 
     /// 尝试获取锁（非阻塞）
@@ -324,24 +221,20 @@ impl<T> Mutex<T> {
     /// }
     /// ```
     pub fn try_lock(&self) -> Result<MutexGuard<'_, T>> {
-        // 检查是否已毒化
-        if self.inner.poisoned.load(Ordering::Acquire) {
-            return Err(RtosError::MutexPoisoned);
-        }
-
-        // 尝试获取锁
-        if self.inner.locked.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ).is_ok() {
-            let task_id = Scheduler::get_current_task().get_taskid();
-            self.inner.state.owner.store(task_id, Ordering::Release);
-            Ok(MutexGuard { mutex: self, _marker: PhantomData })
-        } else {
-            Err(RtosError::WouldBlock)
-        }
+        critical_section::with(|cs| {
+            if self.is_poisoned() {
+                return Err(RtosError::MutexPoisoned);
+            }
+            if self.inner.locked.swap(true, Ordering::Acquire) {
+                return Err(RtosError::WouldBlock);
+            }
+            let task = Scheduler::get_current_task();
+            self.inner.owner.borrow(cs).set(Some(task));
+            Ok(MutexGuard {
+                mutex: self,
+                _marker: PhantomData,
+            })
+        })
     }
 
     /// 带超时的获取锁
@@ -350,7 +243,7 @@ impl<T> Mutex<T> {
     /// 如果超时，返回 `Err(RtosError::Timeout)`。
     ///
     /// # 参数
-    /// - `timeout_ms`: 超时时间（毫秒）
+    /// - `timeout`: 超时时间（Duration 或 Ticks）
     ///
     /// # 返回值
     /// - `Ok(MutexGuard)`: 成功获取锁
@@ -362,106 +255,32 @@ impl<T> Mutex<T> {
     /// use neon_rtos2::sync::Mutex;
     ///
     /// let mutex = Mutex::new(0);
-    /// match mutex.lock_timeout(1000) {
+    /// match mutex.lock_timeout(neon_rtos2::prelude::Ticks(1000)) {
     ///     Ok(guard) => println!("Got lock: {}", *guard),
     ///     Err(neon_rtos2::error::RtosError::Timeout) => println!("Timeout"),
     ///     Err(_) => println!("Other error"),
     /// }
     /// ```
-    pub fn lock_timeout(&self, timeout_ms: usize) -> Result<MutexGuard<'_, T>> {
-        // 检查是否已毒化
-        if self.inner.poisoned.load(Ordering::Acquire) {
-            return Err(RtosError::MutexPoisoned);
-        }
-
-        let deadline = Systick::get_current_time() + timeout_ms;
-
-        loop {
-            // 尝试获取锁
-            if self.inner.locked.compare_exchange(
-                false,
-                true,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ).is_ok() {
-                // 成功获取锁
-                let task_id = Scheduler::get_current_task().get_taskid();
-                self.inner.state.owner.store(task_id, Ordering::Release);
-                return Ok(MutexGuard { mutex: self, _marker: PhantomData });
-            }
-
-            // 检查是否超时
-            if Systick::get_current_time() >= deadline {
-                return Err(RtosError::Timeout);
-            }
-
-            // 锁被占用，加入等待队列并阻塞
-            let current = Scheduler::get_current_task();
-            let task_id = current.get_taskid();
-
-            {
-                let mut waiters = self.inner.waiters.lock();
-                if !waiters.push(task_id) {
-                    return Err(RtosError::WaiterQueueFull);
-                }
-            }
-
-            // 使用 Arc 的地址作为唯一标识
-            let mutex_id = Arc::as_ptr(&self.inner) as usize;
-            
-            // 阻塞当前任务
-            Scheduler::get_current_task().block(crate::sync::event::Event::Mutex(mutex_id));
-            trigger_schedule();
-
-            // 被唤醒后检查是否毒化
-            if self.inner.poisoned.load(Ordering::Acquire) {
-                return Err(RtosError::MutexPoisoned);
-            }
-
-            // 检查是否超时
-            if Systick::get_current_time() >= deadline {
-                // 从等待队列中移除自己
-                let mut waiters = self.inner.waiters.lock();
-                waiters.remove(task_id);
-                return Err(RtosError::Timeout);
-            }
-
-            // 被唤醒后重新尝试获取锁
-        }
+    pub fn lock_timeout(&self, timeout: impl Into<Ticks>) -> Result<MutexGuard<'_, T>> {
+        self.lock_until(Some(Deadline::after(timeout.into().0)))
     }
 
-    /// 带超时的尝试获取锁（轮询模式）
-    ///
-    /// 在指定时间内反复尝试获取锁，不会阻塞任务。
-    /// 适用于不想让任务进入阻塞状态的场景。
-    ///
-    /// # 参数
-    /// - `timeout_ms`: 超时时间（毫秒）
-    ///
-    /// # 返回值
-    /// - `Ok(MutexGuard)`: 成功获取锁
-    /// - `Err(RtosError::Timeout)`: 超时
-    /// - `Err(RtosError::MutexPoisoned)`: 锁已被毒化
-    pub fn try_lock_timeout(&self, timeout_ms: usize) -> Result<MutexGuard<'_, T>> {
-        let deadline = Systick::get_current_time() + timeout_ms;
-        
-        loop {
-            match self.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(RtosError::WouldBlock) => {
-                    if Systick::get_current_time() >= deadline {
-                        return Err(RtosError::Timeout);
-                    }
-                    // 避免纯忙等导致饿死同优先级任务，让出 1 tick 或执行权
-                    let remaining = deadline - Systick::get_current_time();
-                    if remaining > 1 {
-                        let _ = crate::kernel::time::timer::Delay::delay(1);
-                    } else {
-                        crate::hal::trigger_schedule();
-                    }
+    fn lock_until(&self, deadline: Option<Deadline>) -> Result<MutexGuard<'_, T>> {
+        self.inner.waiters.wait_until(
+            Event::Mutex(self.id()),
+            deadline,
+            || self.try_lock(),
+            || self.donate_to_owner(),
+        )
+    }
+
+    fn donate_to_owner(&self) {
+        if self.has_priority_inheritance() {
+            critical_section::with(|cs| {
+                if let Some(owner) = self.inner.owner.borrow(cs).get() {
+                    Scheduler::donate_to_owner(Scheduler::get_current_task(), owner);
                 }
-                Err(e) => return Err(e),
-            }
+            });
         }
     }
 
@@ -496,9 +315,7 @@ impl<T> Mutex<T> {
 
     /// 检查锁是否被当前任务持有
     pub fn is_locked_by_current(&self) -> bool {
-        let current_id = Scheduler::get_current_task().get_taskid();
-        self.inner.locked.load(Ordering::Acquire) 
-            && self.inner.state.owner.load(Ordering::Acquire) == current_id
+        critical_section::with(|cs| self.inner.owner.borrow(cs).get() == Some(Scheduler::get_current_task()))
     }
 
     /// 检查锁是否被占用
@@ -518,52 +335,7 @@ impl<T> Mutex<T> {
 
     /// 内部方法：释放锁
     fn unlock(&self) {
-        // 优先级继承：恢复原始优先级
-        if self.inner.state.priority_inheritance {
-            let owner_id = self.inner.state.owner.load(Ordering::Acquire);
-            if owner_id != usize::MAX {
-                let original_priority = {
-                    let mut orig = self.inner.state.owner_original_priority.lock();
-                    orig.take()
-                };
-                
-                if let Some(priority) = original_priority {
-                    let mut task = crate::kernel::task::Task(owner_id);
-                    task.set_priority(priority);
-                }
-            }
-        }
-
-        // 清除持有者
-        self.inner.state.owner.store(usize::MAX, Ordering::Release);
-        
-        // 释放锁
-        self.inner.locked.store(false, Ordering::Release);
-
-        // 首先尝试唤醒同步等待者
-        let task_id = {
-            let mut waiters = self.inner.waiters.lock();
-            waiters.pop_front()
-        };
-
-        if let Some(task_id) = task_id {
-            // O(1) 唤醒，不再使用 O(N) 的 Task::for_each
-            let mut task = crate::kernel::task::Task(task_id);
-            if let crate::kernel::task::TaskState::Blocked(_) = task.get_state() {
-                task.ready();
-            }
-            return;
-        }
-
-        // 然后尝试唤醒异步等待者
-        let waker = {
-            let mut async_waiters = self.inner.async_waiters.lock();
-            async_waiters.pop_front()
-        };
-
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        critical_section::with(|cs| self.inner.release(cs)).wake();
     }
 
     /// 内部方法：标记为毒化并释放锁
@@ -586,7 +358,7 @@ impl<T: core::fmt::Debug> core::fmt::Debug for Mutex<T> {
         d.field("locked", &self.is_locked());
         d.field("poisoned", &self.is_poisoned());
         d.field("waiters", &self.waiter_count());
-        
+
         // 尝试显示数据（如果能获取锁）
         match self.try_lock() {
             Ok(guard) => {
@@ -596,7 +368,7 @@ impl<T: core::fmt::Debug> core::fmt::Debug for Mutex<T> {
                 d.field("data", &"<locked>");
             }
         }
-        
+
         d.finish()
     }
 }
@@ -617,6 +389,7 @@ impl<T: core::fmt::Debug> core::fmt::Debug for Mutex<T> {
 ///     // 离开作用域自动释放锁
 /// }
 /// ```
+#[must_use = "keep the guard alive while accessing the protected data"]
 pub struct MutexGuard<'a, T> {
     pub(crate) mutex: &'a Mutex<T>,
     // 使用 PhantomData 标记此类型不应该被发送到其他任务
@@ -639,7 +412,7 @@ impl<'a, T> MutexGuard<'a, T> {
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::Mutex;
+    /// use neon_rtos2::sync::{Mutex, MutexGuard};
     ///
     /// let mutex = Mutex::new(42);
     /// let guard = mutex.lock().unwrap();
@@ -655,13 +428,18 @@ impl<'a, T> MutexGuard<'a, T> {
         core::mem::forget(guard);
         mutex
     }
+    pub(crate) fn unlock_deferred(self, cs: CriticalSection<'_>) -> WakeBatch {
+        let mutex = self.mutex;
+        core::mem::forget(self);
+        mutex.inner.release(cs)
+    }
 }
 
 // 显式实现 !Send - MutexGuard 不能被发送到其他任务
 // 这是故意的，因为锁必须在获取它的任务中释放
 // 注意：由于 PhantomData<*const ()>，MutexGuard 已经是 !Send 的
 // 但我们仍然可以显式实现 Sync（如果 T: Sync）
-unsafe impl<T: Sync> Sync for MutexGuard<'_, T> {}
+unsafe impl<T: Send + Sync> Sync for MutexGuard<'_, T> {}
 
 impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
@@ -689,9 +467,7 @@ impl<T> Drop for MutexGuard<'_, T> {
 
 impl<T: core::fmt::Debug> core::fmt::Debug for MutexGuard<'_, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MutexGuard")
-            .field("data", &**self)
-            .finish()
+        f.debug_struct("MutexGuard").field("data", &**self).finish()
     }
 }
 
@@ -718,11 +494,12 @@ impl<T: core::fmt::Display> core::fmt::Display for MutexGuard<'_, T> {
 ///
 /// let mutex = Mutex::new(42);
 /// let guard = mutex.lock_owned().unwrap();
-/// 
+///
 /// // guard 可以被存储或移动
 /// let value = *guard;
 /// drop(guard); // 显式释放
 /// ```
+#[must_use = "keep the guard alive while accessing the protected data"]
 pub struct OwnedMutexGuard<T> {
     mutex: Arc<MutexInner<T>>,
 }
@@ -750,53 +527,7 @@ impl<T> DerefMut for OwnedMutexGuard<T> {
 
 impl<T> Drop for OwnedMutexGuard<T> {
     fn drop(&mut self) {
-        // 优先级继承：恢复原始优先级
-        if self.mutex.state.priority_inheritance {
-            let owner_id = self.mutex.state.owner.load(Ordering::Acquire);
-            if owner_id != usize::MAX {
-                let original_priority = {
-                    let mut orig = self.mutex.state.owner_original_priority.lock();
-                    orig.take()
-                };
-                
-                if let Some(priority) = original_priority {
-                    let mut task = crate::kernel::task::Task(owner_id);
-                    task.set_priority(priority);
-                }
-            }
-        }
-
-        // 清除持有者
-        self.mutex.state.owner.store(usize::MAX, Ordering::Release);
-        
-        // 释放锁
-        self.mutex.locked.store(false, Ordering::Release);
-
-        // 唤醒等待者
-        let task_id = {
-            let mut waiters = self.mutex.waiters.lock();
-            waiters.pop_front()
-        };
-
-        if let Some(task_id) = task_id {
-            crate::kernel::task::Task::for_each(|task, id| {
-                if id == task_id {
-                    if let TaskState::Blocked(_) = task.get_state() {
-                        task.ready();
-                    }
-                }
-            });
-            return;
-        }
-
-        let waker = {
-            let mut async_waiters = self.mutex.async_waiters.lock();
-            async_waiters.pop_front()
-        };
-
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        critical_section::with(|cs| self.mutex.release(cs)).wake();
     }
 }
 
@@ -829,86 +560,28 @@ impl<T> Mutex<T> {
     /// use neon_rtos2::sync::Mutex;
     ///
     /// let mutex = Mutex::new(42);
-    /// let guard = mutex.lock_owned_guard().unwrap();
+    /// let guard = mutex.lock_owned().unwrap();
     /// // guard 可以被存储在结构体中
     /// ```
 
     /// 从 Mutex 获取拥有所有权的锁守卫
-    pub fn lock_owned_guard(&self) -> Result<OwnedMutexGuard<T>> {
-        // 检查是否已毒化
-        if self.inner.poisoned.load(Ordering::Acquire) {
-            return Err(RtosError::MutexPoisoned);
-        }
-
-        loop {
-            // 尝试获取锁
-            if self.inner.locked.compare_exchange(
-                false,
-                true,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ).is_ok() {
-                // 成功获取锁
-                let current = Scheduler::get_current_task();
-                let task_id = current.get_taskid();
-                self.inner.state.owner.store(task_id, Ordering::Release);
-                
-                // 如果启用优先级继承，保存原始优先级
-                if self.inner.state.priority_inheritance {
-                    let mut orig_priority = self.inner.state.owner_original_priority.lock();
-                    *orig_priority = Some(current.get_priority());
-                }
-                
-                return Ok(OwnedMutexGuard { 
-                    mutex: Arc::clone(&self.inner),
-                });
-            }
-
-            // 锁被占用，加入等待队列并阻塞
-            let current = Scheduler::get_current_task();
-            let task_id = current.get_taskid();
-            let current_priority = current.get_priority();
-
-            {
-                let mut waiters = self.inner.waiters.lock();
-                if !waiters.push(task_id) {
-                    return Err(RtosError::WaiterQueueFull);
-                }
-            }
-
-            // 优先级继承
-            self.inner.state.propagate_priority(current_priority, 0);
-
-            let mutex_id = Arc::as_ptr(&self.inner) as usize;
-            Scheduler::get_current_task().block(crate::sync::event::Event::Mutex(mutex_id));
-            trigger_schedule();
-
-            if self.inner.poisoned.load(Ordering::Acquire) {
-                return Err(RtosError::MutexPoisoned);
-            }
-        }
+    pub fn lock_owned(&self) -> Result<OwnedMutexGuard<T>> {
+        let guard = self.lock()?;
+        let owned = OwnedMutexGuard {
+            mutex: self.inner.clone(),
+        };
+        core::mem::forget(guard);
+        Ok(owned)
     }
 
     /// 尝试获取拥有所有权的锁守卫���非阻塞）
     pub fn try_lock_owned(&self) -> Result<OwnedMutexGuard<T>> {
-        if self.inner.poisoned.load(Ordering::Acquire) {
-            return Err(RtosError::MutexPoisoned);
-        }
-
-        if self.inner.locked.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ).is_ok() {
-            let task_id = Scheduler::get_current_task().get_taskid();
-            self.inner.state.owner.store(task_id, Ordering::Release);
-            Ok(OwnedMutexGuard { 
-                mutex: Arc::clone(&self.inner),
-            })
-        } else {
-            Err(RtosError::WouldBlock)
-        }
+        let guard = self.try_lock()?;
+        let owned = OwnedMutexGuard {
+            mutex: self.inner.clone(),
+        };
+        core::mem::forget(guard);
+        Ok(owned)
     }
 }
 
@@ -923,7 +596,7 @@ impl<T> Mutex<T> {
 ///
 /// # 示例
 /// ```rust,no_run
-/// use neon_rtos2::sync::Mutex;
+/// use neon_rtos2::sync::{Mutex, MutexGuard};
 ///
 /// struct Data {
 ///     field1: i32,
@@ -932,11 +605,12 @@ impl<T> Mutex<T> {
 ///
 /// let mutex = Mutex::new(Data { field1: 42, field2: "hello".into() });
 /// let guard = mutex.lock().unwrap();
-/// 
+///
 /// // 映射到 field1
-/// let mapped = MutexGuard::map(guard, |data| &mut data.field1);
+/// let mut mapped = MutexGuard::map(guard, |data| &mut data.field1);
 /// *mapped = 100;
 /// ```
+#[must_use = "keep the guard alive while accessing the protected data"]
 pub struct MappedMutexGuard<'a, T, U> {
     data: *mut U,
     mutex: &'a Mutex<T>,
@@ -990,23 +664,26 @@ impl<'a, T> MutexGuard<'a, T> {
         let mutex = guard.mutex;
         let data = unsafe { &mut *mutex.inner.data.get() };
         let mapped_data = f(data) as *mut U;
-        
+
         // 阻止原始 guard 的 drop
         core::mem::forget(guard);
-        
+
         MappedMutexGuard::new(mapped_data, mutex)
     }
 
     /// 尝试将锁守卫映射到数据的一部分
     ///
     /// 如果映射函数返回 `None`，则返回原始守卫。
-    pub fn try_map<U, F>(guard: Self, f: F) -> core::result::Result<MappedMutexGuard<'a, T, U>, Self>
+    pub fn try_map<U, F>(
+        guard: Self,
+        f: F,
+    ) -> core::result::Result<MappedMutexGuard<'a, T, U>, Self>
     where
         F: FnOnce(&mut T) -> Option<&mut U>,
     {
         let mutex = guard.mutex;
         let data = unsafe { &mut *mutex.inner.data.get() };
-        
+
         match f(data) {
             Some(mapped_data) => {
                 let mapped_ptr = mapped_data as *mut U;
@@ -1027,14 +704,14 @@ impl<'a, T> MutexGuard<'a, T> {
 /// 实现 `Future` trait，允许在 async/await 上下文中获取锁。
 pub struct MutexLockFuture<'a, T> {
     mutex: &'a Mutex<T>,
-    registered: bool,
+    registration: Registration<'a>,
 }
 
 impl<'a, T> MutexLockFuture<'a, T> {
     fn new(mutex: &'a Mutex<T>) -> Self {
         Self {
             mutex,
-            registered: false,
+            registration: mutex.inner.waiters.registration(),
         }
     }
 }
@@ -1042,36 +719,12 @@ impl<'a, T> MutexLockFuture<'a, T> {
 impl<'a, T> core::future::Future for MutexLockFuture<'a, T> {
     type Output = Result<MutexGuard<'a, T>>;
 
-    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Self::Output> {
-        // 检查是否已毒化
-        if self.mutex.inner.poisoned.load(Ordering::Acquire) {
-            return core::task::Poll::Ready(Err(RtosError::MutexPoisoned));
-        }
-
-        // 尝试获取锁
-        if self.mutex.inner.locked.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ).is_ok() {
-            // 成功获取锁
-            let task_id = Scheduler::get_current_task().get_taskid();
-            self.mutex.inner.state.owner.store(task_id, Ordering::Release);
-            return core::task::Poll::Ready(Ok(MutexGuard { 
-                mutex: self.mutex, 
-                _marker: PhantomData 
-            }));
-        }
-
-        // 锁被占用，注册 waker
-        if !self.registered {
-            let mut async_waiters = self.mutex.inner.async_waiters.lock();
-            async_waiters.push_back(cx.waker().clone());
-            self.registered = true;
-        }
-
-        core::task::Poll::Pending
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        let mutex = self.mutex;
+        self.registration.poll_until(cx, || mutex.try_lock())
     }
 }
 
@@ -1087,7 +740,7 @@ impl<T> Mutex<T> {
     ///
     /// # 示例
     /// ```rust,no_run
-    /// use neon_rtos2::sync::Mutex;
+    /// use neon_rtos2::sync::{Mutex, MutexGuard};
     ///
     /// async fn example(mutex: Mutex<i32>) {
     ///     let guard = mutex.lock_async().await.unwrap();
@@ -1100,17 +753,20 @@ impl<T> Mutex<T> {
 
     /// 获取等待者数量（包括同步和异步等待者）
     pub fn waiter_count(&self) -> usize {
-        self.inner.waiters.lock().len() + self.inner.async_waiters.lock().len()
+        {
+            let (tasks, futures) = self.inner.waiters.counts();
+            tasks + futures
+        }
     }
 
     /// 获取同步等待者数量
     pub fn sync_waiter_count(&self) -> usize {
-        self.inner.waiters.lock().len()
+        self.inner.waiters.counts().0
     }
 
     /// 获取异步等待者数量
     pub fn async_waiter_count(&self) -> usize {
-        self.inner.async_waiters.lock().len()
+        self.inner.waiters.counts().1
     }
 }
 
@@ -1126,14 +782,7 @@ struct RwLockInner<T> {
     /// 0 = 无锁，>0 = 读锁数量，-1 = 写锁
     state: AtomicIsize,
     /// 写者等待队列（同步）
-    write_waiters: SpinMutex<WaiterList>,
-    /// 读者等待队列（同步）
-    read_waiters: SpinMutex<WaiterList>,
-    /// 异步写者等待队列
-    async_write_waiters: SpinMutex<VecDeque<Waker>>,
-    /// 异步读者等待队列
-    async_read_waiters: SpinMutex<VecDeque<Waker>>,
-    /// 是否已被毒化
+    waiters: WaitQueue,
     poisoned: AtomicBool,
 }
 
@@ -1148,10 +797,7 @@ impl<T> RwLockInner<T> {
         Self {
             data: UnsafeCell::new(data),
             state: AtomicIsize::new(0),
-            write_waiters: SpinMutex::new(WaiterList::new()),
-            read_waiters: SpinMutex::new(WaiterList::new()),
-            async_write_waiters: SpinMutex::new(VecDeque::new()),
-            async_read_waiters: SpinMutex::new(VecDeque::new()),
+            waiters: WaitQueue::new(),
             poisoned: AtomicBool::new(false),
         }
     }
@@ -1217,48 +863,9 @@ impl<T> RwLock<T> {
     /// - `Ok(RwLockReadGuard)`: 成功获取读锁
     /// - `Err(RtosError::MutexPoisoned)`: 锁已被毒化
     pub fn read(&self) -> Result<RwLockReadGuard<'_, T>> {
-        // 检查是否已毒化
-        if self.inner.poisoned.load(Ordering::Acquire) {
-            return Err(RtosError::MutexPoisoned);
-        }
-
-        loop {
-            let state = self.inner.state.load(Ordering::Acquire);
-            
-            // 如果没有写者（state >= 0），尝试增加读者计数
-            if state >= 0 {
-                if self.inner.state.compare_exchange(
-                    state,
-                    state + 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ).is_ok() {
-                    return Ok(RwLockReadGuard { lock: self, _marker: PhantomData });
-                }
-                // CAS 失败，重试
-                continue;
-            }
-
-            // 有写者，需要阻塞
-            let current = Scheduler::get_current_task();
-            let task_id = current.get_taskid();
-
-            {
-                let mut read_waiters = self.inner.read_waiters.lock();
-                if !read_waiters.push(task_id) {
-                    return Err(RtosError::WaiterQueueFull);
-                }
-            }
-
-            let lock_id = Arc::as_ptr(&self.inner) as usize;
-            Scheduler::get_current_task().block(crate::sync::event::Event::Mutex(lock_id));
-            trigger_schedule();
-
-            // 被唤醒后检查是否毒化
-            if self.inner.poisoned.load(Ordering::Acquire) {
-                return Err(RtosError::MutexPoisoned);
-            }
-        }
+        self.inner
+            .waiters
+            .wait_until(Event::Mutex(self.id()), None, || self.try_read(), || {})
     }
 
     /// 尝试获取读锁（非阻塞）
@@ -1274,15 +881,18 @@ impl<T> RwLock<T> {
 
         loop {
             let state = self.inner.state.load(Ordering::Acquire);
-            
+
             if state >= 0 {
-                if self.inner.state.compare_exchange(
-                    state,
-                    state + 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ).is_ok() {
-                    return Ok(RwLockReadGuard { lock: self, _marker: PhantomData });
+                if self
+                    .inner
+                    .state
+                    .compare_exchange(state, state + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Ok(RwLockReadGuard {
+                        lock: self,
+                        _marker: PhantomData,
+                    });
                 }
                 continue;
             }
@@ -1299,40 +909,9 @@ impl<T> RwLock<T> {
     /// - `Ok(RwLockWriteGuard)`: 成功获取写锁
     /// - `Err(RtosError::MutexPoisoned)`: 锁已被毒化
     pub fn write(&self) -> Result<RwLockWriteGuard<'_, T>> {
-        if self.inner.poisoned.load(Ordering::Acquire) {
-            return Err(RtosError::MutexPoisoned);
-        }
-
-        loop {
-            // 尝试从 0 变为 -1（获取写锁）
-            if self.inner.state.compare_exchange(
-                0,
-                -1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ).is_ok() {
-                return Ok(RwLockWriteGuard { lock: self, _marker: PhantomData });
-            }
-
-            // 锁被占用，需要阻塞
-            let current = Scheduler::get_current_task();
-            let task_id = current.get_taskid();
-
-            {
-                let mut write_waiters = self.inner.write_waiters.lock();
-                if !write_waiters.push(task_id) {
-                    return Err(RtosError::WaiterQueueFull);
-                }
-            }
-
-            let lock_id = Arc::as_ptr(&self.inner) as usize;
-            Scheduler::get_current_task().block(crate::sync::event::Event::Mutex(lock_id));
-            trigger_schedule();
-
-            if self.inner.poisoned.load(Ordering::Acquire) {
-                return Err(RtosError::MutexPoisoned);
-            }
-        }
+        self.inner
+            .waiters
+            .wait_until(Event::Mutex(self.id()), None, || self.try_write(), || {})
     }
 
     /// 尝试获取写锁（非阻塞）
@@ -1346,13 +925,16 @@ impl<T> RwLock<T> {
             return Err(RtosError::MutexPoisoned);
         }
 
-        if self.inner.state.compare_exchange(
-            0,
-            -1,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ).is_ok() {
-            Ok(RwLockWriteGuard { lock: self, _marker: PhantomData })
+        if self
+            .inner
+            .state
+            .compare_exchange(0, -1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            Ok(RwLockWriteGuard {
+                lock: self,
+                _marker: PhantomData,
+            })
         } else {
             Err(RtosError::WouldBlock)
         }
@@ -1391,101 +973,23 @@ impl<T> RwLock<T> {
 
     /// 内部方法：释放读锁
     fn unlock_read(&self) {
-        let prev = self.inner.state.fetch_sub(1, Ordering::Release);
-        
-        // 如果这是最后一个读者，尝试唤醒写者
-        if prev == 1 {
-            // 首先尝试唤醒同步写者
-            let task_id = {
-                let mut write_waiters = self.inner.write_waiters.lock();
-                write_waiters.pop_front()
-            };
-
-            if let Some(task_id) = task_id {
-                crate::kernel::task::Task::for_each(|task, id| {
-                    if id == task_id {
-                        if let TaskState::Blocked(_) = task.get_state() {
-                            task.ready();
-                        }
-                    }
-                });
-                return;
+        critical_section::with(|cs| {
+            if self.inner.state.fetch_sub(1, Ordering::Release) == 1 {
+                self.inner.waiters.take_all(cs, Event::Mutex(self.id()))
+            } else {
+                WakeBatch::default()
             }
-
-            // 然后尝试唤醒异步写者
-            let waker = {
-                let mut async_write_waiters = self.inner.async_write_waiters.lock();
-                async_write_waiters.pop_front()
-            };
-
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
+        })
+        .wake();
     }
 
     /// 内部方法：释放写锁
     fn unlock_write(&self) {
-        self.inner.state.store(0, Ordering::Release);
-
-        // 优先唤醒所有等待的读者
-        let read_task_ids: [Option<usize>; 16];
-        {
-            let mut read_waiters = self.inner.read_waiters.lock();
-            read_task_ids = read_waiters.drain();
-        }
-
-        let mut woke_readers = false;
-        for task_id in read_task_ids.iter().filter_map(|&id| id) {
-            woke_readers = true;
-            crate::kernel::task::Task::for_each(|task, id| {
-                if id == task_id {
-                    if let TaskState::Blocked(_) = task.get_state() {
-                        task.ready();
-                    }
-                }
-            });
-        }
-
-        // 唤醒异步读者
-        let async_read_wakers: VecDeque<Waker>;
-        {
-            let mut async_read_waiters = self.inner.async_read_waiters.lock();
-            async_read_wakers = core::mem::take(&mut *async_read_waiters);
-        }
-
-        for waker in async_read_wakers {
-            woke_readers = true;
-            waker.wake();
-        }
-
-        // 如果没有读者等待，唤醒一个写者
-        if !woke_readers {
-            let task_id = {
-                let mut write_waiters = self.inner.write_waiters.lock();
-                write_waiters.pop_front()
-            };
-
-            if let Some(task_id) = task_id {
-                crate::kernel::task::Task::for_each(|task, id| {
-                    if id == task_id {
-                        if let TaskState::Blocked(_) = task.get_state() {
-                            task.ready();
-                        }
-                    }
-                });
-                return;
-            }
-
-            let waker = {
-                let mut async_write_waiters = self.inner.async_write_waiters.lock();
-                async_write_waiters.pop_front()
-            };
-
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
+        critical_section::with(|cs| {
+            self.inner.state.store(0, Ordering::Release);
+            self.inner.waiters.take_all(cs, Event::Mutex(self.id()))
+        })
+        .wake();
     }
 }
 
@@ -1500,7 +1004,7 @@ impl<T: core::fmt::Debug> core::fmt::Debug for RwLock<T> {
         let mut d = f.debug_struct("RwLock");
         d.field("id", &self.id());
         d.field("poisoned", &self.is_poisoned());
-        
+
         let state = self.inner.state.load(Ordering::Relaxed);
         if state == -1 {
             d.field("state", &"write_locked");
@@ -1509,12 +1013,13 @@ impl<T: core::fmt::Debug> core::fmt::Debug for RwLock<T> {
         } else {
             d.field("state", &"unlocked");
         }
-        
+
         d.finish()
     }
 }
 
 /// 读锁守卫
+#[must_use = "keep the guard alive while accessing the protected data"]
 pub struct RwLockReadGuard<'a, T> {
     lock: &'a RwLock<T>,
     _marker: PhantomData<*const ()>,
@@ -1545,6 +1050,7 @@ impl<T: core::fmt::Debug> core::fmt::Debug for RwLockReadGuard<'_, T> {
 }
 
 /// 写锁守卫
+#[must_use = "keep the guard alive while accessing the protected data"]
 pub struct RwLockWriteGuard<'a, T> {
     lock: &'a RwLock<T>,
     _marker: PhantomData<*const ()>,
@@ -1583,93 +1089,54 @@ impl<T: core::fmt::Debug> core::fmt::Debug for RwLockWriteGuard<'_, T> {
 /// 异步读锁 Future
 pub struct RwLockReadFuture<'a, T> {
     lock: &'a RwLock<T>,
-    registered: bool,
+    registration: Registration<'a>,
 }
 
 impl<'a, T> RwLockReadFuture<'a, T> {
     fn new(lock: &'a RwLock<T>) -> Self {
-        Self { lock, registered: false }
+        Self {
+            lock,
+            registration: lock.inner.waiters.registration(),
+        }
     }
 }
 
 impl<'a, T> core::future::Future for RwLockReadFuture<'a, T> {
     type Output = Result<RwLockReadGuard<'a, T>>;
 
-    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Self::Output> {
-        if self.lock.inner.poisoned.load(Ordering::Acquire) {
-            return core::task::Poll::Ready(Err(RtosError::MutexPoisoned));
-        }
-
-        loop {
-            let state = self.lock.inner.state.load(Ordering::Acquire);
-            
-            if state >= 0 {
-                if self.lock.inner.state.compare_exchange(
-                    state,
-                    state + 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ).is_ok() {
-                    return core::task::Poll::Ready(Ok(RwLockReadGuard { 
-                        lock: self.lock, 
-                        _marker: PhantomData 
-                    }));
-                }
-                continue;
-            }
-
-            // 有写者，注册 waker
-            if !self.registered {
-                let mut async_read_waiters = self.lock.inner.async_read_waiters.lock();
-                async_read_waiters.push_back(cx.waker().clone());
-                self.registered = true;
-            }
-
-            return core::task::Poll::Pending;
-        }
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        let lock = self.lock;
+        self.registration.poll_until(cx, || lock.try_read())
     }
 }
 
 /// 异步写锁 Future
 pub struct RwLockWriteFuture<'a, T> {
     lock: &'a RwLock<T>,
-    registered: bool,
+    registration: Registration<'a>,
 }
 
 impl<'a, T> RwLockWriteFuture<'a, T> {
     fn new(lock: &'a RwLock<T>) -> Self {
-        Self { lock, registered: false }
+        Self {
+            lock,
+            registration: lock.inner.waiters.registration(),
+        }
     }
 }
 
 impl<'a, T> core::future::Future for RwLockWriteFuture<'a, T> {
     type Output = Result<RwLockWriteGuard<'a, T>>;
 
-    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Self::Output> {
-        if self.lock.inner.poisoned.load(Ordering::Acquire) {
-            return core::task::Poll::Ready(Err(RtosError::MutexPoisoned));
-        }
-
-        if self.lock.inner.state.compare_exchange(
-            0,
-            -1,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ).is_ok() {
-            return core::task::Poll::Ready(Ok(RwLockWriteGuard { 
-                lock: self.lock, 
-                _marker: PhantomData 
-            }));
-        }
-
-        // 锁被占用，注册 waker
-        if !self.registered {
-            let mut async_write_waiters = self.lock.inner.async_write_waiters.lock();
-            async_write_waiters.push_back(cx.waker().clone());
-            self.registered = true;
-        }
-
-        core::task::Poll::Pending
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        let lock = self.lock;
+        self.registration.poll_until(cx, || lock.try_write())
     }
 }
 
@@ -1684,23 +1151,23 @@ mod tests {
     #[serial]
     fn test_mutex_v2_basic() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex = Mutex::new(42);
-        
+
         // 获取锁并读取
         {
             let guard = mutex.lock().unwrap();
             assert_eq!(*guard, 42);
         }
-        
+
         // 获取锁并修改
         {
             let mut guard = mutex.lock().unwrap();
             *guard = 100;
         }
-        
+
         // 验证修改
         {
             let guard = mutex.lock().unwrap();
@@ -1712,20 +1179,20 @@ mod tests {
     #[serial]
     fn test_mutex_v2_try_lock() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex = Mutex::new(0);
-        
+
         // 第一次 try_lock 应该成功
         let guard = mutex.try_lock().unwrap();
         assert_eq!(*guard, 0);
-        
+
         // 锁被持有时，try_lock 应该失败
         // 注意：在单任务测试中，我们持有 guard，所以无法再次获取
         // 这里我们只测试基本功能
         drop(guard);
-        
+
         // 释放后应该能再次获取
         let guard2 = mutex.try_lock().unwrap();
         assert_eq!(*guard2, 0);
@@ -1735,21 +1202,21 @@ mod tests {
     #[serial]
     fn test_mutex_v2_clone() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex1 = Mutex::new(0);
         let mutex2 = mutex1.clone();
-        
+
         // 两个句柄指向同一个互斥锁
         assert_eq!(mutex1.id(), mutex2.id());
-        
+
         // 通过一个修改，另一个可以看到
         {
             let mut guard = mutex1.lock().unwrap();
             *guard = 42;
         }
-        
+
         {
             let guard = mutex2.lock().unwrap();
             assert_eq!(*guard, 42);
@@ -1760,23 +1227,23 @@ mod tests {
     #[serial]
     fn test_mutex_v2_with_lock() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex = Mutex::new(vec![1, 2, 3]);
-        
+
         // 使用 with_lock 闭包风格
-        let sum = mutex.with_lock(|data| {
-            data.iter().sum::<i32>()
-        }).unwrap();
-        
+        let sum = mutex.with_lock(|data| data.iter().sum::<i32>()).unwrap();
+
         assert_eq!(sum, 6);
-        
+
         // 修改数据
-        mutex.with_lock(|data| {
-            data.push(4);
-        }).unwrap();
-        
+        mutex
+            .with_lock(|data| {
+                data.push(4);
+            })
+            .unwrap();
+
         // 验证修改
         let len = mutex.with_lock(|data| data.len()).unwrap();
         assert_eq!(len, 4);
@@ -1786,19 +1253,19 @@ mod tests {
     #[serial]
     fn test_mutex_v2_is_locked() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex = Mutex::new(0);
-        
+
         assert!(!mutex.is_locked());
-        
+
         {
             let _guard = mutex.lock().unwrap();
             assert!(mutex.is_locked());
             assert!(mutex.is_locked_by_current());
         }
-        
+
         assert!(!mutex.is_locked());
     }
 
@@ -1806,11 +1273,11 @@ mod tests {
     #[serial]
     fn test_mutex_v2_default() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex: Mutex<i32> = Mutex::default();
-        
+
         let guard = mutex.lock().unwrap();
         assert_eq!(*guard, 0); // i32 的默认值是 0
     }
@@ -1819,11 +1286,11 @@ mod tests {
     #[serial]
     fn test_mutex_v2_debug() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex = Mutex::new(42);
-        
+
         let debug_str = format!("{:?}", mutex);
         assert!(debug_str.contains("Mutex"));
         assert!(debug_str.contains("42"));
@@ -1831,20 +1298,20 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_mutex_v2_try_lock_timeout() {
+    fn test_mutex_v2_lock_timeout_immediate() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex = Mutex::new(42);
-        
+
         // 第一次获取应该成功
-        let guard = mutex.try_lock_timeout(0).unwrap();
+        let guard = mutex.lock_timeout(Ticks(0)).unwrap();
         assert_eq!(*guard, 42);
         drop(guard);
-        
+
         // 释放后再次获取应该成功
-        let guard2 = mutex.try_lock_timeout(100).unwrap();
+        let guard2 = mutex.lock_timeout(Ticks(100)).unwrap();
         assert_eq!(*guard2, 42);
     }
 
@@ -1852,18 +1319,18 @@ mod tests {
     #[serial]
     fn test_mutex_v2_lock_timeout() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex = Mutex::new(0);
-        
+
         // 获取锁
-        let guard = mutex.lock_timeout(1000).unwrap();
+        let guard = mutex.lock_timeout(Ticks(1000)).unwrap();
         assert_eq!(*guard, 0);
         drop(guard);
-        
+
         // 再次获取应该成功
-        let guard2 = mutex.lock_timeout(1000).unwrap();
+        let guard2 = mutex.lock_timeout(Ticks(1000)).unwrap();
         assert_eq!(*guard2, 0);
     }
 
@@ -1871,16 +1338,16 @@ mod tests {
     #[serial]
     fn test_mutex_v2_owned_guard() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex = Mutex::new(42);
-        
+
         // 获取 owned guard
-        let guard = mutex.lock_owned_guard().unwrap();
+        let guard = mutex.lock_owned().unwrap();
         assert_eq!(*guard, 42);
         drop(guard);
-        
+
         // 再次获取应该成功
         let guard2 = mutex.try_lock_owned().unwrap();
         assert_eq!(*guard2, 42);
@@ -1890,23 +1357,26 @@ mod tests {
     #[serial]
     fn test_mutex_v2_mapped_guard() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         struct Data {
             field1: i32,
             field2: i32,
         }
-        
-        let mutex = Mutex::new(Data { field1: 10, field2: 20 });
-        
+
+        let mutex = Mutex::new(Data {
+            field1: 10,
+            field2: 20,
+        });
+
         // 映射到 field1
         {
             let guard = mutex.lock().unwrap();
             let mut mapped = MutexGuard::map(guard, |data| &mut data.field1);
             *mapped = 100;
         }
-        
+
         // 验证修改
         {
             let guard = mutex.lock().unwrap();
@@ -1919,11 +1389,11 @@ mod tests {
     #[serial]
     fn test_mutex_v2_try_map() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         let mutex = Mutex::new(Some(42i32));
-        
+
         // 成功映射
         {
             let guard = mutex.lock().unwrap();
@@ -1932,19 +1402,19 @@ mod tests {
             let mut mapped = mapped.unwrap();
             *mapped = 100;
         }
-        
+
         // 验证修改
         {
             let guard = mutex.lock().unwrap();
             assert_eq!(*guard, Some(100));
         }
-        
+
         // 设置为 None
         {
             let mut guard = mutex.lock().unwrap();
             *guard = None;
         }
-        
+
         // 映射失败
         {
             let guard = mutex.lock().unwrap();
@@ -1957,13 +1427,13 @@ mod tests {
     #[serial]
     fn test_mutex_v2_priority_inheritance() {
         kernel_init();
-        Task::new("test", |_| {}).unwrap();
+        Task::new("test", || {}).unwrap();
         crate::kernel::scheduler::Scheduler::start();
-        
+
         // 创建带优先级继承的互斥锁
         let mutex = Mutex::with_priority_inheritance(42);
         assert!(mutex.has_priority_inheritance());
-        
+
         // 基本功能测试
         {
             let guard = mutex.lock().unwrap();
@@ -1974,17 +1444,25 @@ mod tests {
     #[test]
     #[serial]
     fn test_nested_priority_inheritance() {
-        use crate::kernel::task::{Task, Priority};
-        use crate::kernel::scheduler::Scheduler;
         use crate::compat::Arc;
-        use core::sync::atomic::Ordering;
+        use crate::kernel::scheduler::Scheduler;
+        use crate::kernel::task::{Priority, Task};
 
         kernel_init();
         Scheduler::enable_priority_scheduling();
 
-        let mut task_l = Task::builder("L").priority(Priority::Low).spawn(|_| {}).unwrap();
-        let mut task_m = Task::builder("M").priority(Priority::Normal).spawn(|_| {}).unwrap();
-        let mut task_h = Task::builder("H").priority(Priority::High).spawn(|_| {}).unwrap();
+        let mut task_l = Task::builder("L")
+            .priority(Priority::Low)
+            .spawn(|| {})
+            .unwrap();
+        let mut task_m = Task::builder("M")
+            .priority(Priority::Normal)
+            .spawn(|| {})
+            .unwrap();
+        let mut task_h = Task::builder("H")
+            .priority(Priority::High)
+            .spawn(|| {})
+            .unwrap();
 
         let m1 = Arc::new(Mutex::with_priority_inheritance(1));
         let m2 = Arc::new(Mutex::with_priority_inheritance(2));
@@ -2001,20 +1479,53 @@ mod tests {
         let _guard2 = m2.try_lock().unwrap();
 
         // 模拟任务 M 尝试获取 M1，会失败并阻塞，触发优先级继承
-        m1.inner.state.propagate_priority(task_m.get_priority(), 0);
-        task_m.block(crate::sync::event::Event::Mutex(Arc::as_ptr(&m1.inner) as usize));
+        task_m.block(crate::sync::event::Event::Mutex(
+            Arc::as_ptr(&m1.inner) as usize
+        ));
+        m1.donate_to_owner();
 
         // M 被阻塞在 M1 上，L 继承了 Normal 优先级
         assert_eq!(task_l.get_priority(), Priority::Normal);
 
         // 模拟任务 H 尝试获取 M2
         crate::kernel::scheduler::set_current_task_id_for_test(task_h.get_taskid());
-        m2.inner.state.propagate_priority(task_h.get_priority(), 0);
-        task_h.block(crate::sync::event::Event::Mutex(Arc::as_ptr(&m2.inner) as usize));
+        task_h.block(crate::sync::event::Event::Mutex(
+            Arc::as_ptr(&m2.inner) as usize
+        ));
+        m2.donate_to_owner();
 
         // H 被阻塞在 M2 上，M 继承了 High，同时 L 递归继承了 High！
         assert_eq!(task_m.get_priority(), Priority::High);
         assert_eq!(task_l.get_priority(), Priority::High);
+        task_l.set_priority(Priority::Idle);
+        assert_eq!(task_l.get_priority(), Priority::High);
+        task_h.ready(); // A timeout must revoke both levels of inheritance.
+        assert_eq!(task_m.get_priority(), Priority::Normal);
+        assert_eq!(task_l.get_priority(), Priority::Normal);
+        task_m.ready();
+        assert_eq!(task_l.get_priority(), Priority::Idle);
+    }
+
+    #[test]
+    #[serial]
+    fn priority_inheritance_ignores_unknown_event_ids() {
+        kernel_init();
+        use crate::kernel::task::Priority;
+        let mut owner = Task::builder("owner")
+            .priority(Priority::Low)
+            .spawn(|| {})
+            .unwrap();
+        crate::kernel::scheduler::set_current_task_id_for_test(owner.0);
+        let mutex = Mutex::with_priority_inheritance(0);
+        let _guard = mutex.try_lock().unwrap();
+        owner.block(crate::sync::event::Event::Mutex(1));
+        let mut waiter = Task::builder("waiter")
+            .priority(Priority::High)
+            .spawn(|| {})
+            .unwrap();
+        crate::kernel::scheduler::set_current_task_id_for_test(waiter.0);
+        waiter.block(Event::Mutex(mutex.id()));
+        mutex.donate_to_owner();
+        assert_eq!(owner.get_priority(), Priority::High);
     }
 }
-

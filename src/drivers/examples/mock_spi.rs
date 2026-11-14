@@ -13,7 +13,7 @@
 //!
 //! ```rust
 //! use neon_rtos2::drivers::examples::MockSpi;
-//! use neon_rtos2::drivers::{Device, Spi, SpiConfig, SpiMode};
+//! use neon_rtos2::drivers::{Device, Configure, Spi, SpiConfig, SpiMode};
 //!
 //! let mut spi = MockSpi::new();
 //! spi.init().unwrap();
@@ -33,7 +33,7 @@
 //! ```
 
 use crate::drivers::{
-    Device, Spi,
+    Device, Configure, Spi,
     SpiConfig, SpiMode,
     DeviceError,
 };
@@ -245,7 +245,8 @@ impl Device for MockSpi {
     }
 }
 
-impl Spi for MockSpi {
+impl Configure for MockSpi {
+    type Config = SpiConfig;
     fn configure(&mut self, config: SpiConfig) -> Result<(), Self::Error> {
         if !self.initialized {
             return Err(DeviceError::NotInitialized);
@@ -257,6 +258,9 @@ impl Spi for MockSpi {
         Ok(())
     }
 
+}
+
+impl Spi for MockSpi {
     fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
         if !self.initialized {
             return Err(DeviceError::NotInitialized);

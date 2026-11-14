@@ -77,15 +77,15 @@
 //!     name: Uart0,
 //!     base_addr: 0x4000_0000,
 //!     registers: {
-//!         data: u32 @ 0x00,
-//!         status: u32 @ 0x04,
-//!         control: u32 @ 0x08,
+//!         data: u32, 0x00;
+//!         status: u32, 0x04;
+//!         control: u32, 0x08;
 //!     }
 //! }
 //!
 //! let uart = Uart0::new();
-//! let status = uart.status();
-//! uart.data_write(0x55);
+//! let status = unsafe { uart.status() };
+//! unsafe { uart.data_write(0x55) };
 //! ```
 //!
 //! ### 使用位域宏
@@ -102,7 +102,7 @@
 //!     }
 //! }
 //!
-//! let status = UartStatus::from_raw(uart.status());
+//! let status = UartStatus::from_raw(1);
 //! if status.tx_empty() {
 //!     // 可以发送数据
 //! }
@@ -120,6 +120,9 @@ pub use traits::{
     Read,
     Write,
     ReadWrite,
+    TransferError,
+    Configure,
+    SerialPort,
     AsyncRead,
     AsyncWrite,
     AsyncReadWrite,

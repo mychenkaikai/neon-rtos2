@@ -1,5 +1,28 @@
+/// 通用设备错误
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceError {
+    Unsupported,
+    /// 设备未初始化
+    NotInitialized,
+    /// 设备忙
+    Busy,
+    /// 超时
+    Timeout,
+    /// 无效参数
+    InvalidParameter,
+    /// 通信错误
+    CommunicationError,
+    /// 设备不存在
+    NotFound,
+    /// 缓冲区溢出
+    BufferOverflow,
+    /// 其他错误
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RtosError {
+    Device(DeviceError),
     // 任务相关
     TaskNotFound,
     TaskSlotsFull,
@@ -48,6 +71,7 @@ pub enum RtosError {
 impl core::fmt::Display for RtosError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            RtosError::Device(cause) => write!(f, "Device error: {cause:?}"),
             // 任务相关
             RtosError::TaskNotFound => write!(f, "Task not found"),
             RtosError::TaskSlotsFull => write!(f, "Task slots full"),
@@ -96,3 +120,7 @@ impl core::fmt::Display for RtosError {
 }
 
 pub type Result<T> = core::result::Result<T, RtosError>;
+
+impl From<DeviceError> for RtosError {
+    fn from(error: DeviceError) -> Self { Self::Device(error) }
+}

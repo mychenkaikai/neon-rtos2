@@ -16,6 +16,10 @@ fn main() {
         println!("cargo:rerun-if-changed=memory.x");
         println!("cargo:rustc-link-arg=--nmagic");
         println!("cargo:rustc-link-arg=-Tlink.x");
+        // Only the latency firmware injects a software-pended interrupt at CPSID.
+        println!("cargo:rustc-link-arg-bin=wait_latency=--wrap=__cpsid");
+        println!("cargo:rustc-link-arg-bin=wait_latency=--wrap=SysTick");
+        println!("cargo:rustc-link-arg-bin=wait_latency=--wrap=__cpsie");
     } else {
         println!("Skipping memory.x for x86_64 target");
     }

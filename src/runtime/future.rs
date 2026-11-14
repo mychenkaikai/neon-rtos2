@@ -2,13 +2,15 @@
 //!
 //! 提供常用的 Future 实现，包括异步信号量、异步定时器等。
 
+use crate::kernel::time::systick::Ticks;
+use crate::kernel::time::systick::{Deadline, Systick};
+use crate::kernel::time::timer::Timer;
+use crate::sync::wait::AsyncWaiters;
+use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use alloc::collections::VecDeque;
-use spin::Mutex;
-use crate::kernel::time::timer::Timer;
-use crate::kernel::time::systick::Systick;
+use critical_section::Mutex;
 
 // ============================================================================
 // 异步信号量
@@ -28,95 +30,80 @@ use crate::kernel::time::systick::Systick;
 /// async fn producer() {
 ///     loop {
 ///         // 生产数据...
-///         SIGNAL.signal();
-///         sleep(100).await;
+///         SIGNAL.send();
+///         sleep(neon_rtos2::prelude::Ticks(100)).await;
 ///     }
 /// }
 ///
 /// // 消费者
 /// async fn consumer() {
 ///     loop {
-///         SIGNAL.wait().await;
+///         SIGNAL.wait_async().await;
 ///         // 消费数据...
 ///     }
 /// }
 /// ```
 pub struct AsyncSignal {
-    /// 等待队列
-    waiters: Mutex<VecDeque<Waker>>,
-    /// 信号计数
-    count: Mutex<usize>,
+    state: Mutex<RefCell<AsyncSignalState>>,
+}
+
+struct AsyncSignalState {
+    count: usize,
+    waiters: AsyncWaiters,
 }
 
 impl AsyncSignal {
-    /// 创建新的异步信号量
     pub const fn new() -> Self {
         Self {
-            waiters: Mutex::new(VecDeque::new()),
-            count: Mutex::new(0),
+            state: Mutex::new(RefCell::new(AsyncSignalState {
+                count: 0,
+                waiters: AsyncWaiters::new(),
+            })),
         }
     }
 
-    /// 发送信号
-    ///
-    /// 增加信号计数，并唤醒一个等待的任务。
-    pub fn signal(&self) {
-        let mut count = self.count.lock();
-        *count += 1;
-        drop(count);
-        
-        // 唤醒一个等待者
-        let mut waiters = self.waiters.lock();
-        if let Some(waker) = waiters.pop_front() {
+    pub fn send(&self) {
+        let waker = critical_section::with(|cs| {
+            let mut state = self.state.borrow_ref_mut(cs);
+            state.count = state.count.saturating_add(1);
+            state.waiters.pop()
+        });
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
 
-    /// 发送多个信号
-    ///
-    /// # 参数
-    /// - `n`: 信号数量
-    pub fn signal_n(&self, n: usize) {
-        let mut count = self.count.lock();
-        *count += n;
-        drop(count);
-        
-        // 唤醒所有等待者
-        let mut waiters = self.waiters.lock();
-        for _ in 0..n {
-            if let Some(waker) = waiters.pop_front() {
-                waker.wake();
-            } else {
-                break;
-            }
+    pub fn send_many(&self, n: usize) {
+        let wakers: alloc::vec::Vec<Waker> = critical_section::with(|cs| {
+            let mut state = self.state.borrow_ref_mut(cs);
+            state.count = state.count.saturating_add(n);
+            (0..n).map_while(|_| state.waiters.pop()).collect()
+        });
+        for waker in wakers {
+            waker.wake();
         }
     }
 
-    /// 异步等待信号
-    ///
-    /// 返回一个 Future，在信号到达时完成。
-    pub fn wait(&self) -> SignalFuture<'_> {
-        SignalFuture { signal: self }
+    pub fn wait_async(&self) -> SignalFuture<'_> {
+        SignalFuture {
+            signal: self,
+            token: None,
+        }
     }
 
-    /// 尝试获取信号（非阻塞）
-    ///
-    /// # 返回值
-    /// - `true`: 成功获取信号
-    /// - `false`: 没有可用信号
     pub fn try_wait(&self) -> bool {
-        let mut count = self.count.lock();
-        if *count > 0 {
-            *count -= 1;
+        critical_section::with(|cs| {
+            let mut state = self.state.borrow_ref_mut(cs);
+            if state.count == 0 {
+                return false;
+            }
+            state.count -= 1;
             true
-        } else {
-            false
-        }
+        })
     }
 
-    /// 获取当前信号计数
     pub fn count(&self) -> usize {
-        *self.count.lock()
+        critical_section::with(|cs| self.state.borrow_ref(cs).count)
     }
 }
 
@@ -131,24 +118,49 @@ impl Default for AsyncSignal {
 /// 等待异步信号的 Future 实现
 pub struct SignalFuture<'a> {
     signal: &'a AsyncSignal,
+    token: Option<u64>,
 }
 
-impl<'a> Future for SignalFuture<'a> {
+impl Future for SignalFuture<'_> {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // 尝试获取信号
-        let mut count = self.signal.count.lock();
-        
-        if *count > 0 {
-            *count -= 1;
-            Poll::Ready(())
-        } else {
-            // 没有信号，注册 waker
-            drop(count);
-            let mut waiters = self.signal.waiters.lock();
-            waiters.push_back(cx.waker().clone());
-            Poll::Pending
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let wait = self.get_mut();
+        let mut incoming = Some(cx.waker().clone());
+        let (poll, obsolete) = critical_section::with(|cs| {
+            let mut state = wait.signal.state.borrow_ref_mut(cs);
+            if state.count > 0 {
+                state.count -= 1;
+                (Poll::Ready(()), state.waiters.remove(wait.token.take()))
+            } else {
+                let old = state
+                    .waiters
+                    .register(&mut wait.token, incoming.take().unwrap());
+                (Poll::Pending, old)
+            }
+        });
+        drop(obsolete);
+        poll
+    }
+}
+
+impl Drop for SignalFuture<'_> {
+    fn drop(&mut self) {
+        let Some(id) = self.token.take() else { return };
+        let (removed, next) = critical_section::with(|cs| {
+            let mut state = self.signal.state.borrow_ref_mut(cs);
+            let removed = state.waiters.remove(Some(id));
+            // A sender already dequeued this waiter. Forward its unconsumed permit.
+            let next = if removed.is_none() && state.count > 0 {
+                state.waiters.pop()
+            } else {
+                None
+            };
+            (removed, next)
+        });
+        drop(removed);
+        if let Some(waker) = next {
+            waker.wake();
         }
     }
 }
@@ -162,7 +174,7 @@ impl<'a> Future for SignalFuture<'a> {
 /// 返回一个在指定时间后完成的 Future。
 ///
 /// # 参数
-/// - `duration_ms`: 睡眠时间（毫秒）
+/// - `duration`: 睡眠时间（Duration 或 Ticks）
 ///
 /// # 示例
 ///
@@ -170,12 +182,28 @@ impl<'a> Future for SignalFuture<'a> {
 /// async fn periodic_task() {
 ///     loop {
 ///         // 执行任务...
-///         sleep(100).await;
+///         sleep(neon_rtos2::prelude::Ticks(100)).await;
 ///     }
 /// }
 /// ```
-pub fn sleep(duration_ms: usize) -> Sleep {
-    Sleep::new(duration_ms)
+pub fn sleep(duration: impl Into<Ticks>) -> Sleep {
+    Sleep::new(duration)
+}
+
+/// Wait at most `duration` for an operation. The deadline starts at construction.
+/// If both branches are ready in the same poll, the operation wins. Expiry
+/// drops the supplied future before returning, releasing its wait registration.
+pub fn timeout<F: Future>(
+    duration: impl Into<Ticks>,
+    operation: F,
+) -> impl Future<Output = crate::error::Result<F::Output>> {
+    let wait = super::select2(operation, sleep(duration));
+    async move {
+        match wait.await {
+            super::Either::First(value) => Ok(value),
+            super::Either::Second(()) => Err(crate::error::RtosError::Timeout),
+        }
+    }
 }
 
 /// 睡眠 Future
@@ -183,36 +211,28 @@ pub fn sleep(duration_ms: usize) -> Sleep {
 /// 在指定时间后完成的 Future
 pub struct Sleep {
     /// 目标时间（tick）
-    deadline: usize,
-    /// 是否已注册 waker
-    registered: bool,
+    deadline: Deadline,
     /// 异步睡眠等待槽位 ID
-    waiter_id: Option<usize>,
+    waiter_id: Option<u64>,
 }
 
 impl Sleep {
     /// 创建新的睡眠 Future
-    pub fn new(duration_ms: usize) -> Self {
+    pub fn new(duration: impl Into<Ticks>) -> Self {
         Self {
-            deadline: Systick::get_current_time() + duration_ms,
-            registered: false,
+            deadline: Deadline::after(duration.into().0),
             waiter_id: None,
         }
     }
 
     /// 获取剩余时间
-    pub fn remaining(&self) -> usize {
-        let current = Systick::get_current_time();
-        if current >= self.deadline {
-            0
-        } else {
-            self.deadline - current
-        }
+    pub fn remaining(&self) -> Ticks {
+        Ticks(self.deadline.remaining_at(Systick::now()))
     }
 
     /// 检查是否已超时
     pub fn is_elapsed(&self) -> bool {
-        Systick::get_current_time() >= self.deadline
+        self.deadline.elapsed()
     }
 }
 
@@ -220,16 +240,24 @@ impl Future for Sleep {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if Systick::get_current_time() >= self.deadline {
-            Poll::Ready(())
-        } else {
-            if !self.registered {
-                let waiter_id = Timer::register_async_sleep(self.deadline, cx.waker().clone());
-                self.waiter_id = Some(waiter_id);
-                self.registered = true;
+        critical_section::with(|_| {
+            if self.deadline.elapsed() {
+                if let Some(id) = self.waiter_id.take() {
+                    Timer::unregister_async_sleep(id);
+                }
+                Poll::Ready(())
+            } else {
+                if let Some(id) = self.waiter_id {
+                    Timer::update_async_sleep(id, cx.waker().clone());
+                } else {
+                    self.waiter_id = Some(Timer::register_async_sleep(
+                        self.deadline,
+                        cx.waker().clone(),
+                    ));
+                }
+                Poll::Pending
             }
-            Poll::Pending
-        }
+        })
     }
 }
 
@@ -286,65 +314,7 @@ impl Future for Yield {
 }
 
 // ============================================================================
-// Ready Future
-// ============================================================================
-
-/// 立即就绪的 Future
-///
-/// 返回一个立即完成的 Future，携带指定的值。
-///
-/// # 示例
-///
-/// ```rust,ignore
-/// let value = ready(42).await;
-/// assert_eq!(value, 42);
-/// ```
-pub fn ready<T>(value: T) -> Ready<T> {
-    Ready { value: Some(value) }
-}
-
-/// Ready Future
-pub struct Ready<T> {
-    value: Option<T>,
-}
-
-impl<T> Future for Ready<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: 我们不会移动 self，只是修改内部的 Option
-        let this = unsafe { self.get_unchecked_mut() };
-        match this.value.take() {
-            Some(v) => Poll::Ready(v),
-            None => panic!("Ready polled after completion"),
-        }
-    }
-}
-
-// ============================================================================
-// Pending Future
-// ============================================================================
-
-/// 永不完成的 Future
-///
-/// 返回一个永远处于 Pending 状态的 Future。
-/// 主要用于测试和特殊场景。
-pub fn pending<T>() -> Pending<T> {
-    Pending { _marker: core::marker::PhantomData }
-}
-
-/// Pending Future
-pub struct Pending<T> {
-    _marker: core::marker::PhantomData<T>,
-}
-
-impl<T> Future for Pending<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Pending
-    }
-}
+pub use core::future::{ready, pending, Ready, Pending};
 
 #[cfg(test)]
 mod tests {
@@ -386,13 +356,61 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn timeout_cleans_up_both_waits_and_prefers_a_ready_operation() {
+        kernel_init();
+        let signal = crate::sync::Signal::new();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut wait = core::pin::pin!(timeout(Ticks(2), signal.wait_async()));
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(signal.async_waiter_count(), 1);
+            assert_eq!(Timer::async_sleep_count(), 1);
+        }
+        assert_eq!(signal.async_waiter_count(), 0);
+        assert_eq!(Timer::async_sleep_count(), 0);
+        let mut expired = core::pin::pin!(timeout(Ticks(0), signal.wait_async()));
+        assert_eq!(expired.as_mut().poll(&mut cx), Poll::Ready(Err(crate::error::RtosError::Timeout)));
+        assert_eq!(signal.async_waiter_count(), 0);
+        signal.send();
+        let mut ready = core::pin::pin!(timeout(Ticks(0), signal.wait_async()));
+        assert_eq!(ready.as_mut().poll(&mut cx), Poll::Ready(Ok(Ok(()))));
+    }
+
+    #[test]
+    fn async_signal_refreshes_waiters_and_forwards_cancelled_notifications() {
+        let signal = AsyncSignal::new();
+        let old_count = Arc::new(AtomicUsize::new(0));
+        let new_count = Arc::new(AtomicUsize::new(0));
+        let old_waker = counting_waker(old_count.clone());
+        let new_waker = counting_waker(new_count.clone());
+        let mut old = Context::from_waker(&old_waker);
+        let mut new = Context::from_waker(&new_waker);
+        let mut a = signal.wait_async();
+        let mut b = signal.wait_async();
+        let mut c = signal.wait_async();
+        assert!(Pin::new(&mut a).poll(&mut old).is_pending());
+        assert!(Pin::new(&mut a).poll(&mut new).is_pending());
+        assert!(Pin::new(&mut b).poll(&mut new).is_pending());
+        assert!(Pin::new(&mut c).poll(&mut new).is_pending());
+        signal.send_many(2);
+        assert_eq!(old_count.load(Ordering::SeqCst), 0);
+        assert_eq!(new_count.load(Ordering::SeqCst), 2);
+        drop(a);
+        assert_eq!(new_count.load(Ordering::SeqCst), 3);
+        assert!(Pin::new(&mut b).poll(&mut new).is_ready());
+        assert!(Pin::new(&mut c).poll(&mut new).is_ready());
+        assert_eq!(signal.count(), 0);
+    }
+
+    #[test]
     fn test_async_signal_basic() {
         let signal = AsyncSignal::new();
-        
+
         assert_eq!(signal.count(), 0);
         assert!(!signal.try_wait());
-        
-        signal.signal();
+
+        signal.send();
         assert_eq!(signal.count(), 1);
         assert!(signal.try_wait());
         assert_eq!(signal.count(), 0);
@@ -401,10 +419,10 @@ mod tests {
     #[test]
     fn test_async_signal_multiple() {
         let signal = AsyncSignal::new();
-        
-        signal.signal_n(5);
+
+        signal.send_many(5);
         assert_eq!(signal.count(), 5);
-        
+
         for _ in 0..5 {
             assert!(signal.try_wait());
         }
@@ -415,22 +433,22 @@ mod tests {
     #[serial]
     fn test_sleep_creation() {
         kernel_init();
-        
-        let sleep = Sleep::new(100);
+
+        let sleep = Sleep::new(Ticks(100));
         assert!(!sleep.is_elapsed());
-        assert!(sleep.remaining() <= 100);
+        assert!(sleep.remaining() <= Ticks(100));
     }
 
     #[test]
     #[serial]
     fn test_sleep_elapsed() {
         kernel_init();
-        
-        let sleep = Sleep::new(50);
+
+        let sleep = Sleep::new(Ticks(50));
         Systick::add_current_time(100);
-        
+
         assert!(sleep.is_elapsed());
-        assert_eq!(sleep.remaining(), 0);
+        assert_eq!(sleep.remaining(), Ticks(0));
     }
 
     #[test]
@@ -442,7 +460,7 @@ mod tests {
         let waker = counting_waker(wake_count.clone());
         let mut cx = Context::from_waker(&waker);
 
-        let mut sleep = Sleep::new(10);
+        let mut sleep = Sleep::new(Ticks(10));
         let mut pinned = Pin::new(&mut sleep);
 
         assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
@@ -463,7 +481,7 @@ mod tests {
     #[test]
     fn test_ready_future() {
         use core::task::{RawWaker, RawWakerVTable, Waker};
-        
+
         // 创建一个简单的 waker
         const VTABLE: RawWakerVTable = RawWakerVTable::new(
             |_| RawWaker::new(core::ptr::null(), &VTABLE),
@@ -474,10 +492,10 @@ mod tests {
         let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
-        
+
         let mut future = ready(42);
         let pinned = Pin::new(&mut future);
-        
+
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => assert_eq!(v, 42),
             Poll::Pending => panic!("Ready should be immediately ready"),
@@ -487,7 +505,7 @@ mod tests {
     #[test]
     fn test_yield_future() {
         use core::task::{RawWaker, RawWakerVTable, Waker};
-        
+
         const VTABLE: RawWakerVTable = RawWakerVTable::new(
             |_| RawWaker::new(core::ptr::null(), &VTABLE),
             |_| {},
@@ -497,20 +515,75 @@ mod tests {
         let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
-        
+
         let mut future = yield_now();
         let mut pinned = Pin::new(&mut future);
-        
+
         // 第一次 poll 应该返回 Pending
         match pinned.as_mut().poll(&mut cx) {
-            Poll::Pending => {},
+            Poll::Pending => {}
             Poll::Ready(_) => panic!("First poll should be Pending"),
         }
-        
+
         // 第二次 poll 应该返回 Ready
         match pinned.poll(&mut cx) {
-            Poll::Ready(_) => {},
+            Poll::Ready(_) => {}
             Poll::Pending => panic!("Second poll should be Ready"),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn expired_sleep_drop_cannot_unregister_reused_slot() {
+        kernel_init();
+        let count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut old = Sleep::new(Ticks(1));
+        assert!(Pin::new(&mut old).poll(&mut cx).is_pending());
+        Systick::add_current_time(1);
+        Timer::timer_check_and_send_event();
+        let mut new = Sleep::new(Ticks(10));
+        assert!(Pin::new(&mut new).poll(&mut cx).is_pending());
+        drop(old);
+        assert_eq!(Timer::async_sleep_count(), 1);
+        assert_eq!(Timer::get_next_timeout(), Some(Ticks(10)));
+        Systick::add_current_time(10);
+        Timer::timer_check_and_send_event();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(Pin::new(&mut new).poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    #[serial]
+    fn sleep_refreshes_waker_and_cancels_on_drop() {
+        kernel_init();
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let first_waker = counting_waker(first.clone());
+        let second_waker = counting_waker(second.clone());
+        let mut sleep = Sleep::new(Ticks(5));
+        assert!(
+            Pin::new(&mut sleep)
+                .poll(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        assert!(
+            Pin::new(&mut sleep)
+                .poll(&mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
+        Systick::add_current_time(5);
+        Timer::timer_check_and_send_event();
+        assert_eq!(first.load(Ordering::SeqCst), 0);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+        let mut canceled = Sleep::new(Ticks(100));
+        assert!(
+            Pin::new(&mut canceled)
+                .poll(&mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
+        drop(canceled);
+        assert_eq!(Timer::async_sleep_count(), 0);
     }
 }

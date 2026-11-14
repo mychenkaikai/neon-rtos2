@@ -6,3 +6,6 @@ pub const MAX_TIMERS: usize = 10;
 pub const MAX_MUTEXES: usize = 10;
 pub const MAX_MQS: usize = 10;
 pub const HEAP_SIZE: usize = 8 * 1024;  // 8KB - 适合 64KB RAM 的嵌入式设备
+
+/// Maximum pending asynchronous wait registrations per synchronization object.
+pub const MAX_ASYNC_WAITERS: usize = 16;

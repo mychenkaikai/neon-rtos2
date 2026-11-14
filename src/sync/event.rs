@@ -1,4 +1,5 @@
 use crate::kernel::task::Task;
+use crate::kernel::scheduler::Scheduler;
 use crate::kernel::task::TaskState;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -6,7 +7,10 @@ pub enum Event {
     /// 无事件（用于默认值）
     None,
     Signal(usize),
-    Timer(usize),
+    Timer(u64),
+    TaskExit(Task),
+    /// A task-private delay, separate from user-owned software timers.
+    Delay,
     Ipc(usize),
     Memory(usize),
     Network(usize),
@@ -19,34 +23,25 @@ pub enum Event {
 }
 
 impl Event {
-    //根据事件唤醒被所有被这个事件阻塞的task
     pub(crate) fn wake_task(event_type: Event) {
-        Task::for_each(|mut task, _| {
-            if task.get_state() == TaskState::Blocked(event_type) {
-                task.ready();
-            }
+        critical_section::with(|cs| {
+            Scheduler::wake_tasks_if(cs, 0..crate::config::MAX_TASKS, event_type);
         });
     }
 
-    pub(crate) fn wake_task_by_id(task_id: usize) -> bool {
-        let mut task = Task(task_id);
-        if let TaskState::Blocked(_) = task.get_state() {
-            task.ready();
-            true
-        } else {
-            false
-        }
+    pub(crate) fn wake_task_by_id_if(task_id: usize, event_type: Event) -> bool {
+        critical_section::with(|_| {
+            if task_id >= crate::config::MAX_TASKS { return false; }
+            let mut task = Task::from_slot(task_id);
+            if task.get_state() == TaskState::Blocked(event_type) {
+                task.ready();
+                true
+            } else {
+                false
+            }
+        })
     }
 
-    pub(crate) fn wake_task_by_id_if(task_id: usize, event_type: Event) -> bool {
-        let mut task = Task(task_id);
-        if task.get_state() == TaskState::Blocked(event_type) {
-            task.ready();
-            true
-        } else {
-            false
-        }
-    }
 }
 
 #[cfg(test)]
@@ -58,11 +53,11 @@ mod tests {
     use crate::utils::kernel_init;
     use serial_test::serial;
 
-    fn task1(_args: usize) {}
-    fn task2(_args: usize) {}
-    fn task3(_args: usize) {}
-    fn task4(_args: usize) {}
-    fn task5(_args: usize) {}
+    fn task1() {}
+    fn task2() {}
+    fn task3() {}
+    fn task4() {}
+    fn task5() {}
     
     #[test]
     #[serial]
@@ -110,8 +105,8 @@ mod tests {
     fn test_wake_task_with_no_blocked_tasks() {
         kernel_init();
         
-        Task::new("wake_test1", |_| {}).unwrap();
-        Task::new("wake_test2", |_| {}).unwrap();
+        Task::new("wake_test1", || {}).unwrap();
+        Task::new("wake_test2", || {}).unwrap();
         
         // 不启动调度器，所有任务都处于就绪状态
         
@@ -134,9 +129,9 @@ mod tests {
     fn test_multiple_blocked_same_event() {
         kernel_init();
         
-        let mut task1 = Task::new("same_event1", |_| {}).unwrap();
-        let mut task2 = Task::new("same_event2", |_| {}).unwrap();
-        let mut task3 = Task::new("same_event3", |_| {}).unwrap();
+        let mut task1 = Task::new("same_event1", || {}).unwrap();
+        let mut task2 = Task::new("same_event2", || {}).unwrap();
+        let mut task3 = Task::new("same_event3", || {}).unwrap();
         
         Scheduler::start();
         
@@ -171,11 +166,11 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_wake_task_by_id() {
+    fn targeted_wake_preserves_other_waiters() {
         kernel_init();
 
-        let mut task1 = Task::new("wake_by_id_1", |_| {}).unwrap();
-        let mut task2 = Task::new("wake_by_id_2", |_| {}).unwrap();
+        let mut task1 = Task::new("wake_by_id_1", || {}).unwrap();
+        let mut task2 = Task::new("wake_by_id_2", || {}).unwrap();
 
         Scheduler::start();
 
@@ -189,7 +184,7 @@ mod tests {
         }
 
         if task1.get_taskid() != current_id {
-            assert!(Event::wake_task_by_id(task1.get_taskid()));
+            assert!(Event::wake_task_by_id_if(task1.get_taskid(), Event::Signal(11)));
             assert_eq!(task1.get_state(), TaskState::Ready);
         }
 
@@ -203,7 +198,7 @@ mod tests {
     fn test_wake_task_by_id_if() {
         kernel_init();
 
-        let mut task = Task::new("wake_by_id_if", |_| {}).unwrap();
+        let mut task = Task::new("wake_by_id_if", || {}).unwrap();
 
         Scheduler::start();
 
@@ -223,9 +218,9 @@ mod tests {
     fn test_different_event_types() {
         kernel_init();
         
-        let mut task1 = Task::new("diff_event1", |_| {}).unwrap();
-        let mut task2 = Task::new("diff_event2", |_| {}).unwrap();
-        let mut task3 = Task::new("diff_event3", |_| {}).unwrap();
+        let mut task1 = Task::new("diff_event1", || {}).unwrap();
+        let mut task2 = Task::new("diff_event2", || {}).unwrap();
+        let mut task3 = Task::new("diff_event3", || {}).unwrap();
         
         Scheduler::start();
         

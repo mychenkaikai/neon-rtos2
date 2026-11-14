@@ -16,21 +16,21 @@
 //! ## 支持平台
 //!
 //! - ✅ Cortex-M3（已实现）
-//! - 📝 RISC-V（计划中）
+//! - 📝 RISC-V（QEMU virt，RV32IMAC）
 //!
 //! ## 快速开始
 //!
 //! ```rust,no_run
 //! # use neon_rtos2::prelude::*;
-//! # fn main() -> Result<(), RtosError> {
+//! # fn main() -> Result<()> {
 //! # kernel_init();
 //! // 创建任务（Builder 模式）
 //! let task = Task::builder("my_task")
 //!     .priority(Priority::High)
-//!     .spawn(|_| {
+//!     .spawn(|| {
 //!         loop {
-//!             info!("Task running");
-//!             Delay::delay(1000).unwrap();
+//!             neon_rtos2::info!("Task running");
+//!             Delay::delay(neon_rtos2::prelude::Ticks(1000)).unwrap();
 //!         }
 //!     }).unwrap();
 //!
@@ -87,7 +87,7 @@
 //! - **调度器**: `Scheduler`
 //! - **时间管理**: `Timer`, `Delay`, `Systick`
 //! - **同步原语**: `Mutex`, `MutexGuard`, `Signal`, `Event`
-//! - **进程间通信**: `Mq`, `Ipc`, `IpcHandle`
+//! - **进程间通信**: `bounded`, `Sender`, `Receiver`
 //! - **错误处理**: `Result`, `RtosError`
 //! - **日志**: `LogLevel`, `set_log_level`, `get_log_level`
 //! - **工具函数**: `kernel_init`
@@ -105,6 +105,13 @@
 #[cfg(test)]
 extern crate std;
 extern crate alloc;
+
+#[cfg(all(feature = "cortex_m3", feature = "riscv"))]
+compile_error!("select exactly one architecture: cortex_m3 or riscv");
+#[cfg(all(target_os = "none", target_arch = "arm", not(feature = "cortex_m3")))]
+compile_error!("ARM bare-metal targets require feature cortex_m3");
+#[cfg(all(target_os = "none", target_arch = "riscv32", not(feature = "riscv")))]
+compile_error!("RISC-V bare-metal targets require feature riscv");
 
 // ============================================================================
 // 核心模块

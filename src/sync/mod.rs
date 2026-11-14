@@ -25,7 +25,7 @@
 //!     // 克隆后传递给任务
 //!     let signal_clone = signal.clone();
 //!     Task::builder("task1")
-//!         .spawn(move |_| {
+//!         .spawn(move || {
 //!             signal_clone.wait().unwrap();
 //!         });
 //! }
@@ -73,10 +73,7 @@ pub use semaphore::{
 };
 
 // CondVar
-pub use condvar::{
-    CondVar,
-    CondVarFuture,
-};
+pub use condvar::CondVar;
 
 // Event (内部使用)
 pub use event::Event;
@@ -114,3 +111,5 @@ pub mod prelude {
     pub use super::mutex_condvar_pair;
     pub use super::binary_semaphore;
 }
+
+pub(crate) mod wait;

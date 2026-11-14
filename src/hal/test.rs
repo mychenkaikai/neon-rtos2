@@ -17,12 +17,10 @@ pub(crate) fn trigger_schedule() {
 }
 
 pub(crate) fn init_idle_task() {
-    fn idle_task(_arg: usize) {
+    fn idle_task() {
         loop {
-            // 获取距离下一个定时器超时的预计时间
-            let next_timeout = crate::kernel::time::timer::Timer::get_next_timeout();
-            crate::kernel::power::enter_idle(next_timeout);
+            crate::kernel::power::enter_idle(None);
         }
     }
-    let _task = crate::kernel::task::Task::new("idle", idle_task).unwrap();
+    let _task = crate::kernel::task::Task::builder("idle").priority(crate::kernel::task::Priority::Idle).spawn(idle_task).unwrap();
 }

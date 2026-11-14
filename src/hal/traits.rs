@@ -17,7 +17,11 @@ pub trait ContextSwitch {
     /// - `stack_top`: 栈顶指针（会被修改为初始化后的栈顶）
     /// - `entry`: 任务入口函数
     /// - `arg`: 传递给任务的参数
-    fn init_task_stack(stack_top: &mut usize, entry: fn(usize), arg: usize);
+    ///
+    /// # Safety
+    /// stack_top must refer to the exclusive writable stack of the required
+    /// size and alignment for this port.
+    unsafe fn init_task_stack(stack_top: &mut usize, entry: fn(usize), arg: usize);
 
     /// 触发上下文切换
     ///
@@ -27,49 +31,10 @@ pub trait ContextSwitch {
     /// 启动第一个任务
     ///
     /// 从调度器启动第一个任务，开始多任务执行
-    fn start_first_task();
-}
-
-/// 系统时钟 trait
-///
-/// 定义了系统时钟（SysTick）的基本操作
-pub trait SysTickTrait {
-    /// 初始化系统时钟
     ///
-    /// # 参数
-    /// - `frequency`: 时钟频率（Hz）
-    fn init(frequency: u32);
-
-    /// 获取当前时间
-    ///
-    /// # 返回值
-    /// 当前的 tick 计数
-    fn get_current_time() -> usize;
-
-    /// 增加当前时间
-    ///
-    /// 主要用于测试环境模拟时间流逝
-    ///
-    /// # 参数
-    /// - `ticks`: 要增加的 tick 数
-    fn add_current_time(ticks: usize);
-
-    /// 时钟中断处理
-    ///
-    /// 在 SysTick 中断中调用，处理定时器和任务调度
-    fn tick_handler();
-
-    /// 暂停系统时钟（用于 Tickless Idle）
-    ///
-    /// # 参数
-    /// - `ticks`: 预计暂停的 tick 数量
-    fn suspend(ticks: usize);
-
-    /// 恢复系统时钟
-    ///
-    /// # 返回值
-    /// 实际经过的 tick 数量
-    fn resume() -> usize;
+    /// # Safety
+    /// The scheduler and first task frame must be fully initialized.
+    unsafe fn start_first_task();
 }
 
 /// 空闲任务 trait
@@ -87,42 +52,8 @@ pub trait IdleTaskTrait {
     fn idle_loop() -> !;
 }
 
-/// 临界区 trait
-///
-/// 定义了进入和退出临界区的操作
-pub trait CriticalSectionTrait {
-    /// 临界区令牌类型
-    ///
-    /// 用于保存进入临界区前的状态
-    type Token;
-
-    /// 进入临界区
-    ///
-    /// 禁用中断并返回之前的中断状态
-    ///
-    /// # 返回值
-    /// 临界区令牌，用于退出时恢复状态
-    fn enter() -> Self::Token;
-
-    /// 退出临界区
-    ///
-    /// 恢复进入临界区前的中断状态
-    ///
-    /// # 参数
-    /// - `token`: 进入临界区时获得的令牌
-    fn exit(token: Self::Token);
-}
-
-/// 中断控制 trait
-///
-/// 定义了中断的基本控制操作
+/// Board-specific interrupt routing. Global masking uses hal::with_interrupts_masked.
 pub trait InterruptControl {
-    /// 全局禁用中断
-    fn disable_interrupts();
-
-    /// 全局启用中断
-    fn enable_interrupts();
-
     /// 检查中断是否启用
     ///
     /// # 返回值
@@ -136,77 +67,15 @@ pub trait InterruptControl {
     /// - `priority`: 优先级值
     fn set_priority(irq: u32, priority: u8);
 
-    /// 启用特定中断
-    ///
-    /// # 参数
-    /// - `irq`: 中断号
-    fn enable_irq(irq: u32);
-
-    /// 禁用特定中断
-    ///
-    /// # 参数
-    /// - `irq`: 中断号
-    fn disable_irq(irq: u32);
-
-    /// 注册中断处理函数
-    ///
-    /// # 参数
-    /// - `irq`: 中断号
-    /// - `handler`: 中断处理函数
-    fn register_handler(irq: u32, handler: fn());
-
-    /// 注销中断处理函数
-    ///
-    /// # 参数
-    /// - `irq`: 中断号
-    fn unregister_handler(irq: u32);
-}
-
-/// DMA 传输方向
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DmaDirection {
-    /// 内存到外设
-    MemoryToPeripheral,
-    /// 外设到内存
-    PeripheralToMemory,
-    /// 内存到内存
-    MemoryToMemory,
-    /// 外设到外设
-    PeripheralToPeripheral,
-}
-
-/// DMA 传输配置
-#[derive(Debug, Clone)]
-pub struct DmaConfig {
-    /// 源地址
-    pub src_addr: usize,
-    /// 目标地址
-    pub dst_addr: usize,
-    /// 传输数据长度
-    pub length: usize,
-    /// 传输方向
-    pub direction: DmaDirection,
-}
-
-/// DMA 控制器 trait
-///
-/// 抽象平台底层的直接内存访问（DMA）引擎
-pub trait DmaController {
-    /// DMA 错误类型
+    /// Platform-specific registration error.
     type Error;
+    /// An exclusive registration. Its Drop implementation must mask the IRQ
+    /// and remove this handler before releasing the slot for reuse.
+    type Registration;
 
-    /// 启动异步 DMA 传输
-    ///
-    /// # 参数
-    /// - `channel`: DMA 通道号
-    /// - `config`: 传输配置
-    async fn start_transfer_async(&mut self, channel: u8, config: DmaConfig) -> Result<(), Self::Error>;
-
-    /// 停止 DMA 传输
-    fn stop_transfer(&mut self, channel: u8) -> Result<(), Self::Error>;
-
-    /// 获取 DMA 通道传输剩余长度
-    fn remaining_length(&self, channel: u8) -> usize;
+    /// Install and enable the handler atomically. An occupied IRQ returns an
+    /// error, retaining the existing registration.
+    fn register_handler(irq: u32, handler: fn()) -> Result<Self::Registration, Self::Error>;
 }
 
 /// 处理器控制 trait

@@ -21,7 +21,7 @@
 //! ```rust,ignore
 //! let signal = Signal::new();  // 局部创建
 //! let signal_clone = signal.clone();
-//! Task::builder("task").spawn(move |_| {
+//! Task::builder("task").spawn(move || {
 //!     signal_clone.wait().unwrap();  // 通过闭包捕获
 //! });
 //! ```
@@ -66,7 +66,7 @@ use neon_rtos2::{info, debug, error, trace};
 const UART_BASE_ADDR: usize = 0x1000_0000;
 
 /// 使用 UartOutput 并指定地址
-static UART_OUTPUT: UartOutput<UART_BASE_ADDR> = UartOutput::new();
+static UART_OUTPUT: UartOutput<UART_BASE_ADDR> = unsafe { UartOutput::new() };
 
 // ============================================================================
 // 主函数
@@ -134,7 +134,7 @@ fn main() -> ! {
     let counter_sensor = counter.clone();
     Task::builder("sensor")
         .priority(Priority::High)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[Sensor] Started (High Priority) with Signal + Mutex");
             
             loop {
@@ -149,7 +149,7 @@ fn main() -> ! {
                 data_ready_sender.send();
                 
                 // 延时 2 秒
-                Delay::delay(2000).unwrap();
+                Delay::delay(Duration::from_millis(2000)).unwrap();
             }
         })
         .expect("Failed to create sensor task");
@@ -161,7 +161,7 @@ fn main() -> ! {
     let counter_processor = counter.clone();
     Task::builder("processor")
         .priority(Priority::Normal)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[Processor] Started (Normal Priority)");
             
             loop {
@@ -187,7 +187,7 @@ fn main() -> ! {
     let task_sync_receiver = task_sync.clone();
     Task::builder("logger")
         .priority(Priority::Normal)
-        .spawn(move |_| {
+        .spawn(move || {
             info!("[Logger] Started (Normal Priority)");
             let mut log_count = 0u32;
             
@@ -205,7 +205,7 @@ fn main() -> ! {
     // ----- 监控任务 - 低优先级 -----
     Task::builder("monitor")
         .priority(Priority::Low)
-        .spawn(|_| {
+        .spawn(|| {
             info!("[Monitor] Started (Low Priority)");
             let mut tick = 0u32;
             
@@ -225,6 +225,8 @@ fn main() -> ! {
                 // 遍历所有任务并显示状态
                 Task::iter().for_each(|task| {
                     let state_str = match task.get_state() {
+                        TaskState::Created => "Created",
+                        TaskState::Finished => "Finished",
                         TaskState::Uninit => "Uninit",
                         TaskState::Ready => "Ready",
                         TaskState::Running => "Running",
@@ -237,7 +239,7 @@ fn main() -> ! {
                 info!("");
                 
                 // 延时 5 秒
-                Delay::delay(5000).unwrap();
+                Delay::delay(Duration::from_millis(5000)).unwrap();
             }
         })
         .expect("Failed to create monitor task");
@@ -246,7 +248,7 @@ fn main() -> ! {
     // ----- 心跳任务 - 最低优先级 -----
     Task::builder("heartbeat")
         .priority(Priority::Idle)
-        .spawn(|_| {
+        .spawn(|| {
             info!("[Heartbeat] Started (Idle Priority)");
             let mut beat = 0u32;
             
@@ -255,7 +257,7 @@ fn main() -> ! {
                 trace!("Heartbeat: {}", beat);
                 
                 // 延时 3 秒
-                Delay::delay(3000).unwrap();
+                Delay::delay(Duration::from_millis(3000)).unwrap();
             }
         })
         .expect("Failed to create heartbeat task");

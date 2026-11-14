@@ -54,7 +54,7 @@ impl MpuConfig {
     /// 这个函数在上下文切换时调用。它将 MPU 的区域 4 设定在任务栈的最低端（32 字节）。
     /// 一旦任务的栈指针越界访问该区域，立即触发 MemManage Fault，防止栈溢出破坏其他任务的数据。
     #[inline]
-    pub fn configure_task_guard(stack_bottom: u32) {
+    pub(crate) fn configure_task_guard(stack_bottom: u32) {
         unsafe {
             let mpu_rnr = 0xE000_ED98 as *mut u32;
             let mpu_rbar = 0xE000_ED9C as *mut u32;

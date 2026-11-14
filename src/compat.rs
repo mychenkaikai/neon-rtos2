@@ -5,7 +5,7 @@
 //! # 使用方法
 //!
 //! ```rust
-//! use crate::compat::{Box, Vec, VecDeque};
+//! use neon_rtos2::compat::{Box, Vec, VecDeque};
 //! ```
 //!
 //! # 导出类型

@@ -21,9 +21,15 @@ use crate::ipc::queue::Mq;
 /// 
 /// 此函数会完全重置所有全局状态，适合在测试开始时调用。
 pub fn kernel_init() {
+    #[cfg(target_os = "none")]
+    {
+        static INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        assert!(!INITIALIZED.swap(true, core::sync::atomic::Ordering::AcqRel), "kernel already initialized");
+    }
     crate::mem::allocator::init_heap();
     Task::init();
     Scheduler::init();
+    crate::ipc::Ipc::init();
     Timer::init();
     Systick::init();
     Mq::<u8, 1>::init();  // 初始化消息队列槽位
@@ -31,5 +37,5 @@ pub fn kernel_init() {
 
 
 pub(crate) fn task_exit_error() -> ! {
-    loop {}
+    panic!("task trampoline returned")
 }

@@ -1,8 +1,38 @@
 # Neon-RTOS2 架构设计文档
 
-> 最后更新：2026年6月13日
+> 最后更新：2026年11月8日
 
 本文档详细介绍 Neon-RTOS2 的架构设计、模块组织和核心实现原理。
+
+## 内核状态与等待协议（2026-11-08）
+
+- 调度器在同一临界区更新任务状态、优先级和就绪队列。同优先级任务按 FIFO 轮转。抢占检查请求上下文切换，由切换流程更新当前任务。
+- Cortex-M 通过 PendSV 切换上下文。其异常优先级设为最低，启动调度器之前到达的 SysTick 不会触发切换。
+- 定时器句柄包含代次，普通定时器只占用固定表中的一个槽位。创建时立即计时，restart 从当前时刻重新计时，取消或析构立即释放槽位。下一次超时查询同时考虑普通定时器、异步睡眠和同步任务的截止时间。
+- 消息队列的克隆共享缓冲区。队列操作在同一临界区检查条件和阻塞任务。执行器同样在阻塞前复查可运行队列，避免在收到通知后仍然休眠。
+- 两个 Signal 入口在同一临界区检查计数和登记等待者。重复轮询更新 Waker，取消等待释放登记。每个 `sync::Signal` 最多容纳 `MAX_ASYNC_WAITERS` 个异步等待者，达到上限时返回 `WaiterQueueFull`。唤醒后由等待者竞争计数。
+- `sync::Signal` 的同步超时通过任务 ID 和等待事件定向唤醒，异步超时通过 Sleep 唤醒。关闭前已登记的等待者即使在重开后才运行，也会收到 `SignalClosed`。
+
+主机测试覆盖资源复用、等待取消、广播、关闭及跨越 32 位时钟边界的超时。Cortex-M3 和 RV32IMAC 各有一个有限时 QEMU 固件测试，入口为 `scripts/run_scheduler_smoke.sh` 和 `scripts/run_riscv_smoke.sh`。两端均连续执行超过任务槽数的短任务。RISC-V 另用 CLINT 计数器核对延时和延迟处理中断时的补时。
+
+Mutex、RwLock 和 Semaphore 在一个临界区内检查资源、登记等待并阻塞任务。释放资源后，已登记的等待者重新竞争。每个等待队列最多登记 `MAX_ASYNC_WAITERS` 个 Future。Mutex 和 Semaphore 的同步超时通过任务定时器唤醒。启用优先级继承时，调度器记录每个阻塞任务正在等待的锁持有者，根据任务基础优先级计算继承链。正常唤醒和超时都会撤销对应的继承关系。
+
+CondVar 在同一临界区登记等待并释放互斥锁，先执行解锁产生的 Waker，再检查通知并决定是否阻塞。此间收到的通知会保留。同步等待正常返回或超时返回时都重新持锁。异步入口保留手动管理互斥锁的约定，Future 从第一次轮询起接收通知。
+
+运行时 MPSC 通道分别登记发送和接收 Future。取消已获通知的 Future 时，仍可用的空间或消息会唤醒下一个等待者。最后一个发送端退出后，接收端仍能读完缓冲区，随后返回 `None`。接收端退出会唤醒发送者并归还未送出的值。无界通道的缓冲区按需增长。
+
+批量唤醒先撤销与当前事件匹配的优先级继承关系，至多重算一次有效优先级，再按等待队列的 FIFO 顺序将任务加入对应优先级的就绪队列。状态检查和入队共享同一临界区。Cortex-M3 满载解锁的中断响应探针与真板复测步骤见[测试套件](../examples/tests/README.md#满载解锁时的中断响应)。
+
+内核时间为单调的 64 位 tick。`Deadline` 统一处理同步等待、普通定时器和异步睡眠的到期判断。32 位 CPU 在临界区内读取完整计数。同步任务超时登记有固定容量，异步睡眠按实际并发数增长，定时中断用固定大小的临时数组分批取走到期的 Waker。
+
+当前验收面向单核 QEMU。板级外设接线、物理中断延迟和深度睡眠唤醒时钟需要对应硬件验证。STM32F1 UART DMA 模块是驱动接口示例。
+
+### 本次接口变更
+
+- 请保存 `Task` 句柄以操作任务。裸槽号适合日志，槽位复用后会代表另一个任务。保存栈指针和提交实际上下文切换由内核与 HAL 负责。
+- 在裸机入口调用一次 `kernel_init()`。普通 Timer 的每次 `restart()` 都从当前时刻重新计时。任务 Delay 使用独立的任务超时登记，用户定时器槽位耗尽时仍可延时。
+- Idle 使用周期 tick 和 WFI。需要 tickless 低功耗的板卡需要提供可测量实际经过时间的时钟和唤醒实现。
+- MMIO 寄存器读写和 `UartOutput::new()` 要求调用者在 `unsafe` 处确认地址、访问宽度及权限。RISC-V 端口移除了旧的动态 PMP 栈保护模板。
 
 ---
 
@@ -117,12 +147,12 @@ src/
 │   └── guard.rs           # RAII 守卫
 ├── ipc/                    # 进程间通信
 │   ├── queue.rs           # 消息队列
-│   └── channel.rs         # 类型安全通道
+│   ├── typed.rs           # RTOS 任务与 Future 共用的类型化端点
+│   └── channel.rs         # 动态 IPC 句柄
 ├── runtime/                # 异步运行时
 │   ├── executor.rs        # 执行器
 │   ├── future.rs          # Future 实现
 │   ├── waker.rs           # Waker 机制
-│   ├── channel.rs         # 异步通道
 │   └── select.rs          # select! 宏
 ├── hal/                    # 硬件抽象层
 │   ├── traits.rs          # HAL trait 定义
@@ -151,57 +181,16 @@ src/
 
 ### 1. 任务管理 (kernel/task)
 
-#### Task 结构
+每个任务有一个静态控制块和一个静态栈。`Task` 是可复制的槽位和代次句柄，`get_taskid()` 返回可复用的数值槽号。需要在未来操作同一任务时应保存完整句柄。
 
-```rust
-pub struct Task {
-    /// 任务 ID
-    id: usize,
-    /// 任务名称
-    name: &'static str,
-    /// 任务状态
-    state: TaskState,
-    /// 任务优先级
-    priority: Priority,
-    /// 栈指针
-    stack_ptr: *mut usize,
-    /// 栈空间
-    stack: [u8; STACK_SIZE],
-    /// 任务入口函数
-    entry: fn(usize),
-}
-```
+普通 `Task::new/spawn` 创建就绪任务。`TypedTask::build` 或 `TypedTask::<Created>::new` 先保留入口和栈，`start()` 再进入就绪队列。丢弃拥有创建权的未启动句柄会释放闭包。任务函数返回时，调度器将状态改为 `Finished`，撤销优先级继承并请求切换。当前栈在切出后才能被下一次创建复用，持有旧句柄的代码不能唤醒或调整新任务。
 
-#### 任务状态机
+只有调度器分派任务时可以写入 `Running`。主动让出 CPU 使用 `Scheduler::task_switch()`，等待资源使用相应同步原语。管理代码可用 `block_if_ready(event)` 挂起就绪任务，`wake_if(event)` 校验句柄代次与等待事件。类型化句柄记录观察时的状态，`TypedTask<Ready>::try_from(task)` 和 `created.start()?` 会检查当前状态。
 
-```
-                    ┌─────────────┐
-                    │   Uninit    │
-                    └──────┬──────┘
-                           │ init()
-                           ▼
-                    ┌─────────────┐
-         ┌─────────│    Ready    │◄────────┐
-         │         └──────┬──────┘         │
-         │                │ schedule()     │
-         │                ▼                │
-         │         ┌─────────────┐         │
-         │         │   Running   │         │
-         │         └──────┬──────┘         │
-         │                │                │
-         │    ┌───────────┼───────────┐    │
-         │    │           │           │    │
-         │    ▼           ▼           ▼    │
-         │ yield()    block()     完成     │
-         │    │           │           │    │
-         │    │           ▼           │    │
-         │    │    ┌─────────────┐    │    │
-         │    │    │   Blocked   │    │    │
-         │    │    └──────┬──────┘    │    │
-         │    │           │ wake()    │    │
-         │    └───────────┴───────────┘    │
-         │                                 │
-         └─────────────────────────────────┘
+```text
+Created ──start──> Ready <──yield── Running ──return──> Finished
+                    │                 ▲  │
+                    └────dispatch─────┘  └──wait──> Blocked ──wake──> Ready
 ```
 
 #### 优先级
@@ -226,216 +215,27 @@ Neon-RTOS2 使用**优先级抢占式调度**结合**时间片轮转**：
 2. **时间片轮转**：同优先级任务按时间片轮转执行
 3. **空闲任务**：当没有就绪任务时执行空闲任务
 
-```rust
-pub struct Scheduler {
-    /// 当前运行任务 ID
-    current_task: AtomicUsize,
-    /// 是否正在运行
-    running: AtomicBool,
-    /// 时间片计数
-    tick_count: AtomicUsize,
-}
-
-impl Scheduler {
-    /// 选择下一个任务
-    fn select_next_task() -> Option<usize> {
-        // 1. 查找最高优先级的就绪任务
-        Task::ready_tasks()
-            .max_by_key(|t| t.get_priority())
-            .map(|t| t.get_taskid())
-    }
-    
-    /// 调度（在 SysTick 中断中调用）
-    pub fn schedule() {
-        if let Some(next) = Self::select_next_task() {
-            let current = Self::current_task_id();
-            if next != current {
-                Self::context_switch(current, next);
-            }
-        }
-    }
-}
-```
+优先级模式按有效优先级维护五个就绪队列，通过位图选择最高的非空队列。默认轮转模式按任务槽轮询。嵌入式应用请求调度时只触发硬件切换，HAL 保存当前上下文后才提交下一个运行任务。
 
 ### 3. 同步原语 (sync)
 
 #### Mutex 实现
 
-```rust
-pub struct Mutex {
-    /// 互斥锁 ID
-    id: usize,
-    /// 是否被锁定
-    locked: AtomicBool,
-    /// 持有者任务 ID
-    owner: AtomicUsize,
-}
-
-impl Mutex {
-    /// 获取锁（阻塞）
-    pub fn lock(&self) {
-        loop {
-            if self.try_lock() {
-                return;
-            }
-            // 阻塞当前任务
-            Task::current().block(Event::Mutex(self.id));
-            Scheduler::schedule();
-        }
-    }
-    
-    /// RAII 守卫
-    pub fn lock_guard(&self) -> MutexGuard<'_> {
-        self.lock();
-        MutexGuard { mutex: self }
-    }
-}
-
-/// RAII 守卫，离开作用域自动释放锁
-pub struct MutexGuard<'a> {
-    mutex: &'a Mutex,
-}
-
-impl Drop for MutexGuard<'_> {
-    fn drop(&mut self) {
-        self.mutex.unlock().ok();
-    }
-}
-```
+克隆的 Mutex 共享数据、所有者句柄和等待队列。普通、映射和拥有所有权的守卫共享解锁路径。开启优先级继承后，阻塞任务向仍存活的持锁任务贡献优先级。拥有所有权的守卫可以跨任务释放。
 
 #### Signal 实现
 
-```rust
-pub struct Signal {
-    /// 信号量 ID
-    id: usize,
-    /// 信号计数
-    count: AtomicUsize,
-}
+克隆的 `sync::Signal` 共享同一个计数、关闭代次和等待队列。在同一临界区内，等待者检查计数，决定消费信号或登记等待。发送方增加计数并取出等待者，在释放共享状态后调用异步 Waker。已登记的等待者会记住关闭代次，即使信号在它恢复前重新打开，也能收到 `SignalClosed`。
 
-impl Signal {
-    /// 等待信号
-    pub fn wait(&self) {
-        loop {
-            let count = self.count.load(Ordering::Acquire);
-            if count > 0 {
-                if self.count.compare_exchange(
-                    count, count - 1,
-                    Ordering::AcqRel, Ordering::Relaxed
-                ).is_ok() {
-                    return;
-                }
-            } else {
-                // 阻塞当前任务
-                Task::current().block(Event::Signal(self.id));
-                Scheduler::schedule();
-            }
-        }
-    }
-    
-    /// 发送信号
-    pub fn send(&self) {
-        self.count.fetch_add(1, Ordering::Release);
-        // 唤醒等待的任务
-        Event::wake_task(Event::Signal(self.id));
-    }
-}
-```
+`runtime::AsyncSignal` 支持静态初始化，复用相同的异步等待者登记和取消逻辑。该接口的等待队列按需增长。`sync::Signal` 则在达到配置容量时返回 `WaiterQueueFull`。
 
 ### 4. 硬件抽象层 (hal)
 
-#### HAL Trait 定义
+Cortex-M3 通过 PendSV 在 PSP 上保存和恢复任务帧。PSP 配置完成后才允许挂起首次切换，SysTick 提供周期 tick。系统休眠时保留配置好的周期中断。
 
-```rust
-/// 架构相关操作 trait
-pub trait ArchOps {
-    /// 初始化任务栈
-    fn init_task_stack(stack: &mut [u8], entry: fn(usize), arg: usize) -> *mut usize;
-    
-    /// 上下文切换
-    fn context_switch(from: *mut usize, to: *mut usize);
-    
-    /// 启动第一个任务
-    fn start_first_task(sp: *mut usize) -> !;
-    
-    /// 使能中断
-    fn enable_interrupts();
-    
-    /// 禁用中断
-    fn disable_interrupts();
-    
-    /// 进入低功耗模式
-    fn enter_low_power();
-}
-```
+RV32IMAC 的软件中断和定时中断共用 trap 入口。汇编使用 16 字节对齐的 144 字节帧，调用 Rust 处理函数时仍满足 ABI。首任务和后续任务通过同一恢复路径执行 mret。QEMU virt 默认以 10 MHz 的 CLINT 每 10,000 个计数产生一个内核 tick，可在启动前用 `configure_systick(Duration)` 指定周期。定时中断根据上一次比较值计算实际经过的周期数。两端 idle 都用 WFI 等待中断。
 
-#### Cortex-M3 实现
-
-```rust
-// 上下文切换（通过 PendSV 中断）
-#[naked]
-#[no_mangle]
-pub unsafe extern "C" fn PendSV() {
-    asm!(
-        // 保存当前上下文
-        "mrs r0, psp",
-        "stmdb r0!, {{r4-r11}}",
-        
-        // 保存 PSP 到当前任务
-        "ldr r1, =CURRENT_TASK_SP",
-        "str r0, [r1]",
-        
-        // 加载下一个任务的 SP
-        "ldr r1, =NEXT_TASK_SP",
-        "ldr r0, [r1]",
-        
-        // 恢复上下文
-        "ldmia r0!, {{r4-r11}}",
-        "msr psp, r0",
-        
-        // 返回
-        "bx lr",
-        options(noreturn)
-    );
-}
-```
-
-#### RISC-V 实现
-
-```rust
-// 上下文切换
-#[naked]
-#[no_mangle]
-pub unsafe extern "C" fn context_switch() {
-    asm!(
-        // 保存当前上下文
-        "addi sp, sp, -64",
-        "sw ra, 0(sp)",
-        "sw s0, 4(sp)",
-        "sw s1, 8(sp)",
-        // ... 保存其他寄存器
-        
-        // 保存 SP 到当前任务
-        "la t0, CURRENT_TASK_SP",
-        "sw sp, 0(t0)",
-        
-        // 加载下一个任务的 SP
-        "la t0, NEXT_TASK_SP",
-        "lw sp, 0(t0)",
-        
-        // 恢复上下文
-        "lw ra, 0(sp)",
-        "lw s0, 4(sp)",
-        // ... 恢复其他寄存器
-        "addi sp, sp, 64",
-        
-        "ret",
-        options(noreturn)
-    );
-}
-```
-
----
+HAL 保存或恢复任务帧时检查栈边界和对齐。这能发现无效的保存帧。RISC-V 任务运行于 M 模式，端口不再写入不可撤销的 PMP 锁定位。应用级内存隔离需要另外设计权限模式和板级内存映射。
 
 ## 内存布局
 
@@ -536,48 +336,11 @@ SysTick 中断
 
 ## 异步运行时
 
-### 执行器 (Executor)
+### 执行器和异步睡眠
 
-```rust
-pub struct Executor {
-    tasks: Vec<Option<AsyncTask>>,
-    woken_state: Arc<Mutex<RefCell<WokenState>>>,
-    next_task_id: usize,
-    task_count: usize,
-}
+执行器复用已完成 Future 的槽位，每次 spawn 分配独立的唤醒登记。Waker 通过弱引用访问执行器，已完成的登记不能唤醒复用槽位的新 Future。执行器在同一临界区检查就绪队列、记录实际等待的 RTOS 任务并阻塞它。
 
-impl Executor {
-    pub fn run(&mut self) { /* 阻塞式驱动 */ }
-    pub fn poll_once(&mut self) -> bool { /* 非阻塞驱动 */ }
-}
-```
-
-- `spawn()` 会把新 Future 包装为 `AsyncTask`，并立即把任务 ID 推入唤醒队列，保证至少被轮询一次。
-- `run()` 与 `poll_once()` 都复用 `poll_next_woken_task()` 这一核心路径，只处理被唤醒的 Future，而不是每轮遍历所有任务。
-- `run()` 在没有新唤醒任务但执行器仍有未完成任务时，会把当前 RTOS 任务阻塞在 `Event::Async(...)` 上，再交回 RTOS 调度器，保留当前空闲阻塞语义。
-- `poll_once()` 共享同一轮询逻辑，但不会阻塞当前 RTOS 任务，更适合测试或外部手动驱动。
-- `TaskWaker` 在唤醒 Future 时会同时把 Future ID 放回执行器队列，并通过 `Event::wake_task_by_id()` 唤醒承载执行器的 RTOS 任务。
-
-### 异步休眠 (Sleep)
-
-```rust
-pub struct Sleep {
-    deadline: usize,
-    registered: bool,
-    waiter_id: Option<usize>,
-}
-```
-
-- `runtime::sleep(duration_ms)` 返回 `Sleep` Future；首次 `poll` 时通过 `Timer::register_async_sleep()` 注册一个异步休眠槽位。
-- `registered` 和 `waiter_id` 保证同一个 `Sleep` 只注册一次，不再依赖占位式 TODO 或仅克隆 `Waker` 的临时实现。
-- `Timer::timer_check_and_send_event()` 会在截止时间到达时取出对应 `Waker`、清理槽位，并触发唤醒。
-- 被唤醒的任务再次进入执行器后，`Sleep::poll()` 检查当前时间达到 `deadline`，随后返回 `Poll::Ready(())`。
-- 如果 `Sleep` 在完成前被丢弃，`Drop` 会调用 `Timer::unregister_async_sleep()` 清理未使用的槽位。
-
-### 本轮优化范围
-
-- 本轮只覆盖异步休眠的注册、截止时间唤醒、重新轮询完成路径，以及执行器的唤醒队列与共享轮询逻辑。
-- 本轮没有扩展为 `Duration` 风格时间接口，也没有引入公平调度、多核执行或新的定时器后端。
+`runtime::sleep(ticks)` 使用内核的 64 位截止时间。首次 poll 登记 Waker，后续 poll 更新同一登记，提前丢弃时取消。select 的分支固定在组合 Future 内部，普通 async 块可以直接参与选择，返回获胜结果前释放其他分支。
 
 ### Select 宏
 
@@ -721,4 +484,4 @@ Neon-RTOS2 通过精心设计的分层架构，实现了：
 ---
 
 *文档版本：v1.0*  
-*最后更新：2026年6月13日*
+*最后更新：2026年11月8日*

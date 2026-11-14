@@ -22,8 +22,8 @@
 //!     select! {
 //!         data = recv() => {
 //!             // println!("Received data: {:?}", data);
-//!         }
-//!         _ = sleep(1000) => {
+//!         },
+//!         _ = sleep(neon_rtos2::prelude::Ticks(1000)) => {
 //!             // println!("Timeout!");
 //!         }
 //!     }
@@ -46,12 +46,16 @@ use core::task::{Context, Poll};
 // Select Future 实现
 // ============================================================================
 
-/// 两个 Future 的选择器
-///
-/// 同时轮询两个 Future，返回第一个完成的结果
-pub struct Select2<A, B> {
-    a: Option<A>,
-    b: Option<B>,
+pin_project_lite::pin_project! {
+    /// 两个 Future 的选择器
+    ///
+    /// 同时轮询两个 Future，返回第一个完成的结果
+    pub struct Select2<A, B> {
+        #[pin]
+        a: Option<A>,
+        #[pin]
+        b: Option<B>,
+    }
 }
 
 impl<A, B> Select2<A, B> {
@@ -74,37 +78,41 @@ pub enum Either<A, B> {
 
 impl<A, B> Future for Select2<A, B>
 where
-    A: Future + Unpin,
-    B: Future + Unpin,
+    A: Future,
+    B: Future,
 {
     type Output = Either<A::Output, B::Output>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // 轮询第一个 Future
-        if let Some(ref mut a) = self.a {
-            if let Poll::Ready(result) = Pin::new(a).poll(cx) {
-                self.a = None;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        if let Some(future) = this.a.as_mut().as_pin_mut() {
+            if let Poll::Ready(result) = future.poll(cx) {
+                this.a.set(None);
+                this.b.set(None);
                 return Poll::Ready(Either::First(result));
             }
         }
-
-        // 轮询第二个 Future
-        if let Some(ref mut b) = self.b {
-            if let Poll::Ready(result) = Pin::new(b).poll(cx) {
-                self.b = None;
+        if let Some(future) = this.b.as_mut().as_pin_mut() {
+            if let Poll::Ready(result) = future.poll(cx) {
+                this.a.set(None);
+                this.b.set(None);
                 return Poll::Ready(Either::Second(result));
             }
         }
-
         Poll::Pending
     }
 }
 
-/// 三个 Future 的选择器
-pub struct Select3<A, B, C> {
-    a: Option<A>,
-    b: Option<B>,
-    c: Option<C>,
+pin_project_lite::pin_project! {
+    /// 三个 Future 的选择器
+    pub struct Select3<A, B, C> {
+        #[pin]
+        a: Option<A>,
+        #[pin]
+        b: Option<B>,
+        #[pin]
+        c: Option<C>,
+    }
 }
 
 impl<A, B, C> Select3<A, B, C> {
@@ -130,44 +138,54 @@ pub enum Either3<A, B, C> {
 
 impl<A, B, C> Future for Select3<A, B, C>
 where
-    A: Future + Unpin,
-    B: Future + Unpin,
-    C: Future + Unpin,
+    A: Future,
+    B: Future,
+    C: Future,
 {
     type Output = Either3<A::Output, B::Output, C::Output>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ref mut a) = self.a {
-            if let Poll::Ready(result) = Pin::new(a).poll(cx) {
-                self.a = None;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        if let Some(future) = this.a.as_mut().as_pin_mut() {
+            if let Poll::Ready(result) = future.poll(cx) {
+                this.a.set(None);
+                this.b.set(None);
+                this.c.set(None);
                 return Poll::Ready(Either3::First(result));
             }
         }
-
-        if let Some(ref mut b) = self.b {
-            if let Poll::Ready(result) = Pin::new(b).poll(cx) {
-                self.b = None;
+        if let Some(future) = this.b.as_mut().as_pin_mut() {
+            if let Poll::Ready(result) = future.poll(cx) {
+                this.a.set(None);
+                this.b.set(None);
+                this.c.set(None);
                 return Poll::Ready(Either3::Second(result));
             }
         }
-
-        if let Some(ref mut c) = self.c {
-            if let Poll::Ready(result) = Pin::new(c).poll(cx) {
-                self.c = None;
+        if let Some(future) = this.c.as_mut().as_pin_mut() {
+            if let Poll::Ready(result) = future.poll(cx) {
+                this.a.set(None);
+                this.b.set(None);
+                this.c.set(None);
                 return Poll::Ready(Either3::Third(result));
             }
         }
-
         Poll::Pending
     }
 }
 
-/// 四个 Future 的选择器
-pub struct Select4<A, B, C, D> {
-    a: Option<A>,
-    b: Option<B>,
-    c: Option<C>,
-    d: Option<D>,
+pin_project_lite::pin_project! {
+    /// 四个 Future 的选择器
+    pub struct Select4<A, B, C, D> {
+        #[pin]
+        a: Option<A>,
+        #[pin]
+        b: Option<B>,
+        #[pin]
+        c: Option<C>,
+        #[pin]
+        d: Option<D>,
+    }
 }
 
 impl<A, B, C, D> Select4<A, B, C, D> {
@@ -192,42 +210,51 @@ pub enum Either4<A, B, C, D> {
 
 impl<A, B, C, D> Future for Select4<A, B, C, D>
 where
-    A: Future + Unpin,
-    B: Future + Unpin,
-    C: Future + Unpin,
-    D: Future + Unpin,
+    A: Future,
+    B: Future,
+    C: Future,
+    D: Future,
 {
     type Output = Either4<A::Output, B::Output, C::Output, D::Output>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ref mut a) = self.a {
-            if let Poll::Ready(result) = Pin::new(a).poll(cx) {
-                self.a = None;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        if let Some(future) = this.a.as_mut().as_pin_mut() {
+            if let Poll::Ready(result) = future.poll(cx) {
+                this.a.set(None);
+                this.b.set(None);
+                this.c.set(None);
+                this.d.set(None);
                 return Poll::Ready(Either4::First(result));
             }
         }
-
-        if let Some(ref mut b) = self.b {
-            if let Poll::Ready(result) = Pin::new(b).poll(cx) {
-                self.b = None;
+        if let Some(future) = this.b.as_mut().as_pin_mut() {
+            if let Poll::Ready(result) = future.poll(cx) {
+                this.a.set(None);
+                this.b.set(None);
+                this.c.set(None);
+                this.d.set(None);
                 return Poll::Ready(Either4::Second(result));
             }
         }
-
-        if let Some(ref mut c) = self.c {
-            if let Poll::Ready(result) = Pin::new(c).poll(cx) {
-                self.c = None;
+        if let Some(future) = this.c.as_mut().as_pin_mut() {
+            if let Poll::Ready(result) = future.poll(cx) {
+                this.a.set(None);
+                this.b.set(None);
+                this.c.set(None);
+                this.d.set(None);
                 return Poll::Ready(Either4::Third(result));
             }
         }
-
-        if let Some(ref mut d) = self.d {
-            if let Poll::Ready(result) = Pin::new(d).poll(cx) {
-                self.d = None;
+        if let Some(future) = this.d.as_mut().as_pin_mut() {
+            if let Poll::Ready(result) = future.poll(cx) {
+                this.a.set(None);
+                this.b.set(None);
+                this.c.set(None);
+                this.d.set(None);
                 return Poll::Ready(Either4::Fourth(result));
             }
         }
-
         Poll::Pending
     }
 }
@@ -254,8 +281,8 @@ where
 /// ```
 pub fn select2<A, B>(a: A, b: B) -> Select2<A, B>
 where
-    A: Future + Unpin,
-    B: Future + Unpin,
+    A: Future,
+    B: Future,
 {
     Select2::new(a, b)
 }
@@ -263,9 +290,9 @@ where
 /// 选择三个 Future 中第一个完成的
 pub fn select3<A, B, C>(a: A, b: B, c: C) -> Select3<A, B, C>
 where
-    A: Future + Unpin,
-    B: Future + Unpin,
-    C: Future + Unpin,
+    A: Future,
+    B: Future,
+    C: Future,
 {
     Select3::new(a, b, c)
 }
@@ -273,10 +300,10 @@ where
 /// 选择四个 Future 中第一个完成的
 pub fn select4<A, B, C, D>(a: A, b: B, c: C, d: D) -> Select4<A, B, C, D>
 where
-    A: Future + Unpin,
-    B: Future + Unpin,
-    C: Future + Unpin,
-    D: Future + Unpin,
+    A: Future,
+    B: Future,
+    C: Future,
+    D: Future,
 {
     Select4::new(a, b, c, d)
 }
@@ -348,8 +375,8 @@ macro_rules! __select_match {
 ///     select! {
 ///         msg = recv() => {
 ///             // println!("Received: {:?}", msg);
-///         }
-///         _ = sleep(1000) => {
+///         },
+///         _ = sleep(neon_rtos2::prelude::Ticks(1000)) => {
 ///             // println!("Timeout!");
 ///         }
 ///     }
@@ -378,7 +405,6 @@ macro_rules! __select_match {
 ///
 /// # 注意事项
 ///
-/// - 所有 Future 必须实现 `Unpin`，或使用 `pin!` 宏固定
 /// - 未完成的 Future 会被丢弃
 /// - 分支按顺序检查，如果多个同时就绪，返回第一个
 #[macro_export]
@@ -396,7 +422,6 @@ macro_rules! select {
 
     // 多个分支的情况
     ($($args:tt)+) => {{
-        use $crate::runtime::select::{select2, Either};
         
         // 1. 构建 Future 链
         let future_chain = $crate::__select_future!($($args)+);
@@ -453,14 +478,17 @@ pub struct Race<F, const N: usize> {
     futures: [Option<F>; N],
 }
 
-impl<F: Future + Unpin, const N: usize> Future for Race<F, N> {
+impl<F: Future, const N: usize> Future for Race<F, N> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        for slot in self.futures.iter_mut() {
-            if let Some(fut) = slot {
-                if let Poll::Ready(result) = Pin::new(fut).poll(cx) {
-                    *slot = None;
+        for index in 0..N {
+            // SAFETY: the private inline array never changes shape. Its elements
+            // stay pinned until dropped in place, including on cancellation.
+            let slot = unsafe { self.as_mut().map_unchecked_mut(|race| &mut race.futures[index]) };
+            if let Some(future) = slot.as_pin_mut() {
+                if let Poll::Ready(result) = future.poll(cx) {
+                    self.set(Race { futures: core::array::from_fn(|_| None) });
                     return Poll::Ready(result);
                 }
             }
@@ -476,21 +504,20 @@ impl<F: Future + Unpin, const N: usize> Future for Race<F, N> {
 /// ```rust,no_run
 /// use neon_rtos2::runtime::select::race2;
 ///
-/// async fn fetch_a() -> i32 { 1 }
-/// async fn fetch_b() -> i32 { 2 }
+/// async fn fetch(value: i32) -> i32 { value }
 ///
 /// async fn example() {
-///     let result = race2(fetch_a(), fetch_b()).await;
+///     let result = race2(fetch(1), fetch(2)).await;
 /// }
 /// ```
-pub fn race2<F: Future + Unpin>(a: F, b: F) -> Race<F, 2> {
+pub fn race2<F: Future>(a: F, b: F) -> Race<F, 2> {
     Race {
         futures: [Some(a), Some(b)],
     }
 }
 
 /// 竞争三个相同类型的 Future
-pub fn race3<F: Future + Unpin>(a: F, b: F, c: F) -> Race<F, 3> {
+pub fn race3<F: Future>(a: F, b: F, c: F) -> Race<F, 3> {
     Race {
         futures: [Some(a), Some(b), Some(c)],
     }
@@ -561,6 +588,15 @@ mod tests {
                 MaybeReady::Pending => Poll::Pending,
             }
         }
+    }
+
+    #[test]
+    fn select_releases_a_pending_signal_before_the_combinator_is_dropped() {
+        let signal = crate::sync::Signal::new();
+        let mut choice = core::pin::pin!(select2(signal.wait_async(), async { 42 }));
+        let mut cx = Context::from_waker(core::task::Waker::noop());
+        assert!(matches!(choice.as_mut().poll(&mut cx), Poll::Ready(Either::Second(42))));
+        assert_eq!(signal.waiter_count(), 0);
     }
 
     #[test]
@@ -643,21 +679,7 @@ mod tests {
 
     /// 辅助函数：创建测试用的 Context
     fn create_test_context() -> Context<'static> {
-        static VTABLE: core::task::RawWakerVTable = core::task::RawWakerVTable::new(
-            |_| core::task::RawWaker::new(core::ptr::null(), &VTABLE),
-            |_| {},
-            |_| {},
-            |_| {},
-        );
-        
-        let waker = unsafe {
-            Waker::from_raw(core::task::RawWaker::new(core::ptr::null(), &VTABLE))
-        };
-        
-        // 使用 leak 来获得 'static 生命周期（仅用于测试）
-        let waker_box = Box::new(waker);
-        let waker_ref: &'static Waker = Box::leak(waker_box);
-        Context::from_waker(waker_ref)
+        Context::from_waker(Waker::noop())
     }
 
     /// 测试 Select4：4 分支选择，最后一个分支就绪

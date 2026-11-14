@@ -28,6 +28,7 @@
 //! // 创建并使用 Mock GPIO
 //! let mut gpio = MockGpio::new(0);
 //! gpio.init().unwrap();
+//! gpio.set_mode(neon_rtos2::drivers::PinMode::Output).unwrap();
 //! gpio.set_high().unwrap();
 //! ```
 
@@ -37,7 +38,7 @@ mod mock_spi;
 mod mock_timer;
 
 pub use mock_uart::MockUart;
-pub use mock_gpio::MockGpio;
+pub use mock_gpio::{MockGpio, MockGpioPort};
 pub use mock_spi::MockSpi;
-pub use mock_timer::MockTimer;
+pub use mock_timer::{MockTimer, PeriodicTimer};
 

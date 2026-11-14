@@ -24,10 +24,10 @@ fn main() {
     
     Task::builder("my_task")
         .priority(Priority::High)
-        .spawn(|_| {
+        .spawn(|| {
             loop {
                 info!("Running");
-                Delay::delay(1000).unwrap();
+                Delay::delay(Ticks(1000)).unwrap();
             }
         }).unwrap();
     

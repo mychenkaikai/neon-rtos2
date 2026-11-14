@@ -19,7 +19,7 @@
 #   x18-x27    - 保存寄存器 (s2-s11)
 #   x28-x31    - 临时寄存器 (t3-t6)
 #
-# 栈帧布局 (136 字节):
+# 栈帧布局 (144 字节):
 #   偏移    寄存器
 #   0       (保留)
 #   4       x1  (ra)
@@ -54,13 +54,11 @@
 #   120     x31 (t6)
 #   124     mepc
 #   128     mstatus
-#   132     (保留/对齐)
+#   132-143 (ABI 对齐填充)
 # =============================================================================
 
 .section .text
 .global context_switch
-.global save_context
-.global restore_context
 .global trap_entry
 
 # =============================================================================
@@ -78,8 +76,8 @@
 # =============================================================================
 .align 4
 context_switch:
-    # 分配栈帧空间 (136 字节)
-    addi    sp, sp, -136
+    # 分配栈帧空间 (144 字节)
+    addi    sp, sp, -144
 
     # 保存通用寄存器 (x1, x3-x31)
     sw      x1,  4(sp)      # ra
@@ -125,49 +123,7 @@ context_switch:
     # 切换到新任务的栈
     mv      sp, a1
 
-    # 恢复 mstatus 和 mepc
-    lw      t0, 128(sp)
-    csrw    mstatus, t0
-    lw      t0, 124(sp)
-    csrw    mepc, t0
-
-    # 恢复通用寄存器
-    lw      x1,  4(sp)      # ra
-    lw      x3,  8(sp)      # gp
-    lw      x4,  12(sp)     # tp
-    lw      x5,  16(sp)     # t0
-    lw      x6,  20(sp)     # t1
-    lw      x7,  24(sp)     # t2
-    lw      x8,  28(sp)     # s0
-    lw      x9,  32(sp)     # s1
-    lw      x10, 36(sp)     # a0
-    lw      x11, 40(sp)     # a1
-    lw      x12, 44(sp)     # a2
-    lw      x13, 48(sp)     # a3
-    lw      x14, 52(sp)     # a4
-    lw      x15, 56(sp)     # a5
-    lw      x16, 60(sp)     # a6
-    lw      x17, 64(sp)     # a7
-    lw      x18, 68(sp)     # s2
-    lw      x19, 72(sp)     # s3
-    lw      x20, 76(sp)     # s4
-    lw      x21, 80(sp)     # s5
-    lw      x22, 84(sp)     # s6
-    lw      x23, 88(sp)     # s7
-    lw      x24, 92(sp)     # s8
-    lw      x25, 96(sp)     # s9
-    lw      x26, 100(sp)    # s10
-    lw      x27, 104(sp)    # s11
-    lw      x28, 108(sp)    # t3
-    lw      x29, 112(sp)    # t4
-    lw      x30, 116(sp)    # t5
-    lw      x31, 120(sp)    # t6
-
-    # 释放栈帧
-    addi    sp, sp, 136
-
-    # 返回（对于新任务，会跳转到 mepc）
-    mret
+    j       .Lrestore
 
 # =============================================================================
 # trap_entry - 陷阱入口
@@ -177,7 +133,7 @@ context_switch:
 .align 4
 trap_entry:
     # 保存上下文
-    addi    sp, sp, -136
+    addi    sp, sp, -144
 
     # 保存所有通用寄存器
     sw      x1,  4(sp)
@@ -229,6 +185,7 @@ trap_entry:
     beqz    a0, 1f
     mv      sp, a0
 1:
+.Lrestore:
 
     # 恢复 mstatus 和 mepc
     lw      t0, 128(sp)
@@ -269,7 +226,7 @@ trap_entry:
     lw      x31, 120(sp)
 
     # 释放栈帧
-    addi    sp, sp, 136
+    addi    sp, sp, 144
 
     # 返回
     mret
@@ -285,48 +242,4 @@ trap_entry:
 start_first_task_asm:
     # 设置栈指针
     mv      sp, a0
-
-    # 恢复 mstatus 和 mepc
-    lw      t0, 128(sp)
-    csrw    mstatus, t0
-    lw      t0, 124(sp)
-    csrw    mepc, t0
-
-    # 恢复所有通用寄存器
-    lw      x1,  4(sp)
-    lw      x3,  8(sp)
-    lw      x4,  12(sp)
-    lw      x5,  16(sp)
-    lw      x6,  20(sp)
-    lw      x7,  24(sp)
-    lw      x8,  28(sp)
-    lw      x9,  32(sp)
-    lw      x10, 36(sp)
-    lw      x11, 40(sp)
-    lw      x12, 44(sp)
-    lw      x13, 48(sp)
-    lw      x14, 52(sp)
-    lw      x15, 56(sp)
-    lw      x16, 60(sp)
-    lw      x17, 64(sp)
-    lw      x18, 68(sp)
-    lw      x19, 72(sp)
-    lw      x20, 76(sp)
-    lw      x21, 80(sp)
-    lw      x22, 84(sp)
-    lw      x23, 88(sp)
-    lw      x24, 92(sp)
-    lw      x25, 96(sp)
-    lw      x26, 100(sp)
-    lw      x27, 104(sp)
-    lw      x28, 108(sp)
-    lw      x29, 112(sp)
-    lw      x30, 116(sp)
-    lw      x31, 120(sp)
-
-    # 释放栈帧
-    addi    sp, sp, 136
-
-    # 跳转到任务入口
-    mret
-
+    j       .Lrestore

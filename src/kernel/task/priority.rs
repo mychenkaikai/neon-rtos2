@@ -53,7 +53,7 @@ impl Priority {
     ///
     /// # 返回值
     /// 优先级对应的 u8 数值
-    pub fn as_u8(self) -> u8 {
+    pub const fn as_u8(self) -> u8 {
         self as u8
     }
 

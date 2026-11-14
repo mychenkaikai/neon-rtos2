@@ -2,13 +2,10 @@
 .cpu cortex-m3
 .thumb
 
-.global PendSV_Handler
-.type PendSV_Handler, %function
-
-@ 外部变量：第一次切换标志
-.extern FIRST_SWITCH
-
-PendSV_Handler:
+.global PendSV
+.type PendSV, %function
+.thumb_func
+PendSV:
     cpsid i                     @ 禁用中断
     
     @ 获取当前 PSP
@@ -41,4 +38,4 @@ PendSV_Handler:
     @ 返回，硬件会自动从 PSP 恢复 r0-r3, r12, lr, pc, xpsr
     bx lr
 
-.size PendSV_Handler, .-PendSV_Handler
+.size PendSV, .-PendSV

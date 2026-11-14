@@ -8,100 +8,136 @@
 //! - **轻量**: 最小化内存占用
 //! - **可预测**: 确定性的执行顺序
 
+use super::waker::{WakerData, WokenState};
+use crate::compat::{Arc, Box, Vec, VecDeque};
+use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll};
-use crate::compat::{Box, Vec, Arc, VecDeque};
-use super::waker::{TaskWaker, WakerData, WokenState};
+use core::task::{Context, Waker};
+use crate::ipc::Receiver;
+#[cfg(test)]
+use core::task::Poll;
 use critical_section::Mutex;
-use core::cell::RefCell;
 
 /// 异步任务包装器
 ///
 /// 将 Future 包装为可执行的任务
-pub struct AsyncTask {
-    /// 被包装的 Future
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
-    /// 任务 ID，用于创建 Waker
-    task_id: usize,
-}
-
-impl AsyncTask {
-    /// 创建新的异步任务
-    pub fn new<F>(future: F, task_id: usize) -> Self
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        Self {
-            future: Box::pin(future),
-            task_id,
-        }
-    }
+struct AsyncTask<F: ?Sized> {
+    future: Pin<Box<F>>,
+    registration: Arc<WakerData>,
 }
 
 /// 异步执行器
 ///
 /// 管理和执行异步任务的简单执行器。
-pub struct Executor {
+pub struct TaskExecutor<F: Future<Output = ()> + ?Sized> {
     /// 所有的异步任务
-    tasks: Vec<Option<AsyncTask>>,
+    tasks: Vec<Option<AsyncTask<F>>>,
     /// 被唤醒的任务队列
     woken_state: Arc<Mutex<RefCell<WokenState>>>,
-    /// 下一个任务 ID
-    next_task_id: usize,
     /// 活跃任务数
     task_count: usize,
 }
 
+/// Executor that can be moved between tasks.
+pub type Executor = TaskExecutor<dyn Future<Output = ()> + Send>;
+
+/// Executor for futures that stay on the creating task, including borrowed
+/// mutex guards. Its wakers can still notify it from another task or interrupt.
+pub type LocalExecutor = TaskExecutor<dyn Future<Output = ()>>;
+
+/// Result of a single executor step. Waiting tasks need an external wake.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum RunState { Runnable, Waiting, Finished }
+
+/// Dropping the handle schedules cancellation. The executor releases the future
+/// on its next poll. Dropping the executor releases all of its futures directly.
+#[must_use = "join the task or keep the handle for the desired task lifetime"]
+pub struct JoinHandle<T> {
+    result: Receiver<T>,
+    registration: Arc<WakerData>,
+}
+
+impl<T> JoinHandle<T> {
+    /// None means the executor was dropped before producing a result.
+    /// Dropping the wait leaves the task and its result with the handle.
+    /// A produced result can be taken once.
+    pub async fn join(&mut self) -> Option<T> { self.result.recv().await }
+
+    /// Request cancellation; the executor drops the future on its next poll.
+    pub fn cancel(self) {}
+}
+
+impl<T> Drop for JoinHandle<T> {
+    fn drop(&mut self) { self.registration.cancel(); }
+}
+
 impl Executor {
+    pub fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
+        self.spawn_boxed(Box::pin(future));
+    }
+    pub fn spawn_joinable<T: Send + 'static>(
+        &mut self, future: impl Future<Output = T> + Send + 'static,
+    ) -> JoinHandle<T> {
+        let (tx, result) = crate::runtime::channel(1);
+        let registration = self.spawn_boxed(Box::pin(async move {
+            let _ = tx.try_send(future.await);
+        }));
+        JoinHandle { result, registration }
+    }
+}
+
+impl LocalExecutor {
+    pub fn spawn(&mut self, future: impl Future<Output = ()> + 'static) {
+        self.spawn_boxed(Box::pin(future));
+    }
+    pub fn spawn_joinable<T: 'static>(
+        &mut self, future: impl Future<Output = T> + 'static,
+    ) -> JoinHandle<T> {
+        let (tx, result) = crate::runtime::channel(1);
+        let registration = self.spawn_boxed(Box::pin(async move {
+            let _ = tx.try_send(future.await);
+        }));
+        JoinHandle { result, registration }
+    }
+}
+
+impl<F: Future<Output = ()> + ?Sized> TaskExecutor<F> {
     /// 创建新的执行器
     pub fn new() -> Self {
         Self {
             tasks: Vec::new(),
             woken_state: Arc::new(Mutex::new(RefCell::new(WokenState {
                 queue: VecDeque::new(),
-                in_queue: Vec::new(),
+                parked: None,
             }))),
-            next_task_id: 0,
             task_count: 0,
         }
     }
 
-    /// 添加异步任务
-    pub fn spawn<F>(&mut self, future: F) -> usize
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let task_id = self.next_task_id;
-        self.next_task_id += 1;
-        
-        let task = AsyncTask::new(future, task_id);
-        
-        if self.tasks.len() <= task_id {
-            self.tasks.resize_with(task_id + 1, || None);
-        }
-        self.tasks[task_id] = Some(task);
-        self.task_count += 1;
-        
-        // 初始时将任务加入唤醒队列，以便第一次被 poll
-        critical_section::with(|cs| {
-            let mut state = self.woken_state.borrow_ref_mut(cs);
-            if state.in_queue.len() <= task_id {
-                state.in_queue.resize(task_id + 1, false);
-            }
-            if !state.in_queue[task_id] {
-                state.in_queue[task_id] = true;
-                state.queue.push_back(task_id);
-            }
+    fn spawn_boxed(&mut self, future: Pin<Box<F>>) -> Arc<WakerData> {
+        let slot = self
+            .tasks
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.tasks.len());
+        let registration = Arc::new(WakerData::queued(slot, &self.woken_state));
+        let task = Some(AsyncTask {
+            future,
+            registration: registration.clone(),
         });
-        
-        task_id
+        if slot == self.tasks.len() {
+            self.tasks.push(task);
+        } else {
+            self.tasks[slot] = task;
+        }
+        self.task_count += 1;
+        critical_section::with(|cs| self.woken_state.borrow_ref_mut(cs).queue.push_back(slot));
+        registration
     }
 
     /// 运行执行器
     pub fn run(&mut self) {
-        use crate::kernel::scheduler::Scheduler;
-        use crate::sync::event::Event;
         use crate::hal::trigger_schedule;
 
         loop {
@@ -111,17 +147,40 @@ impl Executor {
                 }
 
                 // 没有新唤醒的任务，阻塞当前 RTOS 任务
-                let mut current_task = Scheduler::get_current_task();
-                current_task.block(Event::Async(current_task.get_taskid()));
-                trigger_schedule();
+                if self.park_if_idle() {
+                    trigger_schedule();
+                }
             }
         }
     }
 
+    // 检查唤醒队列和标记阻塞必须是一个事务，否则中断唤醒会被后续 block 覆盖。
+    fn park_if_idle(&self) -> bool {
+        critical_section::with(|cs| {
+            let mut shared = self.woken_state.borrow_ref_mut(cs);
+            if !shared.queue.is_empty() {
+                return false;
+            }
+            let mut current = crate::kernel::scheduler::Scheduler::get_current_task();
+            shared.parked = Some(current);
+            current.block(crate::sync::event::Event::Async(
+                Arc::as_ptr(&self.woken_state) as usize,
+            ));
+            true
+        })
+    }
+
     /// 执行一轮调度
-    pub fn poll_once(&mut self) -> bool {
+    pub fn poll_once(&mut self) -> RunState {
         self.poll_next_woken_task();
-        !self.is_empty()
+        if self.is_empty() { return RunState::Finished; }
+        critical_section::with(|cs| {
+            if self.woken_state.borrow_ref(cs).queue.is_empty() {
+                RunState::Waiting
+            } else {
+                RunState::Runnable
+            }
+        })
     }
 
     /// 获取未完成任务数量
@@ -146,46 +205,37 @@ impl Executor {
     fn pop_woken_task(&mut self) -> Option<usize> {
         critical_section::with(|cs| {
             let mut state = self.woken_state.borrow_ref_mut(cs);
-            if let Some(id) = state.queue.pop_front() {
-                state.in_queue[id] = false;
-                Some(id)
-            } else {
-                None
-            }
+            let slot = state.queue.pop_front()?;
+            self.tasks[slot]
+                .as_ref()
+                .unwrap()
+                .registration
+                .begin_poll(cs);
+            state.parked = None;
+            Some(slot)
         })
     }
 
-    fn poll_task(&mut self, id: usize) {
-        use crate::kernel::scheduler::Scheduler;
-
-        if id >= self.tasks.len() {
-            return;
-        }
-
-        let Some(mut task) = self.tasks[id].take() else {
-            return;
-        };
-
-        let waker_data = Arc::new(WakerData {
-            rtos_task_id: Scheduler::get_current_task().get_taskid(),
-            future_id: id,
-            woken_state: self.woken_state.clone(),
-        });
-        let waker = TaskWaker::new(waker_data);
-        let mut cx = Context::from_waker(&waker);
-
-        match task.future.as_mut().poll(&mut cx) {
-            Poll::Ready(()) => {
-                self.task_count -= 1;
-            }
-            Poll::Pending => {
-                self.tasks[id] = Some(task);
-            }
+    fn poll_task(&mut self, slot: usize) {
+        let task = self.tasks[slot].as_mut().unwrap();
+        let waker = Waker::from(task.registration.clone());
+        if task.registration.cancelled() || task
+            .future
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready()
+        {
+            critical_section::with(|cs| {
+                task.registration
+                    .complete(cs, &mut self.woken_state.borrow_ref_mut(cs))
+            });
+            self.tasks[slot] = None;
+            self.task_count -= 1;
         }
     }
 }
 
-impl Default for Executor {
+impl<F: Future<Output = ()> + ?Sized> Default for TaskExecutor<F> {
     fn default() -> Self {
         Self::new()
     }
@@ -194,9 +244,9 @@ impl Default for Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::kernel_init;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use serial_test::serial;
-    use crate::utils::kernel_init;
 
     #[test]
     #[serial]
@@ -212,13 +262,11 @@ mod tests {
     fn test_executor_spawn() {
         kernel_init();
         let mut executor = Executor::new();
-        
-        let task_id = executor.spawn(async {});
-        assert_eq!(task_id, 0);
+
+        executor.spawn(async {});
         assert_eq!(executor.pending_count(), 1);
-        
-        let task_id2 = executor.spawn(async {});
-        assert_eq!(task_id2, 1);
+
+        executor.spawn(async {});
         assert_eq!(executor.pending_count(), 2);
     }
 
@@ -227,22 +275,22 @@ mod tests {
     fn test_executor_run_simple() {
         kernel_init();
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        
+
         let mut executor = Executor::new();
-        
+
         executor.spawn(async {
             COUNTER.fetch_add(1, Ordering::SeqCst);
         });
-        
+
         executor.spawn(async {
             COUNTER.fetch_add(10, Ordering::SeqCst);
         });
-        
+
         // 由于测试环境中不支持阻塞RTOS任务，poll_once 会在测试中更适用
         while !executor.is_empty() {
             executor.poll_once();
         }
-        
+
         assert_eq!(COUNTER.load(Ordering::SeqCst), 11);
         assert!(executor.is_empty());
     }
@@ -254,22 +302,22 @@ mod tests {
         // 测试任务数量超过原 64 位限制
         let mut executor = Executor::new();
         let num_tasks = 100;
-        
+
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         COUNTER.store(0, Ordering::SeqCst);
-        
+
         for _ in 0..num_tasks {
             executor.spawn(async {
                 COUNTER.fetch_add(1, Ordering::SeqCst);
             });
         }
-        
+
         assert_eq!(executor.pending_count(), num_tasks);
-        
+
         while !executor.is_empty() {
             executor.poll_once();
         }
-        
+
         assert_eq!(COUNTER.load(Ordering::SeqCst), num_tasks);
         assert!(executor.is_empty());
     }
@@ -280,13 +328,16 @@ mod tests {
         kernel_init();
         use core::future::Future;
         use core::pin::Pin;
-        use core::task::{Context, Poll};
-        
+        use core::task::{Context, Waker};
+use crate::ipc::Receiver;
+        #[cfg(test)]
+        use core::task::Poll;
+
         // 模拟一个需要多次 poll 才能完成的 future
         struct StepFuture {
             steps: usize,
         }
-        
+
         impl Future for StepFuture {
             type Output = ();
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -299,22 +350,22 @@ mod tests {
                 }
             }
         }
-        
+
         let mut executor = Executor::new();
         executor.spawn(StepFuture { steps: 3 });
-        
+
         // 第 1 次 poll (steps 变为 2, 并且 waker enqueue)
-        assert!(executor.poll_once());
+        assert_eq!(executor.poll_once(), RunState::Runnable);
         assert_eq!(executor.pending_count(), 1);
-        
+
         // 第 2 次 poll (steps 变为 1, 并且 waker enqueue)
-        assert!(executor.poll_once());
-        
+        assert_eq!(executor.poll_once(), RunState::Runnable);
+
         // 第 3 次 poll (steps 变为 0, 并且 waker enqueue)
-        assert!(executor.poll_once());
-        
+        assert_eq!(executor.poll_once(), RunState::Runnable);
+
         // 第 4 次 poll (Ready)
-        assert!(!executor.poll_once());
+        assert_eq!(executor.poll_once(), RunState::Finished);
         assert!(executor.is_empty());
     }
 
@@ -324,7 +375,10 @@ mod tests {
         kernel_init();
         use core::future::Future;
         use core::pin::Pin;
-        use core::task::{Context, Poll};
+        use core::task::{Context, Waker};
+use crate::ipc::Receiver;
+        #[cfg(test)]
+        use core::task::Poll;
 
         struct PendingFuture(bool);
 
@@ -345,12 +399,83 @@ mod tests {
         executor.spawn(PendingFuture(false));
 
         // 首次 poll 会消费初始唤醒项，但 future 不会重新唤醒自己。
-        assert!(executor.poll_once());
+        assert_eq!(executor.poll_once(), RunState::Waiting);
         assert_eq!(executor.pending_count(), 1);
 
         // 没有新的唤醒任务时，不应误完成任务，返回值仍表示存在未完成任务。
-        assert!(executor.poll_once());
+        assert_eq!(executor.poll_once(), RunState::Waiting);
         assert_eq!(executor.pending_count(), 1);
         assert!(!executor.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn wake_between_empty_poll_and_park_is_not_lost() {
+        kernel_init();
+        let mut executor = Executor::new();
+        executor.spawn(core::future::pending());
+        executor.poll_once();
+        assert!(executor.pop_woken_task().is_none());
+        let waker = Waker::from(executor.tasks[0].as_ref().unwrap().registration.clone());
+        waker.wake_by_ref();
+        assert!(!executor.park_if_idle());
+        executor.poll_once();
+        assert!(executor.park_if_idle());
+        waker.wake_by_ref();
+        assert_eq!(
+            crate::kernel::task::Task::from_slot(0).get_state(),
+            crate::kernel::task::TaskState::Ready
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn stale_future_waker_does_not_wake_an_unrelated_wait() {
+        kernel_init();
+        let mut executor = Executor::new();
+        executor.spawn(core::future::pending());
+        executor.poll_once();
+        let waker = Waker::from(executor.tasks[0].as_ref().unwrap().registration.clone());
+        assert!(executor.park_if_idle());
+        let event = crate::sync::event::Event::Signal(42);
+        crate::kernel::task::Task::from_slot(0).block(event);
+        waker.wake_by_ref();
+        assert_eq!(
+            crate::kernel::task::Task::from_slot(0).get_state(),
+            crate::kernel::task::TaskState::Blocked(event)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn dropping_executor_closes_join_and_cancelling_unpolled_work_skips_it() {
+        kernel_init();
+        let mut executor = Executor::new();
+        let aborted = executor.spawn_joinable(async { panic!("cancelled task ran"); });
+        drop(aborted);
+        assert_eq!(executor.poll_once(), RunState::Finished);
+
+        let mut handle = executor.spawn_joinable(core::future::pending::<u32>());
+        drop(executor);
+        let mut join = core::pin::pin!(handle.join());
+        assert_eq!(join.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(None));
+    }
+
+    #[test]
+    #[serial]
+    fn reused_future_slot_ignores_a_completed_jobs_waker() {
+        kernel_init();
+        let mut executor = Executor::new();
+        executor.spawn(core::future::poll_fn(|cx| {
+            cx.waker().wake_by_ref();
+            Poll::Ready(())
+        }));
+        let stale = Waker::from(executor.tasks[0].as_ref().unwrap().registration.clone());
+        executor.run();
+        executor.spawn(core::future::pending());
+        executor.poll_once();
+        stale.wake();
+        assert!(executor.pop_woken_task().is_none());
+        assert_eq!(executor.tasks.len(), 1);
     }
 }

@@ -9,7 +9,7 @@
 - ✅ 任务优先级 (`Priority::Idle/Low/Normal/High/Critical`)
 - ✅ 信号量同步 (`define_signal!`, `signal()`, `wait()`)
 - ✅ 互斥锁 RAII (`Mutex::lock_guard()`, `with_lock()`)
-- ✅ 软件定时器 (`Timer::new()`, `start()`, `is_timeout()`)
+- ✅ 软件定时器 (`Timer::after()`, `wait()`, `cancel()`)
 - ✅ 任务迭代器 (`Task::iter()`, `ready_tasks()`, `blocked_tasks()`)
 - ✅ 延时功能 (`Delay::delay()`)
 - ✅ 日志系统 (`info!`, `debug!`, `error!` 等)

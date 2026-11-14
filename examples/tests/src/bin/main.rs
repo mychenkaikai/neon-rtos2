@@ -22,7 +22,6 @@
 
 
 use cortex_m::Peripherals;
-use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::entry;
 use cortex_m_semihosting::debug;
 
@@ -37,9 +36,8 @@ use neon_rtos2::log::{LogLevel, set_log_level};
 // 系统配置
 // ============================================================================
 
-const SYST_FREQ: u32 = 1000;
 const SYS_CLOCK: u32 = 12_000_000;
-const SYST_RELOAD: u32 = SYS_CLOCK / SYST_FREQ;
+
 
 // ============================================================================
 // 测试框架
@@ -126,8 +124,8 @@ fn test_task_creation() -> bool {
     info!("Testing: Task Creation");
     
     // 测试使用 Task::new 创建任务
-    let result = Task::new("test_basic", |_| {
-        loop { Delay::delay(1000).unwrap(); }
+    let result = Task::new("test_basic", || {
+        loop { Delay::delay(Ticks(1000)).unwrap(); }
     });
     
     test_assert!(result.is_ok(), "task_creation_basic", "Task::new should succeed")
@@ -140,8 +138,8 @@ fn test_task_builder() -> bool {
     // 测试 Builder 模式
     let result = Task::builder("test_builder")
         .priority(Priority::High)
-        .spawn(|_| {
-            loop { Delay::delay(1000).unwrap(); }
+        .spawn(|| {
+            loop { Delay::delay(Ticks(1000)).unwrap(); }
         });
     
     if !test_assert!(result.is_ok(), "task_builder_creation", "Builder should create task") {
@@ -158,15 +156,15 @@ fn test_task_builder() -> bool {
 fn test_task_state() -> bool {
     info!("Testing: Task State Transitions");
     
-    let result = Task::new("test_state", |_| {
-        loop { Delay::delay(1000).unwrap(); }
+    let result = Task::new("test_state", || {
+        loop { Delay::delay(Ticks(1000)).unwrap(); }
     });
     
     if !test_assert!(result.is_ok(), "task_state_creation", "Task creation should succeed") {
         return false;
     }
     
-    let mut task = result.unwrap();
+    let task = result.unwrap();
     
     // 新创建的任务应该是 Ready 状态
     let is_ready = task.get_state() == TaskState::Ready;
@@ -174,22 +172,14 @@ fn test_task_state() -> bool {
         return false;
     }
     
-    // 测试状态转换到 Running
-    task.run();
-    let is_running = task.get_state() == TaskState::Running;
-    if !test_assert!(is_running, "task_state_to_running", "Task should be Running") {
-        return false;
-    }
-    
-    // 测试状态转换到 Blocked
-    task.block(Event::Signal(1));
+    task.block_if_ready(Event::Signal(1));
     let is_blocked = matches!(task.get_state(), TaskState::Blocked(_));
     if !test_assert!(is_blocked, "task_state_to_blocked", "Task should be Blocked") {
         return false;
     }
     
     // 测试状态转换回 Ready
-    task.ready();
+    task.wake_if(Event::Signal(1));
     let is_ready_again = task.get_state() == TaskState::Ready;
     test_assert!(is_ready_again, "task_state_back_to_ready", "Task should be Ready again")
 }
@@ -200,8 +190,8 @@ fn test_task_priority() -> bool {
     
     let result = Task::builder("test_priority")
         .priority(Priority::Low)
-        .spawn(|_| {
-            loop { Delay::delay(1000).unwrap(); }
+        .spawn(|| {
+            loop { Delay::delay(Ticks(1000)).unwrap(); }
         });
     
     if !test_assert!(result.is_ok(), "task_priority_creation", "Task creation should succeed") {
@@ -230,9 +220,9 @@ fn test_task_iterator() -> bool {
     let initial_count = Task::iter().count();
     
     // 创建几个测试任务
-    let _ = Task::new("iter_test_1", |_| { loop { Delay::delay(1000).unwrap(); } });
-    let _ = Task::new("iter_test_2", |_| { loop { Delay::delay(1000).unwrap(); } });
-    let _ = Task::new("iter_test_3", |_| { loop { Delay::delay(1000).unwrap(); } });
+    let _ = Task::new("iter_test_1", || { loop { Delay::delay(Ticks(1000)).unwrap(); } });
+    let _ = Task::new("iter_test_2", || { loop { Delay::delay(Ticks(1000)).unwrap(); } });
+    let _ = Task::new("iter_test_3", || { loop { Delay::delay(Ticks(1000)).unwrap(); } });
     
     // 测试 iter() 计数
     let new_count = Task::iter().count();
@@ -318,28 +308,16 @@ fn test_mutex_closure() -> bool {
 fn test_timer_basic() -> bool {
     info!("Testing: Timer Basic");
     
-    let timer_result = Timer::new(100); // 100ms 定时器
+    let timer_result = Timer::after(Ticks(100)); // 100ms 定时器
     
     if !test_assert!(timer_result.is_ok(), "timer_creation", "Timer creation should succeed") {
         return false;
     }
     
-    let mut timer = timer_result.unwrap();
-    
-    // 测试初始状态
-    if !test_assert!(!timer.is_running(), "timer_initial_stopped", "Timer should not be running initially") {
-        return false;
-    }
-    
-    // 测试启动
-    let _ = timer.start();
-    if !test_assert!(timer.is_running(), "timer_started", "Timer should be running after start") {
-        return false;
-    }
-    
-    // 测试停止
-    let _ = timer.stop();
-    test_assert!(!timer.is_running(), "timer_stopped", "Timer should not be running after stop")
+    let timer = timer_result.unwrap();
+    let armed = !timer.is_elapsed();
+    timer.cancel();
+    test_assert!(armed, "timer_armed", "Timer should start on creation")
 }
 
 /// 测试：延时功能
@@ -347,7 +325,7 @@ fn test_delay() -> bool {
     info!("Testing: Delay");
     
     // 测试延时不会失败
-    let result = Delay::delay(10);
+    let result = Delay::delay(Ticks(10));
     test_assert!(result.is_ok(), "delay_basic", "Delay should succeed")
 }
 
@@ -412,11 +390,11 @@ fn test_error_task_slots_full() -> bool {
     
     // 填满剩余槽位
     for _ in 0..remaining {
-        let _ = Task::new("fill_task", |_| { loop { Delay::delay(10000).unwrap(); } });
+        let _ = Task::new("fill_task", || { loop { Delay::delay(Ticks(10000)).unwrap(); } });
     }
     
     // 尝试创建超出限制的任务
-    let result = Task::new("overflow_task", |_| { loop { Delay::delay(10000).unwrap(); } });
+    let result = Task::new("overflow_task", || { loop { Delay::delay(Ticks(10000)).unwrap(); } });
     
     let is_slots_full_error = matches!(result, Err(RtosError::TaskSlotsFull));
     test_assert!(is_slots_full_error, "error_task_slots_full", "Should return TaskSlotsFull error")
@@ -426,8 +404,8 @@ fn test_error_task_slots_full() -> bool {
 fn test_task_name_and_id() -> bool {
     info!("Testing: Task Name and ID");
     
-    let result = Task::new("named_task", |_| {
-        loop { Delay::delay(1000).unwrap(); }
+    let result = Task::new("named_task", || {
+        loop { Delay::delay(Ticks(1000)).unwrap(); }
     });
     
     if !test_assert!(result.is_ok(), "task_name_creation", "Task creation should succeed") {
@@ -450,8 +428,8 @@ fn test_task_name_and_id() -> bool {
 fn test_stack_alignment() -> bool {
     info!("Testing: Stack Alignment");
     
-    let result = Task::new("align_test", |_| {
-        loop { Delay::delay(1000).unwrap(); }
+    let result = Task::new("align_test", || {
+        loop { Delay::delay(Ticks(1000)).unwrap(); }
     });
     
     if !test_assert!(result.is_ok(), "stack_align_creation", "Task creation should succeed") {
@@ -549,7 +527,7 @@ fn run_all_tests() {
 }
 
 /// 测试任务 - 运行测试套件
-fn test_runner_task(_: usize) {
+fn test_runner_task() {
     info!("Test runner task started");
     info!("");
     
@@ -563,7 +541,7 @@ fn test_runner_task(_: usize) {
     
     // 如果退出失败，进入空闲循环
     loop {
-        Delay::delay(1000).unwrap();
+        Delay::delay(Ticks(1000)).unwrap();
     }
 }
 
@@ -582,11 +560,7 @@ fn main() -> ! {
     
     // 初始化 SysTick
     let p = Peripherals::take().unwrap();
-    let mut syst = p.SYST;
-    syst.set_clock_source(SystClkSource::Core);
-    syst.set_reload(SYST_RELOAD);
-    syst.enable_counter();
-    syst.enable_interrupt();
+    neon_rtos2::hal::cortex_m3::configure_systick(p.SYST, SYS_CLOCK, Duration::from_millis(1)).unwrap();
     
     // 创建测试运行器任务
     Task::builder("test_runner")

@@ -32,8 +32,9 @@
 //! - [`Event`] - 事件（用于任务阻塞/唤醒）
 //!
 //! ## 进程间通信
-//! - [`Mq`] - 静态分配的消息队列
-//! - [`Ipc`] - 类型安全的 IPC 通道
+//! - [`bounded`] - 创建类型化发送端和接收端
+//! - [`Mq`] - 固定容量、堆上存储的消息队列
+//! - [`Ipc`] - 运行时检查消息类型的动态 IPC 接口
 //! - [`IpcHandle`] - IPC 句柄
 //!
 //! ## 异步运行时
@@ -94,7 +95,8 @@ pub use crate::kernel::time::timer::Timer;
 pub use crate::kernel::time::timer::Delay;
 
 /// 系统滴答时钟
-pub use crate::kernel::time::systick::Systick;
+pub use crate::kernel::time::systick::{Systick, Ticks};
+pub use core::time::Duration;
 
 // ============================================================================
 // 同步原语
@@ -116,11 +118,13 @@ pub use crate::sync::Event;
 // 进程间通信
 // ============================================================================
 
-/// 静态分配的消息队列
+/// 固定容量、堆上存储的消息队列
 pub use crate::ipc::queue::Mq;
 
-/// 类型安全的 IPC 通道
+/// 运行时检查消息类型的动态 IPC 接口
 pub use crate::ipc::channel::Ipc;
+
+pub use crate::ipc::{bounded, Sender, Receiver, SendError, TrySendError, TryRecvError};
 
 /// IPC 句柄
 pub use crate::ipc::channel::IpcHandle;
@@ -130,7 +134,7 @@ pub use crate::ipc::channel::IpcHandle;
 // ============================================================================
 
 /// 异步执行器
-pub use crate::runtime::Executor;
+pub use crate::runtime::{Executor, LocalExecutor};
 
 /// 异步信号量
 pub use crate::runtime::AsyncSignal;

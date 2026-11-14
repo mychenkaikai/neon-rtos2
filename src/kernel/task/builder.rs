@@ -1,10 +1,9 @@
 //! 任务构建器
 //!
-//! 提供链式 API 创建任务，支持设置优先级和栈大小。
+//! 提供链式 API 创建任务，支持设置优先级。
 
-use super::{Task, TaskFunction};
+use super::Task;
 use super::priority::Priority;
-use crate::config::STACK_SIZE;
 use crate::error::Result;
 
 /// 任务构建器
@@ -18,14 +17,14 @@ use crate::error::Result;
 ///
 /// // 使用默认配置
 /// let task = Task::builder("simple_task")
-///     .spawn(|_| {
+///     .spawn(|| {
 ///         // 任务逻辑
 ///     });
 ///
 /// // 自定义配置
 /// let task = Task::builder("custom_task")
 ///     .priority(Priority::High)
-///     .spawn(|_| {
+///     .spawn(|| {
 ///         // 任务逻辑
 ///     });
 /// ```
@@ -60,7 +59,7 @@ impl TaskBuilder {
     ///
     /// Task::builder("high_priority_task")
     ///     .priority(Priority::High)
-    ///     .spawn(|_| {});
+    ///     .spawn(|| {});
     /// ``````
     pub fn priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
@@ -77,11 +76,9 @@ impl TaskBuilder {
     /// - `Err(RtosError)`: 创建失败（如任务槽已满）
     pub fn spawn<F>(self, func: F) -> Result<Task>
     where
-        F: TaskFunction,
+        F: FnOnce() + Send + 'static,
     {
-        let mut task = Task::new(self.name, func)?;
-        task.set_priority(self.priority);
-        Ok(task)
+        Task::new_with_priority(self.name, func, self.priority)
     }
 }
 
@@ -116,7 +113,7 @@ mod tests {
         
         let task = TaskBuilder::new("spawn_test")
             .priority(Priority::High)
-            .spawn(|_| {})
+            .spawn(|| {})
             .unwrap();
             
         assert_eq!(task.get_name(), "spawn_test");

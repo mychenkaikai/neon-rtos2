@@ -13,7 +13,7 @@
 //!
 //! ```rust
 //! use neon_rtos2::drivers::examples::MockUart;
-//! use neon_rtos2::drivers::{Device, Read, Write, Uart, SerialConfig};
+//! use neon_rtos2::drivers::{Device, Configure, SerialPort, Read, Write, Uart, SerialConfig};
 //!
 //! let mut uart = MockUart::new();
 //!
@@ -21,7 +21,7 @@
 //! uart.init().unwrap();
 //!
 //! // 配置
-//! Uart::set_baudrate(&mut uart, 9600).unwrap();
+//! uart.set_baudrate(9600).unwrap();
 //!
 //! // 写入数据
 //! uart.write(b"Hello, World!").unwrap();
@@ -35,8 +35,8 @@
 //! ```
 
 use crate::drivers::{
-    Device, Read, Write, Uart,
-    AsyncRead, AsyncWrite, AsyncUart,
+    Device, Configure, SerialPort, Read, Write, Uart,
+    AsyncRead, AsyncWrite,
     SerialConfig, DataBits, StopBits, Parity,
     DeviceError,
 };
@@ -59,7 +59,8 @@ const BUFFER_SIZE: usize = 256;
 /// uart.write(b"Test").unwrap();
 ///
 /// // 获取发送的数据
-/// let sent = uart.mock_get_transmitted();
+/// let mut sent = [0; 4];
+/// assert_eq!(uart.mock_get_transmitted_to(&mut sent), 4);
 /// assert_eq!(&sent, b"Test");
 /// ```
 pub struct MockUart {
@@ -329,15 +330,20 @@ impl Write for MockUart {
     }
 }
 
-impl Uart for MockUart {
+impl Configure for MockUart {
+    type Config = SerialConfig;
     fn configure(&mut self, config: SerialConfig) -> Result<(), Self::Error> {
         if !self.initialized {
             return Err(DeviceError::NotInitialized);
         }
+        if config.baudrate == 0 { return Err(DeviceError::InvalidParameter); }
         self.config = config;
         Ok(())
     }
 
+}
+
+impl SerialPort for MockUart {
     fn set_baudrate(&mut self, baudrate: u32) -> Result<(), Self::Error> {
         if !self.initialized {
             return Err(DeviceError::NotInitialized);
@@ -353,6 +359,9 @@ impl Uart for MockUart {
         self.config.baudrate
     }
 
+}
+
+impl Uart for MockUart {
     fn is_rx_ready(&self) -> bool {
         self.rx_tail != self.rx_head
     }
@@ -409,20 +418,6 @@ impl AsyncWrite for MockUart {
     }
 }
 
-impl AsyncUart for MockUart {
-    fn configure(&mut self, config: SerialConfig) -> Result<(), Self::Error> {
-        <Self as Uart>::configure(self, config)
-    }
-
-    fn set_baudrate(&mut self, baudrate: u32) -> Result<(), Self::Error> {
-        <Self as Uart>::set_baudrate(self, baudrate)
-    }
-
-    fn baudrate(&self) -> u32 {
-        <Self as Uart>::baudrate(self)
-    }
-}
-
 // ============================================================================
 // 单元测试
 // ============================================================================
@@ -435,7 +430,7 @@ mod tests {
     fn test_mock_uart_new() {
         let uart = MockUart::new();
         assert!(!uart.is_ready());
-        assert_eq!(Uart::baudrate(&uart), 115200);
+        assert_eq!(uart.baudrate(), 115200);
     }
 
     #[test]
@@ -493,8 +488,8 @@ mod tests {
         let mut uart = MockUart::new();
         uart.init().unwrap();
 
-        Uart::set_baudrate(&mut uart, 9600).unwrap();
-        assert_eq!(Uart::baudrate(&uart), 9600);
+        uart.set_baudrate(9600).unwrap();
+        assert_eq!(uart.baudrate(), 9600);
 
         let config = SerialConfig {
             baudrate: 19200,
@@ -502,8 +497,8 @@ mod tests {
             stop_bits: StopBits::Two,
             parity: Parity::Even,
         };
-        Uart::configure(&mut uart, config).unwrap();
-        assert_eq!(Uart::baudrate(&uart), 19200);
+        uart.configure(config).unwrap();
+        assert_eq!(uart.baudrate(), 19200);
     }
 
     #[test]
